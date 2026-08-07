@@ -34,6 +34,8 @@ The player starts playing immediately. The focused video window accepts:
 - `I` — toggle the FPS / shown / dropped frame / playback-position overlay
 - `Left` / `Right` — seek backward or forward 10 seconds
 - `Space` — pause or resume
+- `S` — toggle subtitles
+- `J` — switch to the next embedded subtitle track
 - `Q` — quit
 
 The borderless Wayland window can be dragged from anywhere with the left mouse
@@ -42,7 +44,9 @@ free, while the video itself retains its display aspect ratio with black bars
 where needed. Double-click anywhere to toggle fullscreen. Its custom title bar
 fades after 1.5 seconds without mouse movement and whenever the window loses
 focus. Its close button is at the top-right. The minimum window size is 320x180.
-Seeking briefly shows the new playback position in the information overlay.
+The bottom timeline appears with the controls; click it or drag its handle to
+seek. Seeking uses the closest indexed keyframe for a quick response and briefly
+shows the resulting playback position above the timeline.
 
 ## Scope
 
@@ -62,7 +66,13 @@ The build intentionally targets this workstation:
 - NVIDIA RTX A4000
 - local FFmpeg 9 shared libraries
 - system SDL3 and libplacebo
+- system Pango/Cairo development files
 - system Wayland client/protocol development files
 - the `bindgen`, `wayland-scanner`, C compiler, and `ar` commands on `PATH`
 
-There is no playlist, subtitle, or stream-selection support yet.
+The default embedded subtitle track is selected automatically; `J` cycles
+through all decodable embedded tracks and briefly shows the selected number.
+DVD/PGS bitmap subtitles retain their authored placement. Text and ASS dialogue
+use a compact bold monospace Pango font with Unicode shaping and automatic font
+fallback; advanced ASS styling is ignored. There is no playlist or audio-stream
+selection support yet.

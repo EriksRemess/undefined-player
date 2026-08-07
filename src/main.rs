@@ -29,28 +29,35 @@ const VIDEO_QUEUE_MAX: usize = 24;
 const VIDEO_PRESENTATION_LEAD: f64 = 0.012;
 const SEEK_SECONDS: f64 = 10.0;
 const TOP_BAR_HEIGHT_PIXELS: f32 = 42.0;
+const SCRUBBER_HIT_HEIGHT_PIXELS: f32 = 42.0;
+const SCRUBBER_MARGIN_PIXELS: f32 = 14.0;
+const RESIZE_BORDER_LOGICAL: f32 = 10.0;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
 
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
+    CycleSubtitles,
     Quit,
     SeekBackward,
     SeekForward,
     ToggleFullscreen,
     ToggleInfo,
     TogglePause,
+    ToggleSubtitles,
 }
 
 fn action_for_key(key: u32) -> Option<Action> {
     match key {
         ffi::SDLK_Q => Some(Action::Quit),
+        ffi::SDLK_J => Some(Action::CycleSubtitles),
         ffi::SDLK_LEFT => Some(Action::SeekBackward),
         ffi::SDLK_RIGHT => Some(Action::SeekForward),
         ffi::SDLK_F => Some(Action::ToggleFullscreen),
         ffi::SDLK_I => Some(Action::ToggleInfo),
         ffi::SDLK_SPACE => Some(Action::TogglePause),
+        ffi::SDLK_S => Some(Action::ToggleSubtitles),
         _ => None,
     }
 }
@@ -101,6 +108,37 @@ fn close_button_contains(
         && x < logical_width as f32
         && y >= 0.0
         && y < button_height
+}
+
+fn scrubber_target(
+    x: f32,
+    y: f32,
+    logical_width: i32,
+    logical_height: i32,
+    pixel_width: i32,
+    pixel_height: i32,
+    duration: f64,
+) -> Option<f64> {
+    if logical_width <= 0
+        || logical_height <= 0
+        || pixel_width <= 0
+        || pixel_height <= 0
+        || !duration.is_finite()
+        || duration <= 0.0
+    {
+        return None;
+    }
+    let hit_height = SCRUBBER_HIT_HEIGHT_PIXELS * logical_height as f32 / pixel_height as f32;
+    if x <= RESIZE_BORDER_LOGICAL
+        || x >= logical_width as f32 - RESIZE_BORDER_LOGICAL
+        || y < logical_height as f32 - hit_height
+        || y >= logical_height as f32 - RESIZE_BORDER_LOGICAL
+    {
+        return None;
+    }
+    let margin = SCRUBBER_MARGIN_PIXELS * logical_width as f32 / pixel_width as f32;
+    let track_width = logical_width as f32 - 2.0 * margin;
+    (track_width > 0.0).then(|| ((x - margin) / track_width).clamp(0.0, 1.0) as f64 * duration)
 }
 
 struct Sdl;
@@ -223,6 +261,30 @@ impl Window {
         )
     }
 
+    unsafe fn scrubber_target(&self, x: f32, y: f32, duration: Option<f64>) -> Option<f64> {
+        let duration = duration?;
+        let mut logical_width = 0;
+        let mut logical_height = 0;
+        let mut pixel_width = 0;
+        let mut pixel_height = 0;
+        if !unsafe { ffi::SDL_GetWindowSize(self.0, &mut logical_width, &mut logical_height) }
+            || !unsafe {
+                ffi::SDL_GetWindowSizeInPixels(self.0, &mut pixel_width, &mut pixel_height)
+            }
+        {
+            return None;
+        }
+        scrubber_target(
+            x,
+            y,
+            logical_width,
+            logical_height,
+            pixel_width,
+            pixel_height,
+            duration,
+        )
+    }
+
     unsafe fn set_minimum_size(&self) -> Result<()> {
         if !unsafe { ffi::SDL_SetWindowMinimumSize(self.0, 320, 180) } {
             return Err(format!(
@@ -270,6 +332,8 @@ struct Renderer(*mut ffi::UpVideoRenderer);
 struct RendererOverlays<'a> {
     info: Option<(&'a CStr, f32)>,
     position: Option<(&'a CStr, f32)>,
+    scrubber: Option<(f32, f32)>,
+    subtitle: Option<&'a SubtitleCue>,
 }
 
 impl Renderer {
@@ -307,6 +371,32 @@ impl Renderer {
         let (position, position_alpha) = overlays
             .position
             .map_or((ptr::null(), 0.0), |(text, alpha)| (text.as_ptr(), alpha));
+        let (scrubber_progress, scrubber_alpha) = overlays.scrubber.unwrap_or((-1.0, 0.0));
+        let rendered_subtitle = overlays.subtitle.and_then(|cue| match &cue.content {
+            SubtitleContent::Text(text) => {
+                Some(CString::new(text.as_str()).expect("decoded subtitle text has no NUL bytes"))
+            }
+            _ => None,
+        });
+        let (subtitle_text, subtitle_pixels, subtitle_width, subtitle_height, subtitle_serial) =
+            match overlays.subtitle {
+                Some(cue) => match &cue.content {
+                    SubtitleContent::Text(_) => (
+                        rendered_subtitle.as_ref().unwrap().as_ptr(),
+                        ptr::null(),
+                        0,
+                        0,
+                        cue.serial,
+                    ),
+                    SubtitleContent::Bitmap {
+                        width,
+                        height,
+                        pixels,
+                    } => (ptr::null(), pixels.as_ptr(), *width, *height, cue.serial),
+                    SubtitleContent::Clear => (ptr::null(), ptr::null(), 0, 0, 0),
+                },
+                None => (ptr::null(), ptr::null(), 0, 0, 0),
+            };
         if unsafe {
             ffi::up_video_renderer_display(
                 self.0,
@@ -319,6 +409,13 @@ impl Renderer {
                 info_alpha,
                 position,
                 position_alpha,
+                scrubber_progress,
+                scrubber_alpha,
+                subtitle_text,
+                subtitle_pixels,
+                subtitle_width,
+                subtitle_height,
+                subtitle_serial,
             )
         } < 0
         {
@@ -464,6 +561,24 @@ struct VideoFrame {
     frame: *mut ffi::AVFrame,
     pts: f64,
     duration: f64,
+}
+
+enum SubtitleContent {
+    Clear,
+    Text(String),
+    Bitmap {
+        width: i32,
+        height: i32,
+        pixels: Vec<u8>,
+    },
+}
+
+struct SubtitleCue {
+    track: usize,
+    start: f64,
+    end: f64,
+    serial: u64,
+    content: SubtitleContent,
 }
 
 // The worker transfers exclusive ownership of each reference-counted AVFrame
@@ -675,16 +790,25 @@ struct Media {
     video: Decoder,
     audio_decoder: Option<Decoder>,
     audio: Option<AudioOutput>,
+    subtitle_decoders: Vec<Decoder>,
     video_queue: VecDeque<VideoFrame>,
+    subtitle_queue: VecDeque<SubtitleCue>,
+    subtitle_serial: u64,
+    log_subtitles: bool,
     eof: bool,
     drained: bool,
     first_video_pts: Option<f64>,
     video_seek_target: Option<f64>,
     audio_seek_target: Option<f64>,
+    subtitle_seek_target: Option<f64>,
 }
 
 impl Media {
-    unsafe fn open(path: &Path, vulkan_device: *mut ffi::AVBufferRef) -> Result<Self> {
+    unsafe fn open(
+        path: &Path,
+        vulkan_device: *mut ffi::AVBufferRef,
+        log_subtitles: bool,
+    ) -> Result<Self> {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| "media path contains a NUL byte".to_string())?;
         let mut format = ptr::null_mut();
@@ -760,6 +884,41 @@ impl Media {
                 (None, None)
             };
 
+            let mut subtitle_indices = (0..unsafe { (*format).nb_streams } as usize)
+                .filter(|&index| {
+                    let stream = unsafe { *(*format).streams.add(index) };
+                    let parameters = unsafe { (*stream).codecpar };
+                    (unsafe { (*parameters).codec_type }) == ffi::AVMediaType_AVMEDIA_TYPE_SUBTITLE
+                })
+                .collect::<Vec<_>>();
+            subtitle_indices.sort_by_key(|&index| {
+                let stream = unsafe { *(*format).streams.add(index) };
+                unsafe { ((*stream).disposition as u32 & ffi::AV_DISPOSITION_DEFAULT) == 0 }
+            });
+            let mut subtitle_decoders = Vec::new();
+            for stream_index in subtitle_indices {
+                let stream = unsafe { *(*format).streams.add(stream_index) };
+                let parameters = unsafe { (*stream).codecpar };
+                let subtitle_name =
+                    unsafe { CStr::from_ptr(ffi::avcodec_get_name((*parameters).codec_id)) }
+                        .to_string_lossy();
+                match unsafe { Decoder::open(format, stream_index as i32, None) } {
+                    Ok(decoder) => {
+                        eprintln!(
+                            "subtitle track {}: {subtitle_name}",
+                            subtitle_decoders.len() + 1
+                        );
+                        subtitle_decoders.push(decoder);
+                    }
+                    Err(error) => eprintln!(
+                        "subtitle stream {stream_index} ({subtitle_name}) unavailable: {error}"
+                    ),
+                }
+            }
+            if !subtitle_decoders.is_empty() {
+                eprintln!("subtitles: S toggles, J switches tracks");
+            }
+
             let packet = unsafe { ffi::av_packet_alloc() };
             if packet.is_null() {
                 return Err("out of memory while allocating a packet".into());
@@ -771,12 +930,17 @@ impl Media {
                 video,
                 audio_decoder,
                 audio,
+                subtitle_decoders,
                 video_queue: VecDeque::new(),
+                subtitle_queue: VecDeque::new(),
+                subtitle_serial: 0,
+                log_subtitles,
                 eof: false,
                 drained: false,
                 first_video_pts: None,
                 video_seek_target: None,
                 audio_seek_target: None,
+                subtitle_seek_target: None,
             })
         })();
 
@@ -866,6 +1030,184 @@ impl Media {
         Ok(())
     }
 
+    unsafe fn decode_subtitle_packet(&mut self, track: usize) -> Result<()> {
+        let decoder = &self.subtitle_decoders[track];
+        let context = decoder.context;
+        let time_base = decoder.time_base;
+        let mut subtitle: ffi::AVSubtitle = unsafe { std::mem::zeroed() };
+        let mut got_subtitle = 0;
+        let packet_pts = unsafe { (*self.packet).pts };
+        let packet_duration = unsafe { (*self.packet).duration };
+        let ret = unsafe {
+            ffi::avcodec_decode_subtitle2(context, &mut subtitle, &mut got_subtitle, self.packet)
+        };
+        if ret < 0 {
+            return Err(format!("subtitle decoder rejected a packet: {}", unsafe {
+                ffmpeg_error(ret)
+            }));
+        }
+        if got_subtitle == 0 {
+            return Ok(());
+        }
+
+        let cue = {
+            let packet_time_base = rational(time_base);
+            let base_pts = if subtitle.pts != AV_NOPTS_VALUE {
+                subtitle.pts as f64 / ffi::AV_TIME_BASE as f64
+            } else if packet_pts != AV_NOPTS_VALUE {
+                packet_pts as f64 * packet_time_base
+            } else {
+                0.0
+            };
+            let start = base_pts + subtitle.start_display_time as f64 / 1000.0;
+            let end = if subtitle.end_display_time > subtitle.start_display_time {
+                base_pts + subtitle.end_display_time as f64 / 1000.0
+            } else if packet_duration > 0 {
+                start + packet_duration as f64 * packet_time_base
+            } else {
+                f64::INFINITY
+            };
+
+            let video_width = unsafe { (*self.video.context).width };
+            let video_height = unsafe { (*self.video.context).height };
+            let subtitle_width = unsafe { (*context).width };
+            let subtitle_height = unsafe { (*context).height };
+            let canvas_width = if subtitle_width > 0 {
+                subtitle_width
+            } else {
+                video_width
+            };
+            let canvas_height = if subtitle_height > 0 {
+                subtitle_height
+            } else {
+                video_height
+            };
+            let pixel_count = usize::try_from(canvas_width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(canvas_height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|bytes| *bytes <= 512 * 1024 * 1024);
+            let mut bitmap = pixel_count.map(|bytes| vec![0_u8; bytes]);
+            let mut has_bitmap = false;
+            let mut text = Vec::new();
+
+            for index in 0..subtitle.num_rects as usize {
+                let rect = unsafe { *subtitle.rects.add(index) };
+                if rect.is_null() {
+                    continue;
+                }
+                match unsafe { (*rect).type_ } {
+                    ffi::AVSubtitleType_SUBTITLE_BITMAP => {
+                        let Some(pixels) = bitmap.as_mut() else {
+                            continue;
+                        };
+                        let rect = unsafe { &*rect };
+                        if rect.w <= 0
+                            || rect.h <= 0
+                            || rect.linesize[0] <= 0
+                            || rect.data[0].is_null()
+                            || rect.data[1].is_null()
+                        {
+                            continue;
+                        }
+                        let x0 = rect.x.clamp(0, canvas_width);
+                        let y0 = rect.y.clamp(0, canvas_height);
+                        let x1 = rect.x.saturating_add(rect.w).clamp(0, canvas_width);
+                        let y1 = rect.y.saturating_add(rect.h).clamp(0, canvas_height);
+                        for y in y0..y1 {
+                            let source_y = y - rect.y;
+                            let source = unsafe {
+                                rect.data[0].add(source_y as usize * rect.linesize[0] as usize)
+                            };
+                            for x in x0..x1 {
+                                let palette_index = unsafe { *source.add((x - rect.x) as usize) };
+                                if palette_index as i32 >= rect.nb_colors {
+                                    continue;
+                                }
+                                let color = unsafe {
+                                    ptr::read_unaligned(
+                                        rect.data[1].cast::<u32>().add(palette_index as usize),
+                                    )
+                                };
+                                let destination =
+                                    (y as usize * canvas_width as usize + x as usize) * 4;
+                                pixels[destination] = (color >> 16) as u8;
+                                pixels[destination + 1] = (color >> 8) as u8;
+                                pixels[destination + 2] = color as u8;
+                                pixels[destination + 3] = (color >> 24) as u8;
+                            }
+                        }
+                        has_bitmap = true;
+                    }
+                    ffi::AVSubtitleType_SUBTITLE_TEXT | ffi::AVSubtitleType_SUBTITLE_ASS => {
+                        let ass = unsafe { (*rect).type_ } == ffi::AVSubtitleType_SUBTITLE_ASS;
+                        let value = if ass {
+                            unsafe { (*rect).ass }
+                        } else {
+                            unsafe { (*rect).text }
+                        };
+                        if !value.is_null() {
+                            let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+                            let value = subtitle_dialogue_text(&value, ass);
+                            if !value.is_empty() {
+                                text.push(value);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let content = if has_bitmap {
+                SubtitleContent::Bitmap {
+                    width: canvas_width,
+                    height: canvas_height,
+                    pixels: bitmap.expect("bitmap storage was allocated"),
+                }
+            } else if !text.is_empty() {
+                SubtitleContent::Text(text.join("\n"))
+            } else {
+                SubtitleContent::Clear
+            };
+            self.subtitle_serial = self.subtitle_serial.wrapping_add(1).max(1);
+            SubtitleCue {
+                track,
+                start,
+                end,
+                serial: self.subtitle_serial,
+                content,
+            }
+        };
+        unsafe { ffi::avsubtitle_free(&mut subtitle) };
+        if self
+            .subtitle_seek_target
+            .is_some_and(|target| cue.end <= target)
+        {
+            return Ok(());
+        }
+        if self.log_subtitles {
+            let kind = match &cue.content {
+                SubtitleContent::Clear => "clear".to_owned(),
+                SubtitleContent::Text(text) => format!("text {} chars", text.len()),
+                SubtitleContent::Bitmap { width, height, .. } => {
+                    format!("bitmap {width}x{height}")
+                }
+            };
+            eprintln!(
+                "subtitle track {} cue: {:.3}-{:.3} {kind}",
+                cue.track + 1,
+                cue.start,
+                cue.end
+            );
+        }
+        self.subtitle_queue.push_back(cue);
+        Ok(())
+    }
+
     unsafe fn decode_packet(&mut self) -> Result<()> {
         let stream_index = unsafe { (*self.packet).stream_index };
         if stream_index == self.video.stream_index {
@@ -889,6 +1231,12 @@ impl Media {
                 }));
             }
             unsafe { self.receive_audio()? };
+        } else if let Some(track) = self
+            .subtitle_decoders
+            .iter()
+            .position(|decoder| decoder.stream_index == stream_index)
+        {
+            unsafe { self.decode_subtitle_packet(track)? };
         }
         Ok(())
     }
@@ -960,11 +1308,34 @@ impl Media {
             .then(|| duration as f64 / ffi::AV_TIME_BASE as f64)
     }
 
-    unsafe fn seek(&mut self, target: f64) -> Result<()> {
+    unsafe fn nearest_keyframe(&self, target: f64) -> Option<f64> {
+        let time_base = rational(self.video.time_base);
+        if time_base <= 0.0 {
+            return None;
+        }
+        let timestamp = (target / time_base).round() as i64;
+        let stream = unsafe { *(*self.format).streams.add(self.video.stream_index as usize) };
+        let entry_time = |flags| {
+            let entry =
+                unsafe { ffi::avformat_index_get_entry_from_timestamp(stream, timestamp, flags) };
+            (!entry.is_null()).then(|| unsafe { (*entry).timestamp as f64 * time_base })
+        };
+        closest_seek_point(
+            target,
+            entry_time(ffi::AVSEEK_FLAG_BACKWARD as i32),
+            entry_time(0),
+        )
+    }
+
+    unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
         let time_base = rational(self.video.time_base);
         if time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
+        // Keyframe seeking avoids decoding an entire GOP before presenting a
+        // new position. That matters for 8K60 AV1, where decoding is already
+        // close to real time and keyframes can be several seconds apart.
+        let target = unsafe { self.nearest_keyframe(requested_target) }.unwrap_or(requested_target);
         let timestamp = (target / time_base).round() as i64;
         let ret = unsafe {
             ffi::av_seek_frame(
@@ -985,15 +1356,20 @@ impl Media {
         if let Some(decoder) = self.audio_decoder.as_ref() {
             unsafe { ffi::avcodec_flush_buffers(decoder.context) };
         }
+        for decoder in &self.subtitle_decoders {
+            unsafe { ffi::avcodec_flush_buffers(decoder.context) };
+        }
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.reset()? };
         }
         self.video_queue.clear();
+        self.subtitle_queue.clear();
         self.eof = false;
         self.drained = false;
         self.video_seek_target = Some(target);
         self.audio_seek_target = self.audio.as_ref().map(|_| target);
-        Ok(())
+        self.subtitle_seek_target = (!self.subtitle_decoders.is_empty()).then_some(target);
+        Ok(target)
     }
 
     unsafe fn audio_clock(&self) -> Option<f64> {
@@ -1135,6 +1511,13 @@ impl DecodeWorker {
         }
     }
 
+    fn receive_subtitles(&self, queue: &mut VecDeque<SubtitleCue>) -> Result<()> {
+        if let Some(mut media) = self.try_lock()? {
+            queue.append(&mut media.subtitle_queue);
+        }
+        Ok(())
+    }
+
     fn clear_frames(
         &self,
         queue: &mut VecDeque<QueuedVideoFrame>,
@@ -1143,6 +1526,21 @@ impl DecodeWorker {
         queue.clear();
         *current = None;
         while self.frames.try_recv().is_ok() {}
+    }
+
+    fn clear_subtitles(
+        &self,
+        incoming: &mut VecDeque<SubtitleCue>,
+        queues: &mut [VecDeque<SubtitleCue>],
+        current: &mut [Option<SubtitleCue>],
+    ) {
+        incoming.clear();
+        for queue in queues {
+            queue.clear();
+        }
+        for subtitle in current {
+            *subtitle = None;
+        }
     }
 
     fn take_fill_time(&self) -> Duration {
@@ -1225,6 +1623,58 @@ fn timeline_text(position: f64, duration: Option<f64>) -> CString {
     CString::new(text).expect("position text has no NUL bytes")
 }
 
+fn subtitle_dialogue_text(raw: &str, ass: bool) -> String {
+    let dialogue = if ass {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("Dialogue:") {
+            trimmed.splitn(10, ',').nth(9).unwrap_or(trimmed)
+        } else {
+            trimmed.splitn(9, ',').nth(8).unwrap_or(trimmed)
+        }
+    } else {
+        raw
+    };
+    let mut text = String::with_capacity(dialogue.len());
+    let mut in_override = false;
+    let mut characters = dialogue.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '{' => in_override = true,
+            '}' if in_override => in_override = false,
+            '\\' if !in_override => match characters.next() {
+                Some('N' | 'n') => text.push('\n'),
+                Some('h') => text.push(' '),
+                Some(other) => {
+                    text.push('\\');
+                    text.push(other);
+                }
+                None => text.push('\\'),
+            },
+            '\0' => {}
+            '’' | '‘' => text.push('\''),
+            '“' | '”' => text.push('"'),
+            '–' | '—' => text.push('-'),
+            _ if !in_override && character.is_whitespace() => text.push(' '),
+            _ if !in_override && !character.is_control() => text.push(character),
+            _ => {}
+        }
+    }
+    text.trim().to_owned()
+}
+
+fn closest_seek_point(target: f64, before: Option<f64>, after: Option<f64>) -> Option<f64> {
+    match (before, after) {
+        (Some(before), Some(after)) => Some(if target - before <= after - target {
+            before
+        } else {
+            after
+        }),
+        (Some(before), None) => Some(before),
+        (None, Some(after)) => Some(after),
+        (None, None) => None,
+    }
+}
+
 struct PositionNotice {
     text: Option<CString>,
     shown_at: Instant,
@@ -1241,7 +1691,11 @@ impl PositionNotice {
     }
 
     fn show(&mut self, position: f64, duration: Option<f64>) {
-        self.text = Some(timeline_text(position, duration));
+        self.show_text(timeline_text(position, duration));
+    }
+
+    fn show_text(&mut self, text: CString) {
+        self.text = Some(text);
         self.shown_at = Instant::now();
         self.alpha = 1.0;
     }
@@ -1264,6 +1718,19 @@ impl PositionNotice {
         }
         changed
     }
+}
+
+fn next_subtitle_track(current: usize, count: usize) -> usize {
+    if count == 0 { 0 } else { (current + 1) % count }
+}
+
+fn subtitle_status_text(visible: bool, selected: usize, count: usize) -> CString {
+    let status = if visible {
+        format!("SUBTITLES: {} / {count}", selected + 1)
+    } else {
+        "SUBTITLES: OFF".to_owned()
+    };
+    CString::new(status).expect("subtitle status has no NUL bytes")
 }
 
 struct TopBar {
@@ -1381,12 +1848,33 @@ unsafe fn seek_by(
         playback_start + (duration - 0.05).max(0.0)
     });
     let target = (clock.now() + offset).clamp(playback_start, maximum);
-    unsafe { media.seek(target)? };
+    let target = unsafe { media.seek(target)? };
     while media.video_queue.is_empty() && !media.eof {
         unsafe { media.fill_queues()? };
     }
-    clock.seek(target);
-    notice.show(target - playback_start, duration);
+    let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
+    clock.seek(displayed_target);
+    notice.show(displayed_target - playback_start, duration);
+    Ok(())
+}
+
+unsafe fn seek_to(
+    media: &mut Media,
+    clock: &mut WallClock,
+    notice: &mut PositionNotice,
+    position: f64,
+    playback_start: f64,
+    duration: f64,
+) -> Result<()> {
+    let position = position.clamp(0.0, (duration - 0.05).max(0.0));
+    let target = playback_start + position;
+    let target = unsafe { media.seek(target)? };
+    while media.video_queue.is_empty() && !media.eof {
+        unsafe { media.fill_queues()? };
+    }
+    let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
+    clock.seek(displayed_target);
+    notice.show(displayed_target - playback_start, Some(duration));
     Ok(())
 }
 
@@ -1399,9 +1887,15 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     )
     .map_err(|_| "media filename contains a NUL byte".to_string())?;
     let window = unsafe { Window::create(&title)? };
-    let _wayland_input = unsafe { WaylandInput::create(&window)? };
+    let _wayland_input = match unsafe { WaylandInput::create(&window) } {
+        Ok(input) => Some(input),
+        Err(error) => {
+            eprintln!("warning: {error}; drag-anywhere is unavailable");
+            None
+        }
+    };
     let renderer = unsafe { Renderer::create(&window)? };
-    let mut media = unsafe { Media::open(&path, renderer.device())? };
+    let mut media = unsafe { Media::open(&path, renderer.device(), perf_log)? };
 
     unsafe { media.fill_queues()? };
     if media.video_queue.is_empty() {
@@ -1421,6 +1915,8 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             RendererOverlays {
                 info: None,
                 position: None,
+                scrubber: None,
+                subtitle: None,
             },
         )?
     };
@@ -1430,18 +1926,32 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         unsafe { media.audio_clock() }.unwrap_or(media.first_video_pts.unwrap_or(0.0));
     let playback_start = clock_origin;
     let media_duration = media.duration();
+    let subtitle_track_count = media.subtitle_decoders.len();
+    let subtitles_available = subtitle_track_count > 0;
     let decoder = DecodeWorker::start(media, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
     let mut video_queue = VecDeque::new();
+    let mut subtitle_queue = VecDeque::new();
+    let mut subtitle_queues = (0..subtitle_track_count)
+        .map(|_| VecDeque::new())
+        .collect::<Vec<VecDeque<SubtitleCue>>>();
+    let mut current_subtitles = (0..subtitle_track_count)
+        .map(|_| None)
+        .collect::<Vec<Option<SubtitleCue>>>();
     let mut running = true;
     let mut paused = false;
     let mut fullscreen = false;
     let mut info_visible = false;
+    let mut subtitles_visible = subtitles_available;
+    let mut selected_subtitle_track = 0;
     let mut redraw = true;
     let mut new_frame_pending = true;
     let mut top_bar = TopBar::new();
     let mut position_notice = PositionNotice::new();
+    let mut scrubbing = false;
+    let mut scrub_preview = None;
+    let mut pending_scrub_target = None;
     let mut stats = PresentationStats::new();
     let mut last_info_refresh = Instant::now();
     let mut last_perf_report = Instant::now();
@@ -1470,10 +1980,23 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 }
                 ffi::SDL_EventType_SDL_EVENT_WINDOW_FOCUS_LOST => {
                     top_bar.set_focused(false);
+                    if scrubbing {
+                        pending_scrub_target = scrub_preview.take();
+                    }
+                    scrubbing = false;
+                    unsafe { ffi::SDL_CaptureMouse(false) };
                     redraw = true;
                 }
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_MOTION => {
+                    let motion = unsafe { event.motion };
                     top_bar.mouse_activity();
+                    if scrubbing
+                        && let Some(target) =
+                            unsafe { window.scrubber_target(motion.x, motion.y, media_duration) }
+                    {
+                        scrub_preview = Some(target);
+                        position_notice.show(target, media_duration);
+                    }
                     redraw = true;
                 }
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_DOWN => {
@@ -1481,11 +2004,35 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     top_bar.mouse_activity();
                     redraw = true;
                     if button.button == ffi::SDL_BUTTON_LEFT as u8 {
-                        if unsafe { window.close_button_contains(button.x, button.y) } {
+                        if let Some(target) =
+                            unsafe { window.scrubber_target(button.x, button.y, media_duration) }
+                        {
+                            scrubbing = true;
+                            scrub_preview = Some(target);
+                            position_notice.show(target, media_duration);
+                            unsafe { ffi::SDL_CaptureMouse(true) };
+                        } else if unsafe { window.close_button_contains(button.x, button.y) } {
                             running = false;
                         } else if button.clicks >= 2 {
                             unsafe { toggle_fullscreen(&window, &mut fullscreen)? };
                         }
+                    }
+                }
+                ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_UP => {
+                    let button = unsafe { event.button };
+                    if button.button == ffi::SDL_BUTTON_LEFT as u8 && scrubbing {
+                        if let Some(target) =
+                            unsafe { window.scrubber_target(button.x, button.y, media_duration) }
+                        {
+                            pending_scrub_target = Some(target);
+                            position_notice.show(target, media_duration);
+                        } else {
+                            pending_scrub_target = scrub_preview;
+                        }
+                        scrubbing = false;
+                        scrub_preview = None;
+                        unsafe { ffi::SDL_CaptureMouse(false) };
+                        redraw = true;
                     }
                 }
                 ffi::SDL_EventType_SDL_EVENT_KEY_DOWN => {
@@ -1498,6 +2045,11 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         Some(Action::SeekBackward) => {
                             let mut media = decoder.lock()?;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
+                            decoder.clear_subtitles(
+                                &mut subtitle_queue,
+                                &mut subtitle_queues,
+                                &mut current_subtitles,
+                            );
                             unsafe {
                                 seek_by(
                                     &mut media,
@@ -1514,6 +2066,11 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         Some(Action::SeekForward) => {
                             let mut media = decoder.lock()?;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
+                            decoder.clear_subtitles(
+                                &mut subtitle_queue,
+                                &mut subtitle_queues,
+                                &mut current_subtitles,
+                            );
                             unsafe {
                                 seek_by(
                                     &mut media,
@@ -1541,6 +2098,27 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             unsafe { media.set_paused(paused)? };
                             clock.set_paused(paused);
                         }
+                        Some(Action::ToggleSubtitles) if subtitles_available => {
+                            subtitles_visible = !subtitles_visible;
+                            position_notice.show_text(subtitle_status_text(
+                                subtitles_visible,
+                                selected_subtitle_track,
+                                subtitle_track_count,
+                            ));
+                            redraw = true;
+                        }
+                        Some(Action::CycleSubtitles) if subtitles_available => {
+                            selected_subtitle_track =
+                                next_subtitle_track(selected_subtitle_track, subtitle_track_count);
+                            subtitles_visible = true;
+                            position_notice.show_text(subtitle_status_text(
+                                true,
+                                selected_subtitle_track,
+                                subtitle_track_count,
+                            ));
+                            redraw = true;
+                        }
+                        Some(Action::ToggleSubtitles | Action::CycleSubtitles) => {}
                         None => {}
                     }
                 }
@@ -1550,13 +2128,58 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         if !running {
             break;
         }
+        if let (Some(position), Some(duration)) = (pending_scrub_target.take(), media_duration) {
+            let mut media = decoder.lock()?;
+            decoder.clear_frames(&mut video_queue, &mut current_video);
+            decoder.clear_subtitles(
+                &mut subtitle_queue,
+                &mut subtitle_queues,
+                &mut current_subtitles,
+            );
+            unsafe {
+                seek_to(
+                    &mut media,
+                    &mut clock,
+                    &mut position_notice,
+                    position,
+                    playback_start,
+                    duration,
+                )?
+            };
+            redraw = true;
+            new_frame_pending = true;
+        }
         decoder.check_error()?;
         decoder.receive_frames(&mut video_queue);
+        decoder.receive_subtitles(&mut subtitle_queue)?;
+        while let Some(subtitle) = subtitle_queue.pop_front() {
+            let track = subtitle.track;
+            if let Some(queue) = subtitle_queues.get_mut(track) {
+                queue.push_back(subtitle);
+            }
+        }
 
         // SDL/PipeWire consumes audio in period-sized chunks (1024 samples on
         // this machine), so the continuous audio-anchored wall clock is used
         // for video presentation instead of the quantized queue counter.
         let playback_time = clock.now();
+
+        for (queue, current) in subtitle_queues.iter_mut().zip(current_subtitles.iter_mut()) {
+            while queue
+                .front()
+                .is_some_and(|subtitle| subtitle.start <= playback_time)
+            {
+                *current = queue.pop_front();
+                redraw = true;
+            }
+            if current
+                .as_ref()
+                .is_some_and(|subtitle| subtitle.end <= playback_time)
+            {
+                *current = None;
+                redraw = true;
+            }
+        }
 
         if !paused {
             let mut due_frames = 0;
@@ -1614,7 +2237,9 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
 
         if redraw && let Some(frame) = current_video.as_ref().map(|queued| &queued.frame) {
             let stats_info = info_visible.then(|| stats.text());
-            let persistent_position = (position_notice.text.is_none() && info_visible)
+            let controls_visible = top_bar.alpha > 0.001;
+            let persistent_position = (position_notice.text.is_none()
+                && (info_visible || controls_visible))
                 .then(|| timeline_text(playback_time - playback_start, media_duration));
             let position = position_notice
                 .text
@@ -1624,9 +2249,16 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 position_notice.alpha
             } else if info_visible {
                 1.0
+            } else if controls_visible {
+                top_bar.alpha
             } else {
                 0.0
             };
+            let scrubber = media_duration.map(|duration| {
+                let position = scrub_preview.unwrap_or(playback_time - playback_start);
+                let progress = (position / duration).clamp(0.0, 1.0);
+                (progress as f32, top_bar.alpha)
+            });
             let display_started = Instant::now();
             unsafe {
                 renderer.display(
@@ -1638,6 +2270,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     RendererOverlays {
                         info: stats_info.as_deref().map(|text| (text, 1.0)),
                         position: position.map(|text| (text, position_alpha)),
+                        scrubber,
+                        subtitle: subtitles_visible
+                            .then(|| current_subtitles[selected_subtitle_track].as_ref())
+                            .flatten(),
                     },
                 )?
             };
@@ -1738,8 +2374,25 @@ mod tests {
         assert_eq!(action_for_key(ffi::SDLK_LEFT), Some(Action::SeekBackward));
         assert_eq!(action_for_key(ffi::SDLK_RIGHT), Some(Action::SeekForward));
         assert_eq!(action_for_key(ffi::SDLK_SPACE), Some(Action::TogglePause));
+        assert_eq!(action_for_key(ffi::SDLK_S), Some(Action::ToggleSubtitles));
+        assert_eq!(action_for_key(ffi::SDLK_J), Some(Action::CycleSubtitles));
         assert_eq!(action_for_key(ffi::SDLK_Q), Some(Action::Quit));
         assert_eq!(action_for_key(ffi::SDLK_A), None);
+    }
+
+    #[test]
+    fn subtitle_tracks_cycle_and_report_status() {
+        assert_eq!(next_subtitle_track(0, 3), 1);
+        assert_eq!(next_subtitle_track(2, 3), 0);
+        assert_eq!(next_subtitle_track(0, 0), 0);
+        assert_eq!(
+            subtitle_status_text(true, 1, 3).to_bytes(),
+            b"SUBTITLES: 2 / 3"
+        );
+        assert_eq!(
+            subtitle_status_text(false, 1, 3).to_bytes(),
+            b"SUBTITLES: OFF"
+        );
     }
 
     #[test]
@@ -1762,6 +2415,49 @@ mod tests {
         assert_eq!(
             timeline_text(20.0, Some(313.0)).to_str().unwrap(),
             "0:20 / 5:13"
+        );
+    }
+
+    #[test]
+    fn scrubber_maps_mouse_position_and_avoids_resize_edges() {
+        assert_eq!(
+            scrubber_target(640.0, 700.0, 1280, 720, 2560, 1440, 100.0),
+            Some(50.0)
+        );
+        assert_eq!(
+            scrubber_target(640.0, 680.0, 1280, 720, 2560, 1440, 100.0),
+            None
+        );
+        assert_eq!(
+            scrubber_target(640.0, 715.0, 1280, 720, 2560, 1440, 100.0),
+            None
+        );
+        assert_eq!(
+            scrubber_target(5.0, 700.0, 1280, 720, 2560, 1440, 100.0),
+            None
+        );
+    }
+
+    #[test]
+    fn seeking_chooses_the_closest_available_keyframe() {
+        assert_eq!(closest_seek_point(10.0, Some(6.0), Some(12.0)), Some(12.0));
+        assert_eq!(closest_seek_point(10.0, Some(8.0), Some(14.0)), Some(8.0));
+        assert_eq!(closest_seek_point(10.0, Some(8.0), None), Some(8.0));
+        assert_eq!(closest_seek_point(10.0, None, None), None);
+    }
+
+    #[test]
+    fn ass_dialogue_is_reduced_to_overlay_text() {
+        assert_eq!(
+            subtitle_dialogue_text(
+                "0,0,Default,,0,0,0,,{\\i1}Hello, world!\\NSecond line",
+                true
+            ),
+            "Hello, world!\nSecond line"
+        );
+        assert_eq!(
+            subtitle_dialogue_text("Français — 日本語 — 希布來語", false),
+            "Français - 日本語 - 希布來語"
         );
     }
 }

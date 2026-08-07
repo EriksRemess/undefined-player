@@ -9,6 +9,7 @@
 #include <libplacebo/swapchain.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
+#include <pango/pangocairo.h>
 
 #include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
@@ -28,6 +29,15 @@ struct UpVideoRenderer {
     pl_tex textures[4];
     pl_tex solid_texture;
     pl_tex text_texture;
+    pl_tex subtitle_texture;
+    pl_tex text_subtitle_texture;
+    int subtitle_width;
+    int subtitle_height;
+    uint64_t subtitle_serial;
+    int text_subtitle_width;
+    int text_subtitle_height;
+    int text_subtitle_layout_width;
+    uint64_t text_subtitle_serial;
 
     AVBufferRef *hw_device;
     PFN_vkGetInstanceProcAddr get_proc_addr;
@@ -41,7 +51,7 @@ struct UpVideoRenderer {
 };
 
 #define TEXTURE_WIDTH 1024
-#define TEXTURE_HEIGHT 64
+#define TEXTURE_HEIGHT 160
 #define GLYPH_SCALE 2
 #define CLOSE_GLYPH_X (TEXTURE_WIDTH - 12)
 #define CLOSE_GLYPH_Y 32
@@ -94,6 +104,14 @@ static const uint8_t *glyph_rows(char character)
     static const uint8_t dash[7] = {0, 0, 0, 31, 0, 0, 0};
     static const uint8_t slash[7] = {1, 2, 2, 4, 8, 8, 16};
     static const uint8_t underscore[7] = {0, 0, 0, 0, 0, 0, 31};
+    static const uint8_t comma[7] = {0, 0, 0, 0, 0, 6, 4};
+    static const uint8_t apostrophe[7] = {6, 4, 8, 0, 0, 0, 0};
+    static const uint8_t quote[7] = {10, 10, 20, 0, 0, 0, 0};
+    static const uint8_t exclamation[7] = {4, 4, 4, 4, 4, 0, 4};
+    static const uint8_t question[7] = {14, 17, 1, 2, 4, 0, 4};
+    static const uint8_t left_paren[7] = {2, 4, 8, 8, 8, 4, 2};
+    static const uint8_t right_paren[7] = {8, 4, 2, 2, 2, 4, 8};
+    static const uint8_t ampersand[7] = {12, 18, 20, 8, 21, 18, 13};
 
     if (character >= '0' && character <= '9')
         return digits[character - '0'];
@@ -106,6 +124,14 @@ static const uint8_t *glyph_rows(char character)
     if (character == '-') return dash;
     if (character == '/') return slash;
     if (character == '_') return underscore;
+    if (character == ',') return comma;
+    if (character == '\'') return apostrophe;
+    if (character == '"') return quote;
+    if (character == '!') return exclamation;
+    if (character == '?') return question;
+    if (character == '(') return left_paren;
+    if (character == ')') return right_paren;
+    if (character == '&') return ampersand;
     return blank;
 }
 
@@ -174,6 +200,156 @@ static bool update_text_texture(UpVideoRenderer *renderer, const char *title,
     snprintf(renderer->cached_position, sizeof(renderer->cached_position), "%s",
              safe_position);
     return true;
+}
+
+static bool update_subtitle_texture(UpVideoRenderer *renderer,
+                                    const uint8_t *pixels, int width, int height,
+                                    uint64_t serial)
+{
+    if (!pixels || width <= 0 || height <= 0)
+        return true;
+    if (renderer->subtitle_texture && renderer->subtitle_width == width &&
+        renderer->subtitle_height == height && renderer->subtitle_serial == serial)
+        return true;
+
+    if (!renderer->subtitle_texture || renderer->subtitle_width != width ||
+        renderer->subtitle_height != height) {
+        pl_tex_destroy(renderer->vulkan->gpu, &renderer->subtitle_texture);
+        pl_fmt format = pl_find_fmt(renderer->vulkan->gpu, PL_FMT_UNORM, 4,
+                                    8, 8, PL_FMT_CAP_SAMPLEABLE);
+        if (!format || !(renderer->subtitle_texture = pl_tex_create(
+                renderer->vulkan->gpu,
+                pl_tex_params(.w = width, .h = height, .format = format,
+                              .sampleable = true, .host_writable = true)))) {
+            set_error(renderer, "could not create Vulkan subtitle texture");
+            return false;
+        }
+        renderer->subtitle_width = width;
+        renderer->subtitle_height = height;
+    }
+    if (!pl_tex_upload(renderer->vulkan->gpu,
+                       pl_tex_transfer_params(
+                           .tex = renderer->subtitle_texture,
+                           .row_pitch = (size_t) width * 4,
+                           .ptr = (void *) pixels))) {
+        set_error(renderer, "could not upload subtitle bitmap to Vulkan");
+        return false;
+    }
+    renderer->subtitle_serial = serial;
+    return true;
+}
+
+static bool update_text_subtitle_texture(UpVideoRenderer *renderer,
+                                         const char *text, int layout_width,
+                                         uint64_t serial)
+{
+    if (!text || !*text || layout_width <= 0)
+        return true;
+    if (renderer->text_subtitle_texture &&
+        renderer->text_subtitle_serial == serial &&
+        renderer->text_subtitle_layout_width == layout_width)
+        return true;
+
+    cairo_surface_t *measure_surface = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *measure = cairo_create(measure_surface);
+    PangoLayout *layout = pango_cairo_create_layout(measure);
+    PangoFontDescription *font = pango_font_description_new();
+    pango_font_description_set_family(font, "DejaVu Sans Mono");
+    pango_font_description_set_weight(font, PANGO_WEIGHT_BOLD);
+    pango_font_description_set_absolute_size(font, 18 * PANGO_SCALE);
+    pango_layout_set_font_description(layout, font);
+    pango_layout_set_text(layout, text, -1);
+    pango_layout_set_width(layout, layout_width * PANGO_SCALE);
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+    pango_layout_set_spacing(layout, 8 * PANGO_SCALE);
+    pango_layout_set_height(layout, -4);
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+
+    PangoRectangle logical_extents;
+    pango_layout_get_pixel_extents(layout, NULL, &logical_extents);
+    int text_width = logical_extents.width;
+    int text_height = logical_extents.height;
+    text_width = text_width > 0 ? text_width : 1;
+    text_height = text_height > 0 ? text_height : 1;
+    cairo_surface_t *surface = cairo_image_surface_create(
+        CAIRO_FORMAT_A8, text_width, text_height);
+    cairo_t *context = cairo_create(surface);
+    PangoLayout *render_layout = pango_cairo_create_layout(context);
+    pango_layout_set_font_description(render_layout, font);
+    pango_layout_set_text(render_layout, text, -1);
+    pango_layout_set_width(render_layout, layout_width * PANGO_SCALE);
+    pango_layout_set_wrap(render_layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_alignment(render_layout, PANGO_ALIGN_CENTER);
+    pango_layout_set_spacing(render_layout, 8 * PANGO_SCALE);
+    pango_layout_set_height(render_layout, -4);
+    pango_layout_set_ellipsize(render_layout, PANGO_ELLIPSIZE_END);
+    cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(context, 0.0, 0.0, 0.0, 0.0);
+    cairo_paint(context);
+    cairo_set_operator(context, CAIRO_OPERATOR_OVER);
+    cairo_set_source_rgba(context, 1.0, 1.0, 1.0, 1.0);
+    cairo_translate(context, -logical_extents.x, -logical_extents.y);
+    pango_cairo_show_layout(context, render_layout);
+    cairo_surface_flush(surface);
+
+    bool success = true;
+    const unsigned char *glyphs = cairo_image_surface_get_data(surface);
+    int glyph_stride = cairo_image_surface_get_stride(surface);
+    bool has_glyphs = false;
+    for (int y = 0; y < text_height && !has_glyphs; y++) {
+        for (int x = 0; x < text_width; x++) {
+            if (glyphs[y * glyph_stride + x] != 0) {
+                has_glyphs = true;
+                break;
+            }
+        }
+    }
+    if (!has_glyphs) {
+        set_error(renderer, "Pango produced an empty subtitle glyph mask");
+        success = false;
+    }
+    if (!renderer->text_subtitle_texture ||
+        renderer->text_subtitle_width != text_width ||
+        renderer->text_subtitle_height != text_height) {
+        pl_tex_destroy(renderer->vulkan->gpu,
+                       &renderer->text_subtitle_texture);
+        pl_fmt format = pl_find_fmt(renderer->vulkan->gpu, PL_FMT_UNORM, 1,
+                                    8, 8, PL_FMT_CAP_SAMPLEABLE);
+        if (!format || !(renderer->text_subtitle_texture = pl_tex_create(
+                renderer->vulkan->gpu,
+                pl_tex_params(.w = text_width, .h = text_height,
+                              .format = format, .sampleable = true,
+                              .host_writable = true)))) {
+            set_error(renderer, "could not create Vulkan text subtitle texture");
+            success = false;
+        }
+        renderer->text_subtitle_width = text_width;
+        renderer->text_subtitle_height = text_height;
+    }
+    if (success && !pl_tex_upload(
+            renderer->vulkan->gpu,
+            pl_tex_transfer_params(
+                .tex = renderer->text_subtitle_texture,
+                .row_pitch = (size_t) glyph_stride,
+                .ptr = (void *) glyphs))) {
+        set_error(renderer, "could not upload text subtitle glyphs to Vulkan");
+        success = false;
+    }
+    if (success) {
+        renderer->text_subtitle_serial = serial;
+        renderer->text_subtitle_layout_width = layout_width;
+    }
+
+    g_object_unref(render_layout);
+    cairo_destroy(context);
+    cairo_surface_destroy(surface);
+    pango_font_description_free(font);
+    g_object_unref(layout);
+    cairo_destroy(measure);
+    cairo_surface_destroy(measure_surface);
+    return success;
 }
 
 static void set_error(UpVideoRenderer *renderer, const char *message)
@@ -404,15 +580,21 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
                               int width, int height, float top_bar_alpha,
                               const char *title, const char *info,
                               float info_alpha, const char *position,
-                              float position_alpha)
+                              float position_alpha, float scrubber_progress,
+                              float scrubber_alpha, const char *subtitle_text,
+                              const uint8_t *subtitle_pixels,
+                              int subtitle_width, int subtitle_height,
+                              uint64_t subtitle_serial)
 {
     struct pl_swapchain_frame swap_frame = {0};
     struct pl_frame image = {0};
     struct pl_frame target = {0};
     struct pl_render_params params = pl_render_default_params;
     struct pl_color_space hint = {0};
-    struct pl_overlay overlays[7] = {0};
-    struct pl_overlay_part parts[7] = {0};
+    struct pl_overlay overlays[16] = {0};
+    struct pl_overlay_part parts[16] = {0};
+    struct pl_overlay bitmap_overlay = {0};
+    struct pl_overlay_part bitmap_part = {0};
     int num_overlays = 0;
     int title_width = 0, info_width = 0, position_width = 0;
     int ret = -1;
@@ -428,6 +610,28 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
         return -1;
     }
 
+    if (subtitle_pixels && subtitle_width > 0 && subtitle_height > 0) {
+        if (!update_subtitle_texture(renderer, subtitle_pixels, subtitle_width,
+                                     subtitle_height, subtitle_serial))
+            goto out;
+        bitmap_part = (struct pl_overlay_part) {
+            .src = {0, 0, subtitle_width, subtitle_height},
+            .dst = {0, 0, frame->width, frame->height},
+        };
+        bitmap_overlay = (struct pl_overlay) {
+            .tex = renderer->subtitle_texture,
+            .mode = PL_OVERLAY_NORMAL,
+            .coords = PL_OVERLAY_COORDS_SRC_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &bitmap_part,
+            .num_parts = 1,
+        };
+        bitmap_overlay.repr.alpha = PL_ALPHA_INDEPENDENT;
+        image.overlays = &bitmap_overlay;
+        image.num_overlays = 1;
+    }
+
     pl_color_space_from_avframe(&hint, frame);
     pl_swapchain_colorspace_hint(renderer->swapchain, &hint);
     if (!pl_swapchain_start_frame(renderer->swapchain, &swap_frame)) {
@@ -436,8 +640,39 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
     }
 
     pl_frame_from_swapchain(&target, &swap_frame);
-    if (!update_text_texture(renderer, title, info, position, &title_width,
-                             &info_width, &position_width))
+    double sample_aspect = 1.0;
+    if (frame->sample_aspect_ratio.num > 0 &&
+        frame->sample_aspect_ratio.den > 0) {
+        sample_aspect = (double) frame->sample_aspect_ratio.num /
+                        frame->sample_aspect_ratio.den;
+    }
+    double video_aspect = frame->height > 0
+        ? ((double) frame->width * sample_aspect) / frame->height
+        : (double) width / height;
+    double window_aspect = (double) width / height;
+    float x0 = 0.0f, y0 = 0.0f, x1 = (float) width, y1 = (float) height;
+    if (video_aspect > window_aspect) {
+        float fitted_height = (float) (width / video_aspect);
+        y0 = ((float) height - fitted_height) * 0.5f;
+        y1 = y0 + fitted_height;
+    } else {
+        float fitted_width = (float) (height * video_aspect);
+        x0 = ((float) width - fitted_width) * 0.5f;
+        x1 = x0 + fitted_width;
+    }
+    target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = y0,
+                                        .x1 = x1, .y1 = y1 };
+
+    if (subtitle_text && *subtitle_text) {
+        int layout_width = (int) (x1 - x0) - 80;
+        layout_width = layout_width > 120 ? layout_width : 120;
+        if (!update_text_subtitle_texture(renderer, subtitle_text, layout_width,
+                                          subtitle_serial))
+            goto out;
+    }
+
+    if (!update_text_texture(renderer, title, info, position,
+                             &title_width, &info_width, &position_width))
         goto out;
 
     top_bar_alpha = fminf(fmaxf(top_bar_alpha, 0.0f), 1.0f);
@@ -495,7 +730,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
 
     info_alpha = fminf(fmaxf(info_alpha, 0.0f), 1.0f);
     if (info && info_width > 0 && info_alpha > 0.001f) {
-        const float info_y = fmaxf(height - 32.0f, 0.0f);
+        const float info_y = fmaxf(height - 54.0f, 0.0f);
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, 0, 1, 1},
             .dst = {6, info_y - 4, 22 + info_width, info_y + 22},
@@ -531,7 +766,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
 
     position_alpha = fminf(fmaxf(position_alpha, 0.0f), 1.0f);
     if (position && position_width > 0 && position_alpha > 0.001f) {
-        const float position_y = fmaxf(height - 32.0f, 0.0f);
+        const float position_y = fmaxf(height - 54.0f, 0.0f);
         const float position_x = fmaxf(width - position_width - 14.0f, 14.0f);
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, 0, 1, 1},
@@ -568,31 +803,112 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
         overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
         num_overlays++;
     }
+
+    scrubber_alpha = fminf(fmaxf(scrubber_alpha, 0.0f), 1.0f);
+    if (scrubber_progress >= 0.0f && scrubber_alpha > 0.001f) {
+        const float left = 14.0f;
+        const float right = fmaxf(width - 14.0f, left);
+        const float center_y = fmaxf(height - 18.0f, 0.0f);
+        const float progress_x = left + (right - left) *
+            fminf(fmaxf(scrubber_progress, 0.0f), 1.0f);
+
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, 0, 1, 1},
+            .dst = {left, center_y - 2, right, center_y + 2},
+            .color = {1.0f, 1.0f, 1.0f, 0.35f * scrubber_alpha},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->solid_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+
+        if (progress_x > left) {
+            parts[num_overlays] = (struct pl_overlay_part) {
+                .src = {0, 0, 1, 1},
+                .dst = {left, center_y - 2, progress_x, center_y + 2},
+                .color = {0.25f, 0.70f, 1.0f, scrubber_alpha},
+            };
+            overlays[num_overlays] = (struct pl_overlay) {
+                .tex = renderer->solid_texture,
+                .mode = PL_OVERLAY_MONOCHROME,
+                .coords = PL_OVERLAY_COORDS_DST_FRAME,
+                .repr = pl_color_repr_rgb,
+                .color = pl_color_space_srgb,
+                .parts = &parts[num_overlays], .num_parts = 1,
+            };
+            overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+            num_overlays++;
+        }
+
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, 0, 1, 1},
+            .dst = {progress_x - 3, center_y - 6,
+                    progress_x + 3, center_y + 6},
+            .color = {1.0f, 1.0f, 1.0f, scrubber_alpha},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->solid_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+    }
+
+    if (subtitle_text && *subtitle_text && renderer->text_subtitle_texture) {
+        const float text_width = renderer->text_subtitle_width;
+        const float text_height = renderer->text_subtitle_height;
+        const float bottom = fmaxf(y0 + text_height + 8.0f, y1 - 70.0f);
+        const float top = bottom - text_height;
+        const float background_left = fmaxf(
+            ((float) width - text_width) * 0.5f - 8.0f, x0);
+        const float background_right = fminf(
+            ((float) width + text_width) * 0.5f + 8.0f, x1);
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, 0, 1, 1},
+            .dst = {background_left, top - 5.0f,
+                    background_right, bottom + 5.0f},
+            .color = {0.0f, 0.0f, 0.0f, 0.72f},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->solid_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+
+        const float text_x = ((float) width - text_width) * 0.5f;
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, 0, text_width, text_height},
+            .dst = {text_x, top, text_x + text_width, bottom},
+            .color = {1.0f, 1.0f, 1.0f, 1.0f},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->text_subtitle_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+    }
     target.overlays = overlays;
     target.num_overlays = num_overlays;
-
-    double sample_aspect = 1.0;
-    if (frame->sample_aspect_ratio.num > 0 &&
-        frame->sample_aspect_ratio.den > 0) {
-        sample_aspect = (double) frame->sample_aspect_ratio.num /
-                        frame->sample_aspect_ratio.den;
-    }
-    double video_aspect = frame->height > 0
-        ? ((double) frame->width * sample_aspect) / frame->height
-        : (double) width / height;
-    double window_aspect = (double) width / height;
-    float x0 = 0.0f, y0 = 0.0f, x1 = (float) width, y1 = (float) height;
-    if (video_aspect > window_aspect) {
-        float fitted_height = (float) (width / video_aspect);
-        y0 = ((float) height - fitted_height) * 0.5f;
-        y1 = y0 + fitted_height;
-    } else {
-        float fitted_width = (float) (height * video_aspect);
-        x0 = ((float) width - fitted_width) * 0.5f;
-        x1 = x0 + fitted_width;
-    }
-    target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = y0,
-                                        .x1 = x1, .y1 = y1 };
     params.background = PL_CLEAR_COLOR;
     params.background_color[0] = 0.0f;
     params.background_color[1] = 0.0f;
@@ -656,6 +972,9 @@ void up_video_renderer_destroy(UpVideoRenderer *renderer)
             pl_tex_destroy(renderer->vulkan->gpu, &renderer->textures[i]);
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->solid_texture);
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->text_texture);
+        pl_tex_destroy(renderer->vulkan->gpu, &renderer->subtitle_texture);
+        pl_tex_destroy(renderer->vulkan->gpu,
+                       &renderer->text_subtitle_texture);
         pl_renderer_destroy(&renderer->renderer);
         pl_swapchain_destroy(&renderer->swapchain);
         pl_vulkan_destroy(&renderer->vulkan);

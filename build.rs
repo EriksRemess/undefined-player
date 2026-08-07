@@ -11,6 +11,23 @@ fn run(mut command: Command, description: &str) {
     assert!(status.success(), "{description} failed with {status}");
 }
 
+fn pkg_config(option: &str, package: &str) -> Vec<String> {
+    let output = Command::new("pkg-config")
+        .args([option, package])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start pkg-config for {package}: {error}"));
+    assert!(
+        output.status.success(),
+        "pkg-config could not find {package}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("pkg-config output is UTF-8")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let bindings = out_dir.join("bindings.rs");
@@ -44,7 +61,7 @@ fn main() {
         .arg("native/bindings.h")
         .args([
             "--allowlist-function",
-            "(SDL|av|avcodec|avformat|swr|up)_.*",
+            "(SDL|av|avcodec|avformat|avsubtitle|swr|up)_.*",
         ])
         .args(["--allowlist-type", "(SDL|AV|Swr|Up)_.*"])
         .args(["--allowlist-var", "(SDL|AV|UP).*"])
@@ -63,6 +80,7 @@ fn main() {
     let mut cc = Command::new("cc");
     cc.arg("-std=c11")
         .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .args(pkg_config("--cflags", "pangocairo"))
         .arg(format!("-I{FFMPEG}"))
         .arg("-I/usr/local/include")
         .arg("-I/usr/include/x86_64-linux-gnu")
@@ -114,6 +132,15 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=placebo");
     println!("cargo:rustc-link-lib=dylib=SDL3");
     println!("cargo:rustc-link-lib=dylib=wayland-client");
+    for argument in pkg_config("--libs", "pangocairo") {
+        if let Some(library) = argument.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib=dylib={library}");
+        } else if let Some(directory) = argument.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={directory}");
+        } else {
+            println!("cargo:rustc-link-arg={argument}");
+        }
+    }
 
     for directory in ["libavformat", "libavcodec", "libswresample", "libavutil"] {
         let path = Path::new(FFMPEG).join(directory);

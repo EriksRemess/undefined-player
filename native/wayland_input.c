@@ -13,6 +13,7 @@
 #define DOUBLE_CLICK_DISTANCE 8.0
 #define RESIZE_BORDER 10.0
 #define TOP_BAR_HEIGHT_PIXELS 42.0
+#define SCRUBBER_HIT_HEIGHT_PIXELS 42.0
 
 struct UpWaylandInput {
     SDL_Window *window;
@@ -52,6 +53,18 @@ static bool is_close_button(UpWaylandInput *input)
     const double button_height = TOP_BAR_HEIGHT_PIXELS * height / pixel_height;
     return input->x >= width - button_width && input->x < width &&
            input->y >= 0.0 && input->y < button_height;
+}
+
+static bool is_scrubber(UpWaylandInput *input)
+{
+    int width = 0, height = 0;
+    int pixel_width = 0, pixel_height = 0;
+    if (!SDL_GetWindowSize(input->window, &width, &height) ||
+        !SDL_GetWindowSizeInPixels(input->window, &pixel_width, &pixel_height) ||
+        height <= 0 || pixel_height <= 0)
+        return false;
+    const double hit_height = SCRUBBER_HIT_HEIGHT_PIXELS * height / pixel_height;
+    return input->y >= height - hit_height;
 }
 
 static void pointer_enter(void *data, struct wl_pointer *pointer,
@@ -105,6 +118,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     // SDL's edge-only hit test consumes this click and sends the corresponding
     // xdg_toplevel.resize request. Do not race it with a move request.
     if (is_resize_edge(input)) {
+        input->last_click_time = 0;
+        return;
+    }
+
+    // Leave timeline clicks and drags to SDL instead of asking the compositor
+    // to move the window.
+    if (is_scrubber(input)) {
         input->last_click_time = 0;
         return;
     }
