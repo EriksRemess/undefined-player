@@ -1,9 +1,9 @@
 # undefined-player
 
 A deliberately machine-specific Wayland video-player MVP. It uses the local
-FFmpeg 9 checkout at `/home/eriks/Development/ffmpeg`, decodes directly with
-NVIDIA Vulkan Video, renders with libplacebo to a Vulkan Wayland swapchain, and
-plays audio through PipeWire.
+FFmpeg 9 checkout at `/home/eriks/Development/ffmpeg`, decodes supported codecs
+directly with NVIDIA Vulkan Video, renders with libplacebo to a Vulkan Wayland
+swapchain, and plays audio through PipeWire.
 
 ## Build and run
 
@@ -12,7 +12,8 @@ cargo build --release
 target/release/undefined-player ~/Videos/example.mp4
 ```
 
-Add `--perf` to print shown and dropped frame rates every two seconds:
+Add `--perf` to print shown/dropped frame rates and average decoder-fill and
+display times every two seconds:
 
 ```sh
 target/release/undefined-player --perf ~/Videos/example.mp4
@@ -47,10 +48,12 @@ Seeking briefly shows the new playback position in the information overlay.
 
 The MVP accepts one local media path on the command line. Hardware video decode
 currently covers the codecs exposed by both this FFmpeg build and the installed
-NVIDIA Vulkan driver: H.264, HEVC, AV1, and VP9. Unsupported codecs or profiles
-fail with an explicit error instead of downloading frames for software decode.
+NVIDIA Vulkan driver: H.264, HEVC, AV1, and VP9. Other codecs, including MPEG-2,
+fall back to FFmpeg's software decoder and are uploaded for Vulkan presentation.
 HDR metadata is retained from FFmpeg through libplacebo, which supplies the
 matching colorspace hint to the Vulkan swapchain for an HDR-enabled compositor.
+Sources at 720p and below automatically use libplacebo's GPU EWA Lanczos-sharp
+upscaler; larger sources use the normal Lanczos path.
 
 The build intentionally targets this workstation:
 
@@ -62,5 +65,4 @@ The build intentionally targets this workstation:
 - system Wayland client/protocol development files
 - the `bindgen`, `wayland-scanner`, C compiler, and `ar` commands on `PATH`
 
-There is no seeking, playlist, subtitle, stream-selection, or software-decoding
-fallback yet.
+There is no playlist, subtitle, or stream-selection support yet.

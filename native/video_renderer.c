@@ -424,7 +424,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
                            pl_avframe_params(
                                .frame = frame,
                                .tex = renderer->textures))) {
-        set_error(renderer, "libplacebo could not map the Vulkan video frame");
+        set_error(renderer, "libplacebo could not map the decoded video frame");
         return -1;
     }
 
@@ -598,7 +598,16 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
     params.background_color[1] = 0.0f;
     params.background_color[2] = 0.0f;
     params.background_transparency = 0.0f;
-
+    // Spend the available GPU headroom on a sharper reconstruction for small
+    // sources. Hardware-decoded Vulkan frames stay on-device throughout
+    // scaling; software-decoded frames are uploaded here by libplacebo.
+    if (frame->width <= 1280 && frame->height <= 720)
+        params.upscaler = &pl_filter_ewa_lanczossharp;
+    // Dynamic HDR peak detection scans the full frame and eventually contends
+    // with 8K60 AV1 decoding on this GPU. Keep it for lower resolutions, but
+    // use the source's mastering metadata for 8K HDR presentation.
+    if (frame->width >= 7680 || frame->height >= 4320)
+        params.peak_detect_params = NULL;
     if (!pl_render_image(renderer->renderer, &image, &target, &params)) {
         set_error(renderer, "libplacebo failed to render the video frame");
         goto out;

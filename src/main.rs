@@ -5,6 +5,9 @@ use std::env;
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[allow(warnings, clippy::all)]
@@ -350,6 +353,7 @@ struct Decoder {
     context: *mut ffi::AVCodecContext,
     stream_index: i32,
     time_base: ffi::AVRational,
+    uses_vulkan: bool,
 }
 
 impl Drop for Decoder {
@@ -372,6 +376,24 @@ unsafe extern "C" fn choose_vulkan_format(
     ffi::AVPixelFormat_AV_PIX_FMT_NONE
 }
 
+unsafe fn decoder_supports_vulkan(codec: *const ffi::AVCodec) -> bool {
+    let mut index = 0;
+    loop {
+        let config = unsafe { ffi::avcodec_get_hw_config(codec, index) };
+        if config.is_null() {
+            return false;
+        }
+        if unsafe {
+            (*config).device_type == ffi::AVHWDeviceType_AV_HWDEVICE_TYPE_VULKAN
+                && (*config).pix_fmt == ffi::AVPixelFormat_AV_PIX_FMT_VULKAN
+                && ((*config).methods as u32 & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0
+        } {
+            return true;
+        }
+        index += 1;
+    }
+}
+
 impl Decoder {
     unsafe fn open(
         format: *mut ffi::AVFormatContext,
@@ -391,6 +413,7 @@ impl Decoder {
         if codec.is_null() {
             return Err("no decoder is available for the selected stream".into());
         }
+        let uses_vulkan = vulkan_device.is_some() && unsafe { decoder_supports_vulkan(codec) };
 
         let mut context = unsafe { ffi::avcodec_alloc_context3(codec) };
         if context.is_null() {
@@ -405,7 +428,8 @@ impl Decoder {
             }
             unsafe { (*context).pkt_timebase = (*stream).time_base };
 
-            if let Some(device) = vulkan_device {
+            if uses_vulkan {
+                let device = vulkan_device.expect("a Vulkan decoder has a Vulkan device");
                 unsafe {
                     (*context).get_format = Some(choose_vulkan_format);
                     (*context).hw_device_ctx = ffi::av_buffer_ref(device);
@@ -426,6 +450,7 @@ impl Decoder {
                 context,
                 stream_index,
                 time_base: unsafe { (*stream).time_base },
+                uses_vulkan,
             })
         })();
         if result.is_err() {
@@ -440,6 +465,10 @@ struct VideoFrame {
     pts: f64,
     duration: f64,
 }
+
+// The worker transfers exclusive ownership of each reference-counted AVFrame
+// to the presentation thread; the pointer is never accessed concurrently.
+unsafe impl Send for VideoFrame {}
 
 impl Drop for VideoFrame {
     fn drop(&mut self) {
@@ -647,7 +676,6 @@ struct Media {
     audio_decoder: Option<Decoder>,
     audio: Option<AudioOutput>,
     video_queue: VecDeque<VideoFrame>,
-    current_video: Option<VideoFrame>,
     eof: bool,
     drained: bool,
     first_video_pts: Option<f64>,
@@ -696,8 +724,13 @@ impl Media {
             let video_name =
                 unsafe { CStr::from_ptr(ffi::avcodec_get_name((*video_parameters).codec_id)) }
                     .to_string_lossy();
+            let decode_path = if video.uses_vulkan {
+                "NVIDIA Vulkan Video"
+            } else {
+                "software decode, Vulkan presentation"
+            };
             eprintln!(
-                "video: {video_name} {}x{} via NVIDIA Vulkan Video",
+                "video: {video_name} {}x{} via {decode_path}",
                 unsafe { (*video_parameters).width },
                 unsafe { (*video_parameters).height }
             );
@@ -739,7 +772,6 @@ impl Media {
                 audio_decoder,
                 audio,
                 video_queue: VecDeque::new(),
-                current_video: None,
                 eof: false,
                 drained: false,
                 first_video_pts: None,
@@ -765,7 +797,9 @@ impl Media {
                 unsafe { ffi::av_frame_free(&mut frame) };
                 break;
             }
-            if unsafe { (*frame).format } != ffi::AVPixelFormat_AV_PIX_FMT_VULKAN {
+            if self.video.uses_vulkan
+                && unsafe { (*frame).format } != ffi::AVPixelFormat_AV_PIX_FMT_VULKAN
+            {
                 unsafe { ffi::av_frame_free(&mut frame) };
                 return Err(
                     "the selected codec/profile is not supported by NVIDIA Vulkan Video".into(),
@@ -955,7 +989,6 @@ impl Media {
             unsafe { audio.reset()? };
         }
         self.video_queue.clear();
-        self.current_video = None;
         self.eof = false;
         self.drained = false;
         self.video_seek_target = Some(target);
@@ -982,6 +1015,149 @@ impl Drop for Media {
             ffi::av_packet_free(&mut self.packet);
             ffi::avformat_close_input(&mut self.format);
         }
+    }
+}
+
+// All FFmpeg, resampler, and SDL audio state is exclusively accessed while
+// holding DecodeWorker's mutex. Vulkan queue access is synchronized by the
+// lock callbacks installed on the shared FFmpeg/libplacebo Vulkan device.
+unsafe impl Send for Media {}
+
+struct DecodeWorker {
+    media: Arc<Mutex<Media>>,
+    running: Arc<AtomicBool>,
+    fill_nanoseconds: Arc<AtomicU64>,
+    outstanding_frames: Arc<AtomicUsize>,
+    frames: mpsc::Receiver<QueuedVideoFrame>,
+    errors: mpsc::Receiver<String>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct QueuedVideoFrame {
+    frame: VideoFrame,
+    outstanding_frames: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedVideoFrame {
+    fn drop(&mut self) {
+        self.outstanding_frames.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl DecodeWorker {
+    fn start(media: Media, measure_performance: bool) -> Self {
+        let media = Arc::new(Mutex::new(media));
+        let running = Arc::new(AtomicBool::new(true));
+        let fill_nanoseconds = Arc::new(AtomicU64::new(0));
+        let outstanding_frames = Arc::new(AtomicUsize::new(0));
+        let (frame_sender, frames) = mpsc::channel();
+        let (error_sender, errors) = mpsc::channel();
+        let thread_media = Arc::clone(&media);
+        let thread_running = Arc::clone(&running);
+        let thread_fill_nanoseconds = Arc::clone(&fill_nanoseconds);
+        let thread_outstanding_frames = Arc::clone(&outstanding_frames);
+        let thread = thread::spawn(move || {
+            while thread_running.load(Ordering::Acquire) {
+                let started = Instant::now();
+                let result = match thread_media.lock() {
+                    Ok(mut media) => {
+                        let result = unsafe { media.fill_queues() };
+                        while result.is_ok()
+                            && thread_outstanding_frames.load(Ordering::Acquire) < VIDEO_QUEUE_MAX
+                        {
+                            let Some(frame) = media.video_queue.pop_front() else {
+                                break;
+                            };
+                            thread_outstanding_frames.fetch_add(1, Ordering::Release);
+                            if frame_sender
+                                .send(QueuedVideoFrame {
+                                    frame,
+                                    outstanding_frames: Arc::clone(&thread_outstanding_frames),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        result
+                    }
+                    Err(_) => Err("decoder state lock was poisoned".into()),
+                };
+                if measure_performance {
+                    let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    thread_fill_nanoseconds.fetch_add(elapsed, Ordering::Relaxed);
+                }
+                if let Err(error) = result {
+                    let _ = error_sender.send(error);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Self {
+            media,
+            running,
+            fill_nanoseconds,
+            outstanding_frames,
+            frames,
+            errors,
+            thread: Some(thread),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Media>> {
+        self.media
+            .lock()
+            .map_err(|_| "decoder state lock was poisoned".into())
+    }
+
+    fn try_lock(&self) -> Result<Option<MutexGuard<'_, Media>>> {
+        match self.media.try_lock() {
+            Ok(media) => Ok(Some(media)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err("decoder state lock was poisoned".into()),
+        }
+    }
+
+    fn check_error(&self) -> Result<()> {
+        match self.errors.try_recv() {
+            Ok(error) => Err(error),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => Ok(()),
+        }
+    }
+
+    fn receive_frames(&self, queue: &mut VecDeque<QueuedVideoFrame>) {
+        while queue.len() < VIDEO_QUEUE_MAX {
+            match self.frames.try_recv() {
+                Ok(frame) => queue.push_back(frame),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn clear_frames(
+        &self,
+        queue: &mut VecDeque<QueuedVideoFrame>,
+        current: &mut Option<QueuedVideoFrame>,
+    ) {
+        queue.clear();
+        *current = None;
+        while self.frames.try_recv().is_ok() {}
+    }
+
+    fn take_fill_time(&self) -> Duration {
+        Duration::from_nanos(self.fill_nanoseconds.swap(0, Ordering::Relaxed))
+    }
+}
+
+impl Drop for DecodeWorker {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        while self.frames.try_recv().is_ok() {}
+        debug_assert_eq!(self.outstanding_frames.load(Ordering::Acquire), 0);
     }
 }
 
@@ -1254,7 +1430,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         unsafe { media.audio_clock() }.unwrap_or(media.first_video_pts.unwrap_or(0.0));
     let playback_start = clock_origin;
     let media_duration = media.duration();
+    let decoder = DecodeWorker::start(media, perf_log);
     let mut clock = WallClock::new(clock_origin);
+    let mut current_video = None;
+    let mut video_queue = VecDeque::new();
     let mut running = true;
     let mut paused = false;
     let mut fullscreen = false;
@@ -1268,6 +1447,9 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mut last_perf_report = Instant::now();
     let mut report_shown = 0;
     let mut report_dropped = 0;
+    let mut report_fill_time = Duration::ZERO;
+    let mut report_display_time = Duration::ZERO;
+    let mut report_display_calls = 0_u64;
     while running {
         let mut event: ffi::SDL_Event = unsafe { std::mem::zeroed() };
         while unsafe { ffi::SDL_PollEvent(&mut event) } {
@@ -1314,6 +1496,8 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     match action_for_key(keyboard.key) {
                         Some(Action::Quit) => running = false,
                         Some(Action::SeekBackward) => {
+                            let mut media = decoder.lock()?;
+                            decoder.clear_frames(&mut video_queue, &mut current_video);
                             unsafe {
                                 seek_by(
                                     &mut media,
@@ -1328,6 +1512,8 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             new_frame_pending = true;
                         }
                         Some(Action::SeekForward) => {
+                            let mut media = decoder.lock()?;
+                            decoder.clear_frames(&mut video_queue, &mut current_video);
                             unsafe {
                                 seek_by(
                                     &mut media,
@@ -1351,6 +1537,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         }
                         Some(Action::TogglePause) => {
                             paused = !paused;
+                            let media = decoder.lock()?;
                             unsafe { media.set_paused(paused)? };
                             clock.set_paused(paused);
                         }
@@ -1363,8 +1550,9 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         if !running {
             break;
         }
+        decoder.check_error()?;
+        decoder.receive_frames(&mut video_queue);
 
-        unsafe { media.fill_queues()? };
         // SDL/PipeWire consumes audio in period-sized chunks (1024 samples on
         // this machine), so the continuous audio-anchored wall clock is used
         // for video presentation instead of the quantized queue counter.
@@ -1372,43 +1560,37 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
 
         if !paused {
             let mut due_frames = 0;
-            if media
-                .video_queue
+            if video_queue
                 .front()
-                .is_some_and(|frame| frame.pts <= playback_time)
+                .is_some_and(|frame| frame.frame.pts <= playback_time)
             {
-                media.current_video = media.video_queue.pop_front();
+                current_video = video_queue.pop_front();
                 due_frames = 1;
                 redraw = true;
 
                 // A 144 Hz display can present a two-frame 60 FPS backlog in
-                // order and catch up. Only skip forward when at least three
-                // frames are overdue, which indicates sustained lateness.
-                if media
-                    .video_queue
+                // order and catch up. Skip only sustained lateness.
+                if video_queue
                     .get(1)
-                    .is_some_and(|frame| frame.pts <= playback_time)
+                    .is_some_and(|frame| frame.frame.pts <= playback_time)
                 {
-                    while media
-                        .video_queue
+                    while video_queue
                         .front()
-                        .is_some_and(|frame| frame.pts <= playback_time)
+                        .is_some_and(|frame| frame.frame.pts <= playback_time)
                     {
-                        media.current_video = media.video_queue.pop_front();
+                        current_video = video_queue.pop_front();
                         due_frames += 1;
                     }
                 }
             }
             // Render at most one future frame early so it reaches the FIFO
-            // presentation queue before its PTS. Never count this lead window
-            // as lateness or skip the current frame because of it.
+            // presentation queue before its PTS.
             if due_frames == 0
-                && media
-                    .video_queue
+                && video_queue
                     .front()
-                    .is_some_and(|frame| frame.pts <= playback_time + VIDEO_PRESENTATION_LEAD)
+                    .is_some_and(|frame| frame.frame.pts <= playback_time + VIDEO_PRESENTATION_LEAD)
             {
-                media.current_video = media.video_queue.pop_front();
+                current_video = video_queue.pop_front();
                 due_frames = 1;
                 redraw = true;
             }
@@ -1417,8 +1599,8 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 new_frame_pending = true;
             }
         }
-        if media.current_video.is_none() && !media.video_queue.is_empty() {
-            media.current_video = media.video_queue.pop_front();
+        if current_video.is_none() && !video_queue.is_empty() {
+            current_video = video_queue.pop_front();
             redraw = true;
             new_frame_pending = true;
         }
@@ -1430,7 +1612,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             redraw = true;
         }
 
-        if redraw && let Some(frame) = media.current_video.as_ref() {
+        if redraw && let Some(frame) = current_video.as_ref().map(|queued| &queued.frame) {
             let stats_info = info_visible.then(|| stats.text());
             let persistent_position = (position_notice.text.is_none() && info_visible)
                 .then(|| timeline_text(playback_time - playback_start, media_duration));
@@ -1445,6 +1627,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             } else {
                 0.0
             };
+            let display_started = Instant::now();
             unsafe {
                 renderer.display(
                     frame.frame,
@@ -1458,6 +1641,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     },
                 )?
             };
+            if perf_log {
+                report_display_time += display_started.elapsed();
+                report_display_calls += 1;
+            }
             if new_frame_pending {
                 stats.presented();
                 new_frame_pending = false;
@@ -1467,23 +1654,36 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
 
         if perf_log && last_perf_report.elapsed() >= Duration::from_secs(2) {
             let elapsed = last_perf_report.elapsed().as_secs_f64();
+            let shown = stats.shown - report_shown;
+            report_fill_time += decoder.take_fill_time();
+            let fill_ms = report_fill_time.as_secs_f64() * 1000.0 / shown.max(1) as f64;
+            let display_ms =
+                report_display_time.as_secs_f64() * 1000.0 / report_display_calls.max(1) as f64;
             eprintln!(
-                "perf: {:.1} shown/s, {:.1} dropped/s",
-                (stats.shown - report_shown) as f64 / elapsed,
+                "perf: {:.1} shown/s, {:.1} dropped/s, {:.2} ms fill, {:.2} ms display",
+                shown as f64 / elapsed,
                 (stats.dropped - report_dropped) as f64 / elapsed,
+                fill_ms,
+                display_ms,
             );
             last_perf_report = Instant::now();
             report_shown = stats.shown;
             report_dropped = stats.dropped;
+            report_fill_time = Duration::ZERO;
+            report_display_time = Duration::ZERO;
+            report_display_calls = 0;
         }
 
-        if media.eof
+        if let Some(media) = decoder.try_lock()?
+            && media.eof
             && media.video_queue.is_empty()
+            && video_queue.is_empty()
+            && decoder.outstanding_frames.load(Ordering::Acquire)
+                == usize::from(current_video.is_some())
             && unsafe { media.audio_empty() }
-            && media
-                .current_video
-                .as_ref()
-                .is_none_or(|frame| playback_time >= frame.pts + frame.duration.max(0.1))
+            && current_video.as_ref().is_none_or(|frame| {
+                playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)
+            })
         {
             break;
         }
