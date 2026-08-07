@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Undefined Player
+Comment=Play videos with NVIDIA Vulkan acceleration
+Icon=video-x-generic
+Exec=undefined-player %f
+TryExec=undefined-player
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Player;Video;
+MimeType=video/mp4;video/x-m4v;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/mp2t;video/ogg;video/x-flv;video/x-ms-wmv;video/3gpp;video/3gpp2;
