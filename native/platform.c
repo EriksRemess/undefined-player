@@ -26,6 +26,8 @@ static enum UpKey translate_key(SDL_Keycode key)
         return UP_KEY_SPACE;
     case SDLK_S:
         return UP_KEY_S;
+    case SDLK_A:
+        return UP_KEY_A;
     default:
         return UP_KEY_OTHER;
     }

@@ -31,6 +31,7 @@ type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
+    CycleAudio,
     CycleSubtitles,
     Quit,
     SeekBackward,
@@ -43,6 +44,7 @@ enum Action {
 
 fn action_for_key(key: u32) -> Option<Action> {
     match key {
+        ffi::UpKey_UP_KEY_A => Some(Action::CycleAudio),
         ffi::UpKey_UP_KEY_Q => Some(Action::Quit),
         ffi::UpKey_UP_KEY_J => Some(Action::CycleSubtitles),
         ffi::UpKey_UP_KEY_LEFT => Some(Action::SeekBackward),
@@ -82,6 +84,22 @@ unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
             .to_string_lossy()
             .to_uppercase()
     })
+}
+
+unsafe fn stream_metadata(
+    format: *const ffi::UpAvFormat,
+    stream_index: u32,
+    key: &'static CStr,
+) -> Option<String> {
+    let pointer = unsafe { ffi::up_av_stream_metadata(format, stream_index, key.as_ptr()) };
+    if pointer.is_null() {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 fn format_bitrate(bits_per_second: i64) -> String {
@@ -504,6 +522,30 @@ struct Decoder {
     uses_vulkan: bool,
 }
 
+#[derive(Clone)]
+struct TrackLabel {
+    codec: String,
+    language: Option<String>,
+    title: Option<String>,
+}
+
+impl TrackLabel {
+    unsafe fn inspect(format: *const ffi::UpAvFormat, stream_index: u32) -> Self {
+        let codec = unsafe { ffmpeg_name(ffi::up_av_stream_codec_name(format, stream_index)) }
+            .unwrap_or_else(|| "UNKNOWN".to_owned());
+        Self {
+            codec,
+            language: unsafe { stream_metadata(format, stream_index, c"language") },
+            title: unsafe { stream_metadata(format, stream_index, c"title") },
+        }
+    }
+}
+
+struct MediaTrack {
+    decoder: Decoder,
+    label: TrackLabel,
+}
+
 impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe { ffi::up_av_decoder_free(&mut self.context) };
@@ -628,8 +670,26 @@ impl VideoInfo {
         }
     }
 
-    fn overlay_text(&self) -> CString {
-        CString::new(self.lines.join("\n")).expect("video information has no NUL bytes")
+    fn overlay_text(&self, audio: Option<(usize, usize, &TrackLabel)>) -> CString {
+        let mut text = self.lines.join("\n");
+        if let Some((selected, count, label)) = audio {
+            text.push_str(&format!(
+                "\nAUDIO TRACK: {} / {count}\nAUDIO CODEC: {}",
+                selected + 1,
+                label.codec
+            ));
+            if let Some(language) = label.language.as_deref() {
+                text.push_str("\nAUDIO LANGUAGE: ");
+                text.push_str(&language.to_uppercase());
+            }
+            if let Some(title) = label.title.as_deref() {
+                text.push_str("\nAUDIO TITLE: ");
+                text.push_str(&title.to_uppercase());
+            }
+        } else {
+            text.push_str("\nAUDIO: NONE");
+        }
+        CString::new(text).expect("media information has no NUL bytes")
     }
 }
 
@@ -804,9 +864,10 @@ struct Media {
     format: *mut ffi::UpAvFormat,
     packet: *mut ffi::UpAvPacket,
     video: Decoder,
-    audio_decoder: Option<Decoder>,
+    audio_tracks: Vec<MediaTrack>,
+    selected_audio_track: usize,
     audio: Option<AudioOutput>,
-    subtitle_decoders: Vec<Decoder>,
+    subtitle_tracks: Vec<MediaTrack>,
     video_queue: VecDeque<VideoFrame>,
     subtitle_queue: VecDeque<SubtitleCue>,
     subtitle_serial: u64,
@@ -860,25 +921,54 @@ impl Media {
                 unsafe { ffi::up_av_decoder_height(video.context) }
             );
 
-            let audio_index = unsafe {
+            let preferred_audio_index = unsafe {
                 ffi::up_av_find_best_stream(
                     format,
                     ffi::UpMediaType_UP_MEDIA_TYPE_AUDIO,
                     video_index,
                 )
             };
-            let (audio_decoder, audio) = if audio_index >= 0 {
-                let audio_name = unsafe {
-                    CStr::from_ptr(ffi::up_av_stream_codec_name(format, audio_index as u32))
+            let mut audio_indices = (0..unsafe { ffi::up_av_stream_count(format) } as usize)
+                .filter(|&index| unsafe {
+                    ffi::up_av_stream_type(format, index as u32)
+                        == ffi::UpMediaType_UP_MEDIA_TYPE_AUDIO
+                })
+                .collect::<Vec<_>>();
+            audio_indices.sort_by_key(|&index| index as i32 != preferred_audio_index);
+            let mut audio_tracks = Vec::new();
+            for stream_index in audio_indices {
+                let label = unsafe { TrackLabel::inspect(format, stream_index as u32) };
+                match unsafe { Decoder::open(format, stream_index as i32, None) } {
+                    Ok(decoder) => {
+                        eprintln!(
+                            "audio track {}: {}{}{}",
+                            audio_tracks.len() + 1,
+                            label.codec,
+                            label
+                                .language
+                                .as_deref()
+                                .map_or_else(String::new, |value| format!(" [{value}]")),
+                            label
+                                .title
+                                .as_deref()
+                                .map_or_else(String::new, |value| format!(" {value}")),
+                        );
+                        audio_tracks.push(MediaTrack { decoder, label });
+                    }
+                    Err(error) => eprintln!(
+                        "audio stream {stream_index} ({}) unavailable: {error}",
+                        label.codec
+                    ),
                 }
-                .to_string_lossy();
-                eprintln!("audio: {audio_name} via PipeWire");
-                (
-                    Some(unsafe { Decoder::open(format, audio_index, None)? }),
-                    Some(unsafe { AudioOutput::create()? }),
-                )
+            }
+            let audio = if audio_tracks.is_empty() {
+                None
             } else {
-                (None, None)
+                eprintln!("audio: track 1 selected via PipeWire");
+                if audio_tracks.len() > 1 {
+                    eprintln!("audio: A switches tracks");
+                }
+                Some(unsafe { AudioOutput::create()? })
             };
 
             let mut subtitle_indices = (0..unsafe { ffi::up_av_stream_count(format) } as usize)
@@ -890,26 +980,33 @@ impl Media {
             subtitle_indices.sort_by_key(|&index| unsafe {
                 ffi::up_av_stream_is_default(format, index as u32) == 0
             });
-            let mut subtitle_decoders = Vec::new();
+            let mut subtitle_tracks = Vec::new();
             for stream_index in subtitle_indices {
-                let subtitle_name = unsafe {
-                    CStr::from_ptr(ffi::up_av_stream_codec_name(format, stream_index as u32))
-                }
-                .to_string_lossy();
+                let label = unsafe { TrackLabel::inspect(format, stream_index as u32) };
                 match unsafe { Decoder::open(format, stream_index as i32, None) } {
                     Ok(decoder) => {
                         eprintln!(
-                            "subtitle track {}: {subtitle_name}",
-                            subtitle_decoders.len() + 1
+                            "subtitle track {}: {}{}{}",
+                            subtitle_tracks.len() + 1,
+                            label.codec,
+                            label
+                                .language
+                                .as_deref()
+                                .map_or_else(String::new, |value| format!(" [{value}]")),
+                            label
+                                .title
+                                .as_deref()
+                                .map_or_else(String::new, |value| format!(" {value}")),
                         );
-                        subtitle_decoders.push(decoder);
+                        subtitle_tracks.push(MediaTrack { decoder, label });
                     }
                     Err(error) => eprintln!(
-                        "subtitle stream {stream_index} ({subtitle_name}) unavailable: {error}"
+                        "subtitle stream {stream_index} ({}) unavailable: {error}",
+                        label.codec
                     ),
                 }
             }
-            if !subtitle_decoders.is_empty() {
+            if !subtitle_tracks.is_empty() {
                 eprintln!("subtitles: S toggles, J switches tracks");
             }
 
@@ -922,9 +1019,10 @@ impl Media {
                 format,
                 packet,
                 video,
-                audio_decoder,
+                audio_tracks,
+                selected_audio_track: 0,
                 audio,
-                subtitle_decoders,
+                subtitle_tracks,
                 video_queue: VecDeque::new(),
                 subtitle_queue: VecDeque::new(),
                 subtitle_serial: 0,
@@ -988,9 +1086,10 @@ impl Media {
     }
 
     unsafe fn receive_audio(&mut self) -> Result<()> {
-        let Some(decoder) = self.audio_decoder.as_ref() else {
+        let Some(track) = self.audio_tracks.get(self.selected_audio_track) else {
             return Ok(());
         };
+        let decoder = &track.decoder;
         let context = decoder.context;
         let time_base = decoder.time_base;
         loop {
@@ -1013,7 +1112,7 @@ impl Media {
     }
 
     unsafe fn decode_subtitle_packet(&mut self, track: usize) -> Result<()> {
-        let decoder = &self.subtitle_decoders[track];
+        let decoder = &self.subtitle_tracks[track].decoder;
         let context = decoder.context;
         let time_base = decoder.time_base;
         let mut ret = 0;
@@ -1194,11 +1293,11 @@ impl Media {
             }
             unsafe { self.receive_video()? };
         } else if self
-            .audio_decoder
-            .as_ref()
-            .is_some_and(|decoder| decoder.stream_index == stream_index)
+            .audio_tracks
+            .get(self.selected_audio_track)
+            .is_some_and(|track| track.decoder.stream_index == stream_index)
         {
-            let context = self.audio_decoder.as_ref().unwrap().context;
+            let context = self.audio_tracks[self.selected_audio_track].decoder.context;
             let ret = unsafe { ffi::up_av_decoder_send_packet(context, self.packet) };
             if ret < 0 {
                 return Err(format!("audio decoder rejected a packet: {}", unsafe {
@@ -1207,9 +1306,9 @@ impl Media {
             }
             unsafe { self.receive_audio()? };
         } else if let Some(track) = self
-            .subtitle_decoders
+            .subtitle_tracks
             .iter()
-            .position(|decoder| decoder.stream_index == stream_index)
+            .position(|track| track.decoder.stream_index == stream_index)
         {
             unsafe { self.decode_subtitle_packet(track)? };
         }
@@ -1225,9 +1324,9 @@ impl Media {
             ffi::up_av_decoder_send_packet(self.video.context, ptr::null());
             self.receive_video()?;
         }
-        if let Some(decoder) = self.audio_decoder.as_ref() {
+        if let Some(track) = self.audio_tracks.get(self.selected_audio_track) {
             unsafe {
-                ffi::up_av_decoder_send_packet(decoder.context, ptr::null());
+                ffi::up_av_decoder_send_packet(track.decoder.context, ptr::null());
                 self.receive_audio()?;
             }
         }
@@ -1302,15 +1401,16 @@ impl Media {
         closest_seek_point(target, entry_time(true), entry_time(false))
     }
 
-    unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
+    unsafe fn seek_internal(&mut self, requested_target: f64, precise: bool) -> Result<f64> {
         if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
         // Keyframe seeking avoids decoding an entire GOP before presenting a
         // new position. That matters for 8K60 AV1, where decoding is already
         // close to real time and keyframes can be several seconds apart.
-        let target = unsafe { self.nearest_keyframe(requested_target) }.unwrap_or(requested_target);
-        let ret = unsafe { ffi::up_av_seek(self.format, self.video.stream_index, target) };
+        let seek_target =
+            unsafe { self.nearest_keyframe(requested_target) }.unwrap_or(requested_target);
+        let ret = unsafe { ffi::up_av_seek(self.format, self.video.stream_index, seek_target) };
         if ret < 0 {
             return Err(format!("could not seek: {}", unsafe { ffmpeg_error(ret) }));
         }
@@ -1319,11 +1419,11 @@ impl Media {
             ffi::up_av_packet_unref(self.packet);
             ffi::up_av_decoder_flush(self.video.context);
         }
-        if let Some(decoder) = self.audio_decoder.as_ref() {
-            unsafe { ffi::up_av_decoder_flush(decoder.context) };
+        for track in &self.audio_tracks {
+            unsafe { ffi::up_av_decoder_flush(track.decoder.context) };
         }
-        for decoder in &self.subtitle_decoders {
-            unsafe { ffi::up_av_decoder_flush(decoder.context) };
+        for track in &self.subtitle_tracks {
+            unsafe { ffi::up_av_decoder_flush(track.decoder.context) };
         }
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.reset()? };
@@ -1332,10 +1432,38 @@ impl Media {
         self.subtitle_queue.clear();
         self.eof = false;
         self.drained = false;
-        self.video_seek_target = Some(target);
-        self.audio_seek_target = self.audio.as_ref().map(|_| target);
-        self.subtitle_seek_target = (!self.subtitle_decoders.is_empty()).then_some(target);
-        Ok(target)
+        let playback_target = if precise {
+            requested_target
+        } else {
+            seek_target
+        };
+        self.video_seek_target = Some(playback_target);
+        self.audio_seek_target = self.audio.as_ref().map(|_| playback_target);
+        self.subtitle_seek_target = (!self.subtitle_tracks.is_empty()).then_some(playback_target);
+        Ok(playback_target)
+    }
+
+    unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
+        unsafe { self.seek_internal(requested_target, false) }
+    }
+
+    unsafe fn select_audio_track(&mut self, track: usize, playback_target: f64) -> Result<f64> {
+        if track >= self.audio_tracks.len() {
+            return Err("invalid audio track".into());
+        }
+        let previous = self.selected_audio_track;
+        self.selected_audio_track = track;
+        match unsafe { self.seek_internal(playback_target, true) } {
+            Ok(target) => {
+                let label = &self.audio_tracks[track].label;
+                eprintln!("audio: track {} selected ({})", track + 1, label.codec);
+                Ok(target)
+            }
+            Err(error) => {
+                self.selected_audio_track = previous;
+                Err(error)
+            }
+        }
     }
 
     unsafe fn audio_clock(&self) -> Option<f64> {
@@ -1686,17 +1814,36 @@ impl PositionNotice {
     }
 }
 
-fn next_subtitle_track(current: usize, count: usize) -> usize {
+fn next_track(current: usize, count: usize) -> usize {
     if count == 0 { 0 } else { (current + 1) % count }
 }
 
-fn subtitle_status_text(visible: bool, selected: usize, count: usize) -> CString {
-    let status = if visible {
-        format!("SUBTITLES: {} / {count}", selected + 1)
+fn track_status_text(kind: &str, selected: usize, count: usize, label: &TrackLabel) -> CString {
+    let mut status = format!("{kind}: {} / {count}", selected + 1);
+    if let Some(language) = label.language.as_deref() {
+        status.push_str(" — ");
+        status.push_str(&language.to_uppercase());
+        if let Some(title) = label.title.as_deref() {
+            status.push_str(" — ");
+            status.push_str(&title.to_uppercase());
+        }
+        status.push_str(" — ");
+        status.push_str(&label.codec);
+    }
+    CString::new(status).expect("track status has no NUL bytes")
+}
+
+fn subtitle_status_text(
+    visible: bool,
+    selected: usize,
+    count: usize,
+    label: &TrackLabel,
+) -> CString {
+    if visible {
+        track_status_text("SUBTITLES", selected, count, label)
     } else {
-        "SUBTITLES: OFF".to_owned()
-    };
-    CString::new(status).expect("subtitle status has no NUL bytes")
+        CString::new("SUBTITLES: OFF").expect("subtitle status has no NUL bytes")
+    }
 }
 
 struct TopBar {
@@ -1909,7 +2056,25 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     }
     let video_info =
         unsafe { VideoInfo::inspect(&media, media.video_queue.front().unwrap().frame) };
-    let video_details = video_info.overlay_text();
+    let audio_labels = media
+        .audio_tracks
+        .iter()
+        .map(|track| track.label.clone())
+        .collect::<Vec<_>>();
+    let subtitle_labels = media
+        .subtitle_tracks
+        .iter()
+        .map(|track| track.label.clone())
+        .collect::<Vec<_>>();
+    let audio_track_count = audio_labels.len();
+    let subtitle_track_count = subtitle_labels.len();
+    let subtitles_available = subtitle_track_count > 0;
+    let mut selected_audio_track = 0;
+    let mut video_details = video_info.overlay_text(
+        audio_labels
+            .first()
+            .map(|label| (selected_audio_track, audio_track_count, label)),
+    );
     unsafe { window.set_minimum_size()? };
     let (mut width, mut height) = unsafe { window.pixel_size()? };
     unsafe { renderer.resize(width, height)? };
@@ -1943,8 +2108,6 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             media_duration.map_or(0, seconds_to_microseconds),
         )
     };
-    let subtitle_track_count = media.subtitle_decoders.len();
-    let subtitles_available = subtitle_track_count > 0;
     let decoder = DecodeWorker::start(media, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
@@ -2120,27 +2283,70 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             };
                             mpris_stopped = false;
                         }
+                        Some(Action::CycleAudio) if audio_track_count > 1 => {
+                            let next = next_track(selected_audio_track, audio_track_count);
+                            let requested_target = clock.now();
+                            let mut media = decoder.lock()?;
+                            decoder.clear_frames(&mut video_queue, &mut current_video);
+                            decoder.clear_subtitles(
+                                &mut subtitle_queue,
+                                &mut subtitle_queues,
+                                &mut current_subtitles,
+                            );
+                            unsafe { media.select_audio_track(next, requested_target)? };
+                            while media.video_queue.is_empty() && !media.eof {
+                                unsafe { media.fill_queues()? };
+                            }
+                            let displayed_target = media
+                                .video_queue
+                                .front()
+                                .map_or(requested_target, |frame| frame.pts);
+                            clock.seek(displayed_target);
+                            selected_audio_track = next;
+                            video_details = video_info.overlay_text(Some((
+                                selected_audio_track,
+                                audio_track_count,
+                                &audio_labels[selected_audio_track],
+                            )));
+                            position_notice.show_text(track_status_text(
+                                "AUDIO",
+                                selected_audio_track,
+                                audio_track_count,
+                                &audio_labels[selected_audio_track],
+                            ));
+                            if let Some(mpris) = &mpris {
+                                mpris.seeked(seconds_to_microseconds(
+                                    displayed_target - playback_start,
+                                ));
+                            }
+                            redraw = true;
+                            new_frame_pending = true;
+                        }
                         Some(Action::ToggleSubtitles) if subtitles_available => {
                             subtitles_visible = !subtitles_visible;
                             position_notice.show_text(subtitle_status_text(
                                 subtitles_visible,
                                 selected_subtitle_track,
                                 subtitle_track_count,
+                                &subtitle_labels[selected_subtitle_track],
                             ));
                             redraw = true;
                         }
                         Some(Action::CycleSubtitles) if subtitles_available => {
                             selected_subtitle_track =
-                                next_subtitle_track(selected_subtitle_track, subtitle_track_count);
+                                next_track(selected_subtitle_track, subtitle_track_count);
                             subtitles_visible = true;
                             position_notice.show_text(subtitle_status_text(
                                 true,
                                 selected_subtitle_track,
                                 subtitle_track_count,
+                                &subtitle_labels[selected_subtitle_track],
                             ));
                             redraw = true;
                         }
-                        Some(Action::ToggleSubtitles | Action::CycleSubtitles) => {}
+                        Some(
+                            Action::CycleAudio | Action::ToggleSubtitles | Action::CycleSubtitles,
+                        ) => {}
                         None => {}
                     }
                 }
@@ -2468,6 +2674,10 @@ mod tests {
     #[test]
     fn requested_keys_map_to_requested_actions() {
         assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_A),
+            Some(Action::CycleAudio)
+        );
+        assert_eq!(
             action_for_key(ffi::UpKey_UP_KEY_F),
             Some(Action::ToggleFullscreen)
         );
@@ -2500,16 +2710,30 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_tracks_cycle_and_report_status() {
-        assert_eq!(next_subtitle_track(0, 3), 1);
-        assert_eq!(next_subtitle_track(2, 3), 0);
-        assert_eq!(next_subtitle_track(0, 0), 0);
+    fn media_tracks_cycle_and_report_available_metadata() {
+        assert_eq!(next_track(0, 3), 1);
+        assert_eq!(next_track(2, 3), 0);
+        assert_eq!(next_track(0, 0), 0);
+        let labeled = TrackLabel {
+            codec: "DTS".into(),
+            language: Some("spa".into()),
+            title: Some("Surround 5.1".into()),
+        };
         assert_eq!(
-            subtitle_status_text(true, 1, 3).to_bytes(),
-            b"SUBTITLES: 2 / 3"
+            track_status_text("AUDIO", 2, 5, &labeled).to_bytes(),
+            "AUDIO: 3 / 5 — SPA — SURROUND 5.1 — DTS".as_bytes()
+        );
+        let unlabeled = TrackLabel {
+            codec: "AC3".into(),
+            language: None,
+            title: Some("Commentary".into()),
+        };
+        assert_eq!(
+            track_status_text("AUDIO", 1, 2, &unlabeled).to_bytes(),
+            b"AUDIO: 2 / 2"
         );
         assert_eq!(
-            subtitle_status_text(false, 1, 3).to_bytes(),
+            subtitle_status_text(false, 1, 3, &labeled).to_bytes(),
             b"SUBTITLES: OFF"
         );
     }
@@ -2615,8 +2839,12 @@ mod tests {
             frame_rate: Some(24_000.0 / 1001.0),
         };
         assert_eq!(
-            info.overlay_text().to_bytes(),
-            b"CODEC: HEVC MAIN 10\nRESOLUTION: 3840X2160\nBITRATE: 18.8 MBPS\nPIXEL FORMAT: YUV420P10LE\nDECODE: VULKAN HW\nMATRIX: BT2020NC\nPRIMARIES: BT2020\nTRANSFER: SMPTE2084\nRANGE: TV\nHDR: YES (PQ)"
+            info.overlay_text(Some((1, 3, &TrackLabel {
+                codec: "DTS".into(),
+                language: Some("eng".into()),
+                title: Some("Surround 5.1".into()),
+            }))).to_bytes(),
+            b"CODEC: HEVC MAIN 10\nRESOLUTION: 3840X2160\nBITRATE: 18.8 MBPS\nPIXEL FORMAT: YUV420P10LE\nDECODE: VULKAN HW\nMATRIX: BT2020NC\nPRIMARIES: BT2020\nTRANSFER: SMPTE2084\nRANGE: TV\nHDR: YES (PQ)\nAUDIO TRACK: 2 / 3\nAUDIO CODEC: DTS\nAUDIO LANGUAGE: ENG\nAUDIO TITLE: SURROUND 5.1"
         );
         assert_eq!(
             PresentationStats::new().text(info.frame_rate).to_bytes(),
@@ -2665,5 +2893,78 @@ mod tests {
             subtitle_dialogue_text("Français — 日本語 — 希布來語", false),
             "Français - 日本語 - 希布來語"
         );
+    }
+
+    #[test]
+    #[ignore = "requires UP_TEST_MEDIA pointing to a local video file"]
+    fn external_media_reports_complete_video_info() {
+        let path = env::var_os("UP_TEST_MEDIA")
+            .map(PathBuf::from)
+            .expect("UP_TEST_MEDIA is set");
+        let _sdl = unsafe { Sdl::init() }.expect("SDL initializes");
+        let mut media =
+            unsafe { Media::open(&path, ptr::null_mut(), false) }.expect("test media opens");
+        unsafe { media.fill_queues() }.expect("initial queues fill");
+        let info = unsafe {
+            VideoInfo::inspect(
+                &media,
+                media.video_queue.front().expect("video frame").frame,
+            )
+        };
+        let details = info.overlay_text(media.audio_tracks.first().map(|track| {
+            (
+                media.selected_audio_track,
+                media.audio_tracks.len(),
+                &track.label,
+            )
+        }));
+        let details = details.to_string_lossy();
+        eprintln!("{details}");
+        assert!(
+            !details.contains("UNKNOWN"),
+            "decodable media has complete effective video information"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires UP_TEST_MEDIA pointing to a local file with multiple audio tracks"]
+    fn external_media_switches_every_audio_track() {
+        let path = env::var_os("UP_TEST_MEDIA")
+            .map(PathBuf::from)
+            .expect("UP_TEST_MEDIA is set");
+        let _sdl = unsafe { Sdl::init() }.expect("SDL initializes");
+        let mut media =
+            unsafe { Media::open(&path, ptr::null_mut(), false) }.expect("test media opens");
+        assert!(
+            media.audio_tracks.len() > 1,
+            "test media has multiple audio tracks"
+        );
+
+        unsafe { media.fill_queues() }.expect("initial queues fill");
+        let target = media.video_queue.front().map_or(0.0, |frame| frame.pts) + 5.0;
+        for track in 1..media.audio_tracks.len() {
+            unsafe { media.select_audio_track(track, target) }.expect("audio track switches");
+            for _ in 0..128 {
+                unsafe { media.fill_queues() }.expect("switched queues fill");
+                if !media.video_queue.is_empty() && !unsafe { media.audio_empty() } {
+                    break;
+                }
+            }
+            assert_eq!(media.selected_audio_track, track);
+            assert!(
+                !media.video_queue.is_empty(),
+                "video resumes after switching"
+            );
+            assert!(
+                !unsafe { media.audio_empty() },
+                "selected audio track produces output"
+            );
+            let video_pts = media.video_queue.front().unwrap().pts;
+            let audio_pts = media.audio.as_ref().unwrap().first_pts.unwrap();
+            assert!(
+                (audio_pts - video_pts).abs() < 0.25,
+                "audio/video remain aligned after switching: audio={audio_pts}, video={video_pts}"
+            );
+        }
     }
 }

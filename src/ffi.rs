@@ -138,6 +138,13 @@ unsafe extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn up_av_stream_metadata(
+        format: *const UpAvFormat,
+        stream_index: ::std::os::raw::c_uint,
+        key: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     pub fn up_av_format_duration(format: *const UpAvFormat) -> f64;
 }
 unsafe extern "C" {
@@ -320,6 +327,7 @@ pub const UpKey_UP_KEY_F: UpKey = 5;
 pub const UpKey_UP_KEY_I: UpKey = 6;
 pub const UpKey_UP_KEY_SPACE: UpKey = 7;
 pub const UpKey_UP_KEY_S: UpKey = 8;
+pub const UpKey_UP_KEY_A: UpKey = 9;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

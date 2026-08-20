@@ -85,6 +85,9 @@ int up_av_stream_is_default(const UpAvFormat *format,
                             unsigned int stream_index);
 const char *up_av_stream_codec_name(const UpAvFormat *format,
                                     unsigned int stream_index);
+const char *up_av_stream_metadata(const UpAvFormat *format,
+                                  unsigned int stream_index,
+                                  const char *key);
 double up_av_format_duration(const UpAvFormat *format);
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet);
 int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds);

@@ -28,6 +28,7 @@ tarball: build
 	install -Dm755 $(TARBALL_BINARY) target/dist/$(TARBALL_NAME)/bin/$(BINARY)
 	install -Dm644 $(DESKTOP_FILE) target/dist/$(TARBALL_NAME)/share/applications/$(BINARY).desktop
 	install -Dm644 README.md target/dist/$(TARBALL_NAME)/README.md
+	install -Dm644 LICENSE target/dist/$(TARBALL_NAME)/LICENSE
 	install -Dm644 debian/copyright target/dist/$(TARBALL_NAME)/COPYRIGHT
 	install -Dm644 packaging/tarball/INSTALL.txt target/dist/$(TARBALL_NAME)/INSTALL.txt
 	install -Dm755 packaging/tarball/install.sh target/dist/$(TARBALL_NAME)/install.sh

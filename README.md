@@ -131,6 +131,7 @@ The player starts playing immediately. The focused video window accepts:
 - `F` — toggle fullscreen
 - `I` — toggle video/color details, FPS / shown / dropped frames, and playback
   position
+- `A` — switch to the next audio track
 - `Left` / `Right` — seek backward or forward 10 seconds
 - `Space` — pause or resume
 - `S` — toggle subtitles
@@ -177,4 +178,13 @@ through all decodable embedded tracks and briefly shows the selected number.
 DVD/PGS bitmap subtitles retain their authored placement. Text and ASS dialogue
 use a compact bold monospace Pango font with Unicode shaping and automatic font
 fallback; advanced ASS styling is ignored. There is no playlist or audio-stream
-selection support yet.
+selection menu yet; audio tracks are cycled with `A`.
+
+## License
+
+undefined-player is free software licensed under the GNU General Public License
+version 3 or later. See [`LICENSE`](LICENSE).
+
+Release packages are built against redistributable distribution-provided
+libraries. Do not redistribute builds linked against an FFmpeg configuration
+created with `--enable-nonfree`.

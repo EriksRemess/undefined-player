@@ -60,7 +60,7 @@ struct UpVideoRenderer {
 };
 
 #define TEXTURE_WIDTH 1024
-#define TEXTURE_HEIGHT 256
+#define TEXTURE_HEIGHT 384
 #define GLYPH_SCALE 2
 #define INFO_GLYPH_Y 16
 #define CLOSE_GLYPH_X (TEXTURE_WIDTH - 12)
@@ -68,7 +68,7 @@ struct UpVideoRenderer {
 #define POSITION_GLYPH_Y 48
 #define DETAILS_GLYPH_Y 64
 #define DETAILS_LINE_ADVANCE 18
-#define DETAILS_MAX_LINES 10
+#define DETAILS_MAX_LINES 16
 #define INFO_TEXT_INSET 32.0f
 #define TITLE_TEXTURE_HEIGHT 16
 #define TITLE_CELL_WIDTH (6 * GLYPH_SCALE)
@@ -610,7 +610,7 @@ static void set_error(UpVideoRenderer *renderer, const char *message)
 
 static char *join_extensions(const char *const *first, size_t first_count,
                              const char *const *second, size_t second_count,
-                             const char *prefix)
+                             const char *prefix, const char *excluded)
 {
     size_t length = prefix ? strlen(prefix) : 0;
     size_t count = first_count + second_count + (prefix ? 1 : 0);
@@ -630,11 +630,15 @@ static char *join_extensions(const char *const *first, size_t first_count,
     if (prefix)
         strcat(result, prefix);
     for (size_t i = 0; i < first_count; i++) {
+        if (excluded && !strcmp(first[i], excluded))
+            continue;
         if (result[0])
             strcat(result, "+");
         strcat(result, first[i]);
     }
     for (size_t i = 0; i < second_count; i++) {
+        if (excluded && !strcmp(second[i], excluded))
+            continue;
         if (result[0])
             strcat(result, "+");
         strcat(result, second[i]);
@@ -704,10 +708,11 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
     }
 
     instance_list = join_extensions(instance_extensions, instance_count,
-                                    NULL, 0, NULL);
+                                    NULL, 0, NULL, NULL);
     device_list = join_extensions(pl_vulkan_recommended_extensions,
                                   pl_vulkan_num_recommended_extensions,
-                                  NULL, 0, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+                                  NULL, 0, VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                                  VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     if (!instance_list || !device_list) {
         set_error(renderer, "out of memory while preparing Vulkan extensions");
         goto fail;

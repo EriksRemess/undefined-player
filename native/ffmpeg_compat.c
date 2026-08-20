@@ -120,7 +120,16 @@ int up_av_format_open(UpAvFormat **format, const char *path)
 
 int up_av_format_find_stream_info(UpAvFormat *format)
 {
-    return avformat_find_stream_info(FORMAT(format), NULL);
+    /* Some containers cannot provide bitmap-subtitle dimensions until the
+     * first subtitle packet. FFmpeg reports that expected condition as a
+     * warning even though discovery succeeds and decoding later supplies the
+     * dimensions. Keep startup output useful while preserving actual errors. */
+    int log_level = av_log_get_level();
+    if (log_level > AV_LOG_ERROR)
+        av_log_set_level(AV_LOG_ERROR);
+    int result = avformat_find_stream_info(FORMAT(format), NULL);
+    av_log_set_level(log_level);
+    return result;
 }
 
 void up_av_format_close(UpAvFormat **format)
@@ -161,6 +170,17 @@ const char *up_av_stream_codec_name(const UpAvFormat *format,
 {
     AVStream *stream = stream_at(format, stream_index);
     return stream ? avcodec_get_name(stream->codecpar->codec_id) : "unknown";
+}
+
+const char *up_av_stream_metadata(const UpAvFormat *format,
+                                  unsigned int stream_index,
+                                  const char *key)
+{
+    AVStream *stream = stream_at(format, stream_index);
+    if (!stream || !key)
+        return NULL;
+    const AVDictionaryEntry *entry = av_dict_get(stream->metadata, key, NULL, 0);
+    return entry ? entry->value : NULL;
 }
 
 double up_av_format_duration(const UpAvFormat *format)
@@ -421,39 +441,52 @@ int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
     info->container_bitrate = native_format->bit_rate;
     info->frame_rate = av_q2d(av_guess_frame_rate(native_format, stream, NULL));
 
-    const int assume_hd = info->width >= 1280 || info->height >= 720;
+    const int assume_hd = info->width >= 1280 || info->height > 576;
+    const AVPixFmtDescriptor *pixel_description =
+        av_pix_fmt_desc_get(pixel_format);
+    const int is_rgb = pixel_description &&
+        (pixel_description->flags & AV_PIX_FMT_FLAG_RGB);
     enum AVColorSpace space = native_frame->colorspace;
     if (space == AVCOL_SPC_UNSPECIFIED)
         space = parameters->color_space;
-    if (space == AVCOL_SPC_UNSPECIFIED && assume_hd) {
-        space = AVCOL_SPC_BT709;
+    if (space == AVCOL_SPC_UNSPECIFIED) {
+        info->color_space = is_rgb ? "rgb" : assume_hd ? "bt709" : "bt601";
         info->color_space_assumed = 1;
+    } else {
+        info->color_space = av_color_space_name(space);
     }
-    info->color_space = av_color_space_name(space);
 
     enum AVColorPrimaries primaries = native_frame->color_primaries;
     if (primaries == AVCOL_PRI_UNSPECIFIED)
         primaries = parameters->color_primaries;
-    if (primaries == AVCOL_PRI_UNSPECIFIED && assume_hd) {
-        primaries = AVCOL_PRI_BT709;
+    if (primaries == AVCOL_PRI_UNSPECIFIED) {
+        if (assume_hd)
+            info->color_primaries = "bt709";
+        else if (info->height == 576)
+            info->color_primaries = "bt601-625";
+        else if (info->height == 480 || info->height == 486)
+            info->color_primaries = "bt601-525";
+        else
+            info->color_primaries = "bt709";
         info->color_primaries_assumed = 1;
+    } else {
+        info->color_primaries = av_color_primaries_name(primaries);
     }
-    info->color_primaries = av_color_primaries_name(primaries);
 
     enum AVColorTransferCharacteristic transfer = native_frame->color_trc;
     if (transfer == AVCOL_TRC_UNSPECIFIED)
         transfer = parameters->color_trc;
-    if (transfer == AVCOL_TRC_UNSPECIFIED && assume_hd) {
-        transfer = AVCOL_TRC_BT709;
+    if (transfer == AVCOL_TRC_UNSPECIFIED) {
+        /* This is libplacebo's effective default for unknown SDR transfer. */
+        info->color_transfer = "bt1886";
         info->color_transfer_assumed = 1;
+    } else {
+        info->color_transfer = av_color_transfer_name(transfer);
     }
-    info->color_transfer = av_color_transfer_name(transfer);
     if (transfer == AVCOL_TRC_SMPTE2084)
         info->hdr_kind = UP_HDR_KIND_PQ;
     else if (transfer == AVCOL_TRC_ARIB_STD_B67)
         info->hdr_kind = UP_HDR_KIND_HLG;
-    else if (transfer == AVCOL_TRC_UNSPECIFIED)
-        info->hdr_kind = UP_HDR_KIND_UNKNOWN;
     else
         info->hdr_kind = UP_HDR_KIND_SDR;
 
