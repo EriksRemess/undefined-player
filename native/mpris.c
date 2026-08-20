@@ -10,6 +10,7 @@
 #define COMMAND_QUEUE_CAPACITY 16
 #define MPRIS_OBJECT_PATH "/org/mpris/MediaPlayer2"
 #define TRACK_OBJECT_PATH "/com/github/undefined_player/track/1"
+#define SEEK_STEP_US 10000000LL
 
 struct queued_command {
     enum UpMprisCommand command;
@@ -182,7 +183,13 @@ static void method_call(GDBusConnection *connection,
         command = UP_MPRIS_COMMAND_PLAY_PAUSE;
     else if (!strcmp(method_name, "Stop"))
         command = UP_MPRIS_COMMAND_STOP;
-    else if (!strcmp(method_name, "Seek")) {
+    else if (!strcmp(method_name, "Next")) {
+        command = UP_MPRIS_COMMAND_SEEK;
+        value = SEEK_STEP_US;
+    } else if (!strcmp(method_name, "Previous")) {
+        command = UP_MPRIS_COMMAND_SEEK;
+        value = -SEEK_STEP_US;
+    } else if (!strcmp(method_name, "Seek")) {
         command = UP_MPRIS_COMMAND_SEEK;
         g_variant_get(parameters, "(x)", &value);
     } else if (!strcmp(method_name, "SetPosition")) {
@@ -235,10 +242,11 @@ static GVariant *get_property(GDBusConnection *connection,
             !strcmp(property_name, "MinimumRate") ||
             !strcmp(property_name, "MaximumRate"))
             return g_variant_new_double(1.0);
-        if (!strcmp(property_name, "Shuffle") ||
-            !strcmp(property_name, "CanGoNext") ||
-            !strcmp(property_name, "CanGoPrevious"))
+        if (!strcmp(property_name, "Shuffle"))
             return g_variant_new_boolean(false);
+        if (!strcmp(property_name, "CanGoNext") ||
+            !strcmp(property_name, "CanGoPrevious"))
+            return g_variant_new_boolean(true);
         if (!strcmp(property_name, "Metadata"))
             return metadata_variant(mpris);
         if (!strcmp(property_name, "Position"))
