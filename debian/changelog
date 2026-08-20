@@ -1,3 +1,16 @@
+undefined-player (0.1.2-1) unstable; urgency=medium
+
+  * Prepare the 0.1.2 release.
+
+ -- Ēriks Remess <eriks@remess.lv>  Fri, 21 Aug 2026 00:08:56 +0300
+
+undefined-player (0.1.1-1) unstable; urgency=medium
+
+  * Add portable distribution packages and release automation.
+  * Add audio-track switching and richer media information.
+
+ -- Ēriks Remess <eriks@remess.lv>  Fri, 21 Aug 2026 00:02:35 +0300
+
 undefined-player (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian package.

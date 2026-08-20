@@ -69,24 +69,56 @@ jobs:
       - name: Install declared build dependencies
         run: DEBIAN_FRONTEND=noninteractive apt-get build-dep -y .
 
-      - name: Validate tag version
-        if: github.ref_type == 'tag'
+      - name: Prepare package version
+        id: package
+        shell: bash
         run: |
+          set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-          test "${GITHUB_REF_NAME}" = "v${version}"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            test "${GITHUB_REF_NAME}" = "v${version}"
+            artifact_version="${version}"
+            deb_version="${version}-1"
+          else
+            artifact_version="${version}+${short_sha}"
+            deb_version="${version}+${short_sha}-1"
+          fi
+
+          if [ "$(dpkg-parsechangelog --show-field Version)" != "${deb_version}" ]; then
+            DEBFULLNAME="undefined-player CI" DEBEMAIL="noreply@github.com" \
+              dch --newversion "${deb_version}" --distribution unstable \
+              "Automated package build for ${GITHUB_REF_NAME}."
+          fi
+
+          architecture="$(dpkg --print-architecture)"
+          archive_architecture="$(uname -m)"
+          {
+            echo "artifact_version=${artifact_version}"
+            echo "deb_file=../undefined-player_${deb_version}_${architecture}.deb"
+            echo "tarball_file=target/dist/undefined-player-${artifact_version}-linux-${archive_architecture}.tar.gz"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build and lint package
+        env:
+          DEB_FILE: ${{ steps.package.outputs.deb_file }}
         run: |
           dpkg-buildpackage --build=binary --no-sign --no-pre-clean
-          lintian --fail-on error ../undefined-player_*.deb
+          lintian --fail-on error "${DEB_FILE}"
 
       - name: Build binary tarball
-        run: make tarball
+        env:
+          ARTIFACT_VERSION: ${{ steps.package.outputs.artifact_version }}
+        run: make VERSION="${ARTIFACT_VERSION}" tarball
 
       - name: Collect release assets
+        env:
+          DEB_FILE: ${{ steps.package.outputs.deb_file }}
+          TARBALL_FILE: ${{ steps.package.outputs.tarball_file }}
         run: |
           mkdir release-assets
-          cp ../undefined-player_*.deb target/dist/undefined-player-*.tar.gz release-assets/
+          cp "${DEB_FILE}" "${TARBALL_FILE}" release-assets/
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7
@@ -96,6 +128,9 @@ jobs:
           retention-days: 1
           path: release-assets/
 
+      - name: Exclude distribution archives from the build cache
+        run: rm -rf target/dist
+
   publish-release:
     needs:
       - arch-linux
@@ -104,11 +139,67 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download release assets
         uses: actions/download-artifact@v8
         with:
           name: undefined-player-packages
           path: release-assets
+
+      - name: Prepare tip release notes
+        if: github.ref_type == 'branch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          short_sha="${GITHUB_SHA:0:7}"
+          latest_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD 2>/dev/null || true)"
+          commit_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+
+          {
+            echo "Version \`${version}\` at commit [\`${short_sha}\`](${commit_url})."
+            if [ -n "${latest_tag}" ]; then
+              echo
+              echo "## Changes since ${latest_tag}"
+              changes="$(git log --no-merges --format='- %s (%h)' "${latest_tag}..HEAD")"
+              if [ -n "${changes}" ]; then
+                echo "${changes}"
+              else
+                echo "- No changes since ${latest_tag}."
+              fi
+              echo
+              echo "[Full changelog](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${latest_tag}...${short_sha})"
+            fi
+          } > tip-release-notes.md
+
+      - name: Prepare tagged release notes
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "${previous_tag}" ]; then
+            range="${previous_tag}..${GITHUB_REF_NAME}"
+          else
+            range="${GITHUB_REF_NAME}"
+          fi
+          changes="$(git log --no-merges --format='- %s (%h)' "${range}")"
+
+          {
+            echo "## Changes"
+            if [ -n "${changes}" ]; then
+              echo "${changes}"
+            else
+              echo "- Packaging-only release."
+            fi
+            if [ -n "${previous_tag}" ]; then
+              echo
+              echo "[Full changelog](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${previous_tag}...${GITHUB_REF_NAME})"
+            fi
+          } > tagged-release-notes.md
 
       - name: Update rolling tip release
         if: github.ref_type == 'branch'
@@ -126,12 +217,23 @@ jobs:
           if gh release view tip --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release edit tip --repo "${GITHUB_REPOSITORY}" \
               --title "Development build (tip)" --prerelease \
-              --notes "Latest successful build from the main branch."
+              --notes-file tip-release-notes.md
           else
             gh release create tip --repo "${GITHUB_REPOSITORY}" --verify-tag \
               --title "Development build (tip)" --prerelease \
-              --notes "Latest successful build from the main branch."
+              --notes-file tip-release-notes.md
           fi
+
+          gh release view tip --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name' |
+          while IFS= read -r asset; do
+            case "${asset}" in
+              undefined-player-*-linux-*.tar.gz|undefined-player_*.deb)
+                gh release delete-asset tip "${asset}" \
+                  --repo "${GITHUB_REPOSITORY}" --yes
+                ;;
+            esac
+          done
 
           gh release upload tip release-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
 
@@ -140,10 +242,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" --notes-file tagged-release-notes.md
+          else
             gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+              --verify-tag --title "${GITHUB_REF_NAME}" \
+              --notes-file tagged-release-notes.md
           fi
+
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name' |
+          while IFS= read -r asset; do
+            case "${asset}" in
+              undefined-player-*-linux-*.tar.gz|undefined-player_*.deb)
+                gh release delete-asset "${GITHUB_REF_NAME}" "${asset}" \
+                  --repo "${GITHUB_REPOSITORY}" --yes
+                ;;
+            esac
+          done
 
           gh release upload "${GITHUB_REF_NAME}" release-assets/* \
             --repo "${GITHUB_REPOSITORY}" --clobber
