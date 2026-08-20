@@ -398,6 +398,70 @@ impl Drop for WaylandInput {
     }
 }
 
+enum MprisCommand {
+    Quit,
+    Play,
+    Pause,
+    PlayPause,
+    Stop,
+    Seek(i64),
+    SetPosition(i64),
+}
+
+struct Mpris(*mut ffi::UpMpris);
+
+impl Mpris {
+    unsafe fn create(title: &CStr, path: &CStr, duration_us: i64) -> Option<Self> {
+        let mpris = unsafe { ffi::up_mpris_create(title.as_ptr(), path.as_ptr(), duration_us) };
+        if mpris.is_null() {
+            eprintln!("warning: out of memory while enabling MPRIS");
+            return None;
+        }
+        if unsafe { ffi::up_mpris_active(mpris) } == 0 {
+            let error = unsafe { CStr::from_ptr(ffi::up_mpris_error(mpris)) }.to_string_lossy();
+            eprintln!("warning: MPRIS unavailable: {error}");
+            unsafe { ffi::up_mpris_destroy(mpris) };
+            return None;
+        }
+        Some(Self(mpris))
+    }
+
+    fn dispatch(&self) {
+        unsafe { ffi::up_mpris_dispatch(self.0) };
+    }
+
+    fn take_command(&self) -> Option<MprisCommand> {
+        let mut value = 0;
+        let command = unsafe { ffi::up_mpris_take_command(self.0, &mut value) };
+        match command {
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_QUIT => Some(MprisCommand::Quit),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_PLAY => Some(MprisCommand::Play),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_PAUSE => Some(MprisCommand::Pause),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_PLAY_PAUSE => Some(MprisCommand::PlayPause),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_STOP => Some(MprisCommand::Stop),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_SEEK => Some(MprisCommand::Seek(value)),
+            ffi::UpMprisCommand_UP_MPRIS_COMMAND_SET_POSITION => {
+                Some(MprisCommand::SetPosition(value))
+            }
+            _ => None,
+        }
+    }
+
+    fn update(&self, status: ffi::UpMprisStatus, position_us: i64) {
+        unsafe { ffi::up_mpris_update(self.0, status, position_us) };
+    }
+
+    fn seeked(&self, position_us: i64) {
+        unsafe { ffi::up_mpris_seeked(self.0, position_us) };
+    }
+}
+
+impl Drop for Mpris {
+    fn drop(&mut self) {
+        unsafe { ffi::up_mpris_destroy(self.0) };
+    }
+}
+
 struct Renderer(*mut ffi::UpVideoRenderer);
 
 struct RendererOverlays<'a> {
@@ -2044,6 +2108,22 @@ unsafe fn toggle_fullscreen(window: &Window, fullscreen: &mut bool) -> Result<()
     Ok(())
 }
 
+unsafe fn set_playback_paused(
+    decoder: &DecodeWorker,
+    clock: &mut WallClock,
+    paused: &mut bool,
+    requested: bool,
+) -> Result<()> {
+    if *paused == requested {
+        return Ok(());
+    }
+    let media = decoder.lock()?;
+    unsafe { media.set_paused(requested)? };
+    clock.set_paused(requested);
+    *paused = requested;
+    Ok(())
+}
+
 unsafe fn seek_by(
     media: &mut Media,
     clock: &mut WallClock,
@@ -2051,7 +2131,7 @@ unsafe fn seek_by(
     offset: f64,
     playback_start: f64,
     duration: Option<f64>,
-) -> Result<()> {
+) -> Result<f64> {
     let maximum = duration.map_or(f64::MAX, |duration| {
         playback_start + (duration - 0.05).max(0.0)
     });
@@ -2062,8 +2142,9 @@ unsafe fn seek_by(
     }
     let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
     clock.seek(displayed_target);
-    notice.show(displayed_target - playback_start, duration);
-    Ok(())
+    let position = displayed_target - playback_start;
+    notice.show(position, duration);
+    Ok(position)
 }
 
 unsafe fn seek_to(
@@ -2073,7 +2154,7 @@ unsafe fn seek_to(
     position: f64,
     playback_start: f64,
     duration: f64,
-) -> Result<()> {
+) -> Result<f64> {
     let position = position.clamp(0.0, (duration - 0.05).max(0.0));
     let target = playback_start + position;
     let target = unsafe { media.seek(target)? };
@@ -2082,18 +2163,54 @@ unsafe fn seek_to(
     }
     let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
     clock.seek(displayed_target);
-    notice.show(displayed_target - playback_start, Some(duration));
-    Ok(())
+    let position = displayed_target - playback_start;
+    notice.show(position, Some(duration));
+    Ok(position)
+}
+
+fn seconds_to_microseconds(seconds: f64) -> i64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        0
+    } else {
+        (seconds * 1_000_000.0).min(i64::MAX as f64) as i64
+    }
+}
+
+fn media_title(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("undefined-player");
+    let stem = stem
+        .strip_suffix(']')
+        .and_then(|value| value.rsplit_once(" ["))
+        .filter(|(_, id)| {
+            id.len() == 11
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map_or(stem, |(title, _)| title);
+    let title = stem.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        "undefined-player".into()
+    } else {
+        title
+    }
+}
+
+fn display_title(path: &Path) -> String {
+    media_title(path).to_uppercase()
 }
 
 unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let _sdl = unsafe { Sdl::init()? };
-    let title = CString::new(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("undefined-player"),
-    )
-    .map_err(|_| "media filename contains a NUL byte".to_string())?;
+    let metadata_title = CString::new(media_title(&path))
+        .map_err(|_| "media filename contains a NUL byte".to_string())?;
+    let title = CString::new(display_title(&path))
+        .map_err(|_| "media filename contains a NUL byte".to_string())?;
+    let path_text = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| "media path contains a NUL byte".to_string())?;
     let window = unsafe { Window::create(&title)? };
     let _wayland_input = match unsafe { WaylandInput::create(&window) } {
         Ok(input) => Some(input),
@@ -2138,6 +2255,13 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         unsafe { media.audio_clock() }.unwrap_or(media.first_video_pts.unwrap_or(0.0));
     let playback_start = clock_origin;
     let media_duration = media.duration();
+    let mpris = unsafe {
+        Mpris::create(
+            &metadata_title,
+            &path_text,
+            media_duration.map_or(0, seconds_to_microseconds),
+        )
+    };
     let subtitle_track_count = media.subtitle_decoders.len();
     let subtitles_available = subtitle_track_count > 0;
     let decoder = DecodeWorker::start(media, perf_log);
@@ -2153,6 +2277,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         .collect::<Vec<Option<SubtitleCue>>>();
     let mut running = true;
     let mut paused = false;
+    let mut mpris_stopped = false;
     let mut fullscreen = false;
     let mut info_visible = false;
     let mut subtitles_visible = subtitles_available;
@@ -2262,7 +2387,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 &mut subtitle_queues,
                                 &mut current_subtitles,
                             );
-                            unsafe {
+                            let position = unsafe {
                                 seek_by(
                                     &mut media,
                                     &mut clock,
@@ -2272,6 +2397,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                     media_duration,
                                 )?
                             };
+                            if let Some(mpris) = &mpris {
+                                mpris.seeked(seconds_to_microseconds(position));
+                            }
+                            mpris_stopped = false;
                             redraw = true;
                             new_frame_pending = true;
                         }
@@ -2283,7 +2412,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 &mut subtitle_queues,
                                 &mut current_subtitles,
                             );
-                            unsafe {
+                            let position = unsafe {
                                 seek_by(
                                     &mut media,
                                     &mut clock,
@@ -2293,6 +2422,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                     media_duration,
                                 )?
                             };
+                            if let Some(mpris) = &mpris {
+                                mpris.seeked(seconds_to_microseconds(position));
+                            }
+                            mpris_stopped = false;
                             redraw = true;
                             new_frame_pending = true;
                         }
@@ -2305,10 +2438,11 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             redraw = true;
                         }
                         Some(Action::TogglePause) => {
-                            paused = !paused;
-                            let media = decoder.lock()?;
-                            unsafe { media.set_paused(paused)? };
-                            clock.set_paused(paused);
+                            let requested = !paused;
+                            unsafe {
+                                set_playback_paused(&decoder, &mut clock, &mut paused, requested)?
+                            };
+                            mpris_stopped = false;
                         }
                         Some(Action::ToggleSubtitles) if subtitles_available => {
                             subtitles_visible = !subtitles_visible;
@@ -2337,6 +2471,65 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 _ => {}
             }
         }
+
+        if let Some(mpris) = &mpris {
+            mpris.dispatch();
+            while let Some(command) = mpris.take_command() {
+                match command {
+                    MprisCommand::Quit => running = false,
+                    MprisCommand::Play => {
+                        unsafe { set_playback_paused(&decoder, &mut clock, &mut paused, false)? };
+                        mpris_stopped = false;
+                    }
+                    MprisCommand::Pause => {
+                        unsafe { set_playback_paused(&decoder, &mut clock, &mut paused, true)? };
+                        mpris_stopped = false;
+                    }
+                    MprisCommand::PlayPause => {
+                        let requested = if mpris_stopped { false } else { !paused };
+                        unsafe {
+                            set_playback_paused(&decoder, &mut clock, &mut paused, requested)?
+                        };
+                        mpris_stopped = false;
+                    }
+                    MprisCommand::Stop => {
+                        unsafe { set_playback_paused(&decoder, &mut clock, &mut paused, true)? };
+                        mpris_stopped = true;
+                        if media_duration.is_some() {
+                            pending_scrub_target = Some(0.0);
+                        }
+                    }
+                    MprisCommand::Seek(offset_us) => {
+                        let mut media = decoder.lock()?;
+                        decoder.clear_frames(&mut video_queue, &mut current_video);
+                        decoder.clear_subtitles(
+                            &mut subtitle_queue,
+                            &mut subtitle_queues,
+                            &mut current_subtitles,
+                        );
+                        let position = unsafe {
+                            seek_by(
+                                &mut media,
+                                &mut clock,
+                                &mut position_notice,
+                                offset_us as f64 / 1_000_000.0,
+                                playback_start,
+                                media_duration,
+                            )?
+                        };
+                        mpris.seeked(seconds_to_microseconds(position));
+                        mpris_stopped = false;
+                        redraw = true;
+                        new_frame_pending = true;
+                    }
+                    MprisCommand::SetPosition(position_us) => {
+                        if media_duration.is_some() {
+                            pending_scrub_target = Some(position_us.max(0) as f64 / 1_000_000.0);
+                        }
+                    }
+                }
+            }
+        }
         if !running {
             break;
         }
@@ -2348,7 +2541,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 &mut subtitle_queues,
                 &mut current_subtitles,
             );
-            unsafe {
+            let position = unsafe {
                 seek_to(
                     &mut media,
                     &mut clock,
@@ -2358,6 +2551,9 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     duration,
                 )?
             };
+            if let Some(mpris) = &mpris {
+                mpris.seeked(seconds_to_microseconds(position));
+            }
             redraw = true;
             new_frame_pending = true;
         }
@@ -2375,6 +2571,19 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         // this machine), so the continuous audio-anchored wall clock is used
         // for video presentation instead of the quantized queue counter.
         let playback_time = clock.now();
+        if let Some(mpris) = &mpris {
+            let status = if mpris_stopped {
+                ffi::UpMprisStatus_UP_MPRIS_STATUS_STOPPED
+            } else if paused {
+                ffi::UpMprisStatus_UP_MPRIS_STATUS_PAUSED
+            } else {
+                ffi::UpMprisStatus_UP_MPRIS_STATUS_PLAYING
+            };
+            mpris.update(
+                status,
+                seconds_to_microseconds(playback_time - playback_start),
+            );
+        }
 
         for (queue, current) in subtitle_queues.iter_mut().zip(current_subtitles.iter_mut()) {
             while queue
@@ -2629,6 +2838,33 @@ mod tests {
             timeline_text(20.0, Some(313.0)).to_str().unwrap(),
             "0:20 / 5:13"
         );
+    }
+
+    #[test]
+    fn display_title_collapses_filename_whitespace() {
+        assert_eq!(
+            media_title(Path::new(
+                "Kyoto Hidden Valleys Drive 🌿 Arashiyama to Kibune [8zcPIr0mDzU].webm"
+            )),
+            "Kyoto Hidden Valleys Drive 🌿 Arashiyama to Kibune"
+        );
+        assert_eq!(
+            display_title(Path::new("Kyoto  Hidden   Valley.mkv")),
+            "KYOTO HIDDEN VALLEY"
+        );
+        assert_eq!(
+            display_title(Path::new(
+                "Kyoto Hidden Valleys Drive 🌿 Arashiyama to Kibune ⧸ 8K 60fps HDR ⧸ Relaxing Piano [8zcPIr0mDzU].webm"
+            )),
+            "KYOTO HIDDEN VALLEYS DRIVE 🌿 ARASHIYAMA TO KIBUNE ⧸ 8K 60FPS HDR ⧸ RELAXING PIANO"
+        );
+    }
+
+    #[test]
+    fn mpris_positions_use_microseconds() {
+        assert_eq!(seconds_to_microseconds(1.25), 1_250_000);
+        assert_eq!(seconds_to_microseconds(-1.0), 0);
+        assert_eq!(seconds_to_microseconds(f64::NAN), 0);
     }
 
     #[test]

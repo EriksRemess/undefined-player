@@ -13,3 +13,4 @@
 
 #include "video_renderer.h"
 #include "wayland_input.h"
+#include "mpris.h"

@@ -12,7 +12,8 @@ Building requires:
 - Rust 1.85 or newer and Cargo (the crate uses Rust 2024 edition)
 - a C compiler, `ar`, `pkg-config`, `bindgen`, and libclang
 - `wayland-scanner` and the stable Wayland protocol definitions
-- development files for SDL3, libplacebo, Vulkan, Wayland, Pango, and Cairo
+- development files for SDL3, libplacebo, Vulkan, Wayland, Pango, Cairo, and
+  GIO
 - an FFmpeg 9 source checkout built with shared `libavformat`, `libavcodec`,
   `libswresample`, and `libavutil` libraries; Vulkan Video support is needed for
   hardware decoding
@@ -22,7 +23,7 @@ On Ubuntu 26.04, the packaged build dependencies can be installed with:
 ```sh
 sudo apt install build-essential binutils clang libclang-dev pkg-config \
   wayland-protocols libwayland-dev libvulkan-dev libsdl3-dev libplacebo-dev \
-  libpango1.0-dev libcairo2-dev
+  libpango1.0-dev libcairo2-dev libglib2.0-dev
 cargo install bindgen-cli
 ```
 
@@ -31,7 +32,7 @@ separately.
 
 Running requires a Wayland session, the Vulkan loader and a working Vulkan
 driver, SDL3 with its Wayland and PipeWire backends, libplacebo, Wayland client,
-Pango/Cairo, and the shared libraries from the selected FFmpeg checkout. The
+Pango/Cairo, GIO, and the shared libraries from the selected FFmpeg checkout. The
 linker records the selected FFmpeg and non-system library directories as
 runtime search paths. NVIDIA Vulkan Video support enables hardware decoding;
 unsupported codecs fall back to software decoding but still use Vulkan for
@@ -93,6 +94,9 @@ The player starts playing immediately. The focused video window accepts:
 - `S` — toggle subtitles
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
+
+The current file is also exported through MPRIS. GNOME and other desktop media
+controls can show its title and send play, pause, stop, and seek commands.
 
 The borderless Wayland window can be dragged from anywhere with the left mouse
 button. Drag an edge or corner to resize it; the client-area aspect ratio is

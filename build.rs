@@ -74,6 +74,7 @@ fn main() {
     let bindings = out_dir.join("bindings.rs");
     let renderer_object = out_dir.join("video_renderer.o");
     let input_object = out_dir.join("wayland_input.o");
+    let mpris_object = out_dir.join("mpris.o");
     let protocol_object = out_dir.join("xdg_shell_protocol.o");
     let renderer_archive = out_dir.join("libvideo_renderer.a");
     let protocol_header = out_dir.join("xdg-shell-client-protocol.h");
@@ -84,6 +85,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/video_renderer.h");
     println!("cargo:rerun-if-changed=native/wayland_input.c");
     println!("cargo:rerun-if-changed=native/wayland_input.h");
+    println!("cargo:rerun-if-changed=native/mpris.c");
+    println!("cargo:rerun-if-changed=native/mpris.h");
 
     let protocol_xml = wayland_protocols_dir.join("stable/xdg-shell/xdg-shell.xml");
     println!("cargo:rerun-if-changed={}", protocol_xml.display());
@@ -147,6 +150,17 @@ fn main() {
         .arg(&input_object);
     run(input_cc, "C Wayland input compilation");
 
+    let mut mpris_cc = Command::new("cc");
+    mpris_cc
+        .arg("-std=c11")
+        .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .args(pkg_config("--cflags", &["gio-2.0"]))
+        .arg("-c")
+        .arg("native/mpris.c")
+        .arg("-o")
+        .arg(&mpris_object);
+    run(mpris_cc, "C MPRIS bridge compilation");
+
     let mut protocol_cc = Command::new("cc");
     protocol_cc
         .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
@@ -163,6 +177,7 @@ fn main() {
         .arg(&renderer_archive)
         .arg(&renderer_object)
         .arg(&input_object)
+        .arg(&mpris_object)
         .arg(&protocol_object);
     run(ar, "C Vulkan renderer archive creation");
 
@@ -174,7 +189,13 @@ fn main() {
     }
     for argument in pkg_config(
         "--libs",
-        &["libplacebo", "sdl3", "wayland-client", "pangocairo"],
+        &[
+            "libplacebo",
+            "sdl3",
+            "wayland-client",
+            "pangocairo",
+            "gio-2.0",
+        ],
     ) {
         if let Some(library) = argument.strip_prefix("-l") {
             println!("cargo:rustc-link-lib=dylib={library}");

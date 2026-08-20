@@ -29,8 +29,12 @@ struct UpVideoRenderer {
     pl_tex textures[4];
     pl_tex solid_texture;
     pl_tex text_texture;
+    pl_tex title_texture;
     pl_tex subtitle_texture;
     pl_tex text_subtitle_texture;
+    int title_width;
+    int title_height;
+    int title_layout_width;
     int subtitle_width;
     int subtitle_height;
     uint64_t subtitle_serial;
@@ -61,7 +65,9 @@ struct UpVideoRenderer {
 #define DETAILS_GLYPH_Y 64
 #define DETAILS_LINE_ADVANCE 18
 #define DETAILS_MAX_LINES 10
-#define INFO_PANEL_ALPHA 0.55f
+#define INFO_TEXT_INSET 32.0f
+#define TITLE_TEXTURE_HEIGHT 16
+#define TITLE_CELL_WIDTH (6 * GLYPH_SCALE)
 
 static void set_error(UpVideoRenderer *renderer, const char *message);
 
@@ -164,6 +170,22 @@ static const uint8_t *glyph_rows(char character)
     return blank;
 }
 
+static void draw_glyph(uint8_t *pixels, int stride, int x, int y,
+                       char character)
+{
+    const uint8_t *rows = glyph_rows(character);
+    for (int gy = 0; gy < 7; gy++) {
+        for (int gx = 0; gx < 5; gx++) {
+            if (!(rows[gy] & (1 << (4 - gx))))
+                continue;
+            for (int sy = 0; sy < GLYPH_SCALE; sy++)
+                for (int sx = 0; sx < GLYPH_SCALE; sx++)
+                    pixels[(y + gy * GLYPH_SCALE + sy) * stride +
+                           x + gx * GLYPH_SCALE + sx] = 255;
+        }
+    }
+}
+
 static int draw_text_line(uint8_t *pixels, int start_x, int y,
                           const char *text, size_t length)
 {
@@ -175,17 +197,7 @@ static int draw_text_line(uint8_t *pixels, int start_x, int y,
          index < length && x + 6 * GLYPH_SCALE <= TEXTURE_WIDTH;
          index++) {
         const char character = text[index];
-        const uint8_t *rows = glyph_rows(character);
-        for (int gy = 0; gy < 7; gy++) {
-            for (int gx = 0; gx < 5; gx++) {
-                if (!(rows[gy] & (1 << (4 - gx))))
-                    continue;
-                for (int sy = 0; sy < GLYPH_SCALE; sy++)
-                    for (int sx = 0; sx < GLYPH_SCALE; sx++)
-                        pixels[(y + gy * GLYPH_SCALE + sy) * TEXTURE_WIDTH +
-                               x + gx * GLYPH_SCALE + sx] = 255;
-            }
-        }
+        draw_glyph(pixels, TEXTURE_WIDTH, x, y, character);
         x += 6 * GLYPH_SCALE;
     }
     return x > start_x ? x - start_x - GLYPH_SCALE : 0;
@@ -220,30 +232,202 @@ static int draw_details_text(uint8_t *pixels, int y, const char *text)
     return width;
 }
 
-static bool update_text_texture(UpVideoRenderer *renderer, const char *title,
-                                const char *info, const char *details,
+static bool update_title_texture(UpVideoRenderer *renderer, const char *title,
+                                 int layout_width, int *title_width,
+                                 int *title_height)
+{
+    struct unicode_run {
+        const char *text;
+        size_t length;
+        int x;
+        int cells;
+    } unicode_runs[TEXTURE_WIDTH / TITLE_CELL_WIDTH] = {0};
+    uint8_t pixels[TEXTURE_WIDTH * TITLE_TEXTURE_HEIGHT] = {0};
+    const char *safe_title = title ? title : "";
+    *title_width = renderer->title_width;
+    *title_height = renderer->title_height;
+    if (!*safe_title || layout_width <= 0) {
+        *title_width = 0;
+        *title_height = 0;
+        return true;
+    }
+    if (renderer->title_texture &&
+        renderer->title_layout_width == layout_width &&
+        !strcmp(renderer->cached_title, safe_title))
+        return true;
+
+    const int texture_cells = TEXTURE_WIDTH / TITLE_CELL_WIDTH;
+    int maximum_cells = (layout_width + GLYPH_SCALE) / TITLE_CELL_WIDTH;
+    maximum_cells = maximum_cells < texture_cells
+        ? maximum_cells : texture_cells;
+    maximum_cells = maximum_cells > 0 ? maximum_cells : 1;
+    const glong glyph_count = g_utf8_strlen(safe_title, -1);
+    const bool ellipsized = glyph_count > maximum_cells;
+    const int ellipsis_cells = ellipsized
+        ? (maximum_cells < 3 ? maximum_cells : 3) : 0;
+    const int content_cells = maximum_cells - ellipsis_cells;
+    const size_t length = strlen(safe_title);
+    size_t offset = 0;
+    int cells = 0;
+    int num_unicode_runs = 0;
+    while (offset < length && cells < content_cells) {
+        const char *current = safe_title + offset;
+        gunichar character = g_utf8_get_char_validated(
+            current, (gssize) (length - offset));
+        if (character == (gunichar) -1 || character == (gunichar) -2) {
+            draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
+                       (TITLE_TEXTURE_HEIGHT - 14) / 2, '?');
+            offset++;
+            cells++;
+            continue;
+        }
+        if (character < 0x80) {
+            draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
+                       (TITLE_TEXTURE_HEIGHT - 14) / 2, (char) character);
+            offset = (size_t) (g_utf8_next_char(current) - safe_title);
+            cells++;
+            continue;
+        }
+
+        const char *run_start = current;
+        int run_cells = 0;
+        while (offset < length && cells + run_cells < content_cells) {
+            current = safe_title + offset;
+            character = g_utf8_get_char_validated(
+                current, (gssize) (length - offset));
+            if (character < 0x80 || character == (gunichar) -1 ||
+                character == (gunichar) -2)
+                break;
+            offset = (size_t) (g_utf8_next_char(current) - safe_title);
+            run_cells++;
+        }
+        unicode_runs[num_unicode_runs++] = (struct unicode_run) {
+            .text = run_start,
+            .length = (size_t) (safe_title + offset - run_start),
+            .x = cells * TITLE_CELL_WIDTH,
+            .cells = run_cells,
+        };
+        cells += run_cells;
+    }
+    for (int index = 0; index < ellipsis_cells; index++) {
+        draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
+                   (TITLE_TEXTURE_HEIGHT - 14) / 2, '.');
+        cells++;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create_for_data(
+        pixels, CAIRO_FORMAT_A8, TEXTURE_WIDTH, TITLE_TEXTURE_HEIGHT,
+        TEXTURE_WIDTH);
+    cairo_surface_mark_dirty(surface);
+    cairo_t *context = cairo_create(surface);
+    cairo_font_options_t *font_options = cairo_font_options_create();
+    cairo_font_options_set_antialias(font_options, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_FULL);
+    cairo_font_options_set_hint_metrics(font_options, CAIRO_HINT_METRICS_ON);
+    cairo_set_font_options(context, font_options);
+    PangoLayout *layout = pango_cairo_create_layout(context);
+    PangoFontDescription *font = pango_font_description_new();
+    pango_font_description_set_family(font, "DejaVu Sans Mono");
+    pango_font_description_set_absolute_size(font, 11 * PANGO_SCALE);
+    pango_layout_set_font_description(layout, font);
+    pango_layout_set_single_paragraph_mode(layout, true);
+    cairo_set_source_rgba(context, 1.0, 1.0, 1.0, 1.0);
+    for (int index = 0; index < num_unicode_runs; index++) {
+        const struct unicode_run *run = &unicode_runs[index];
+        char *run_text = g_strndup(run->text, run->length);
+        const int run_width = run->cells * TITLE_CELL_WIDTH;
+        pango_layout_set_text(layout, run_text, -1);
+        pango_layout_set_width(layout, run_width * PANGO_SCALE);
+        pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+        PangoRectangle logical_extents;
+        pango_layout_get_pixel_extents(layout, NULL, &logical_extents);
+        cairo_save(context);
+        cairo_translate(context, run->x,
+                        ((TITLE_TEXTURE_HEIGHT - logical_extents.height) * 0.5) -
+                        logical_extents.y);
+        pango_cairo_show_layout(context, layout);
+        cairo_restore(context);
+        g_free(run_text);
+    }
+    cairo_surface_flush(surface);
+
+    bool success = true;
+    const unsigned char *glyphs = cairo_image_surface_get_data(surface);
+    const int glyph_stride = cairo_image_surface_get_stride(surface);
+    bool has_glyphs = false;
+    for (int y = 0; y < TITLE_TEXTURE_HEIGHT && !has_glyphs; y++) {
+        for (int x = 0; x < TEXTURE_WIDTH; x++) {
+            if (glyphs[y * glyph_stride + x] != 0) {
+                has_glyphs = true;
+                break;
+            }
+        }
+    }
+    if (success && !has_glyphs) {
+        set_error(renderer, "Pango produced an empty title texture");
+        success = false;
+    }
+    if (success && (!renderer->title_texture ||
+                    renderer->title_height != TITLE_TEXTURE_HEIGHT)) {
+        pl_tex_destroy(renderer->vulkan->gpu, &renderer->title_texture);
+        pl_fmt format = pl_find_fmt(renderer->vulkan->gpu, PL_FMT_UNORM, 1,
+                                    8, 8, PL_FMT_CAP_SAMPLEABLE);
+        if (!format || !(renderer->title_texture = pl_tex_create(
+                renderer->vulkan->gpu,
+                pl_tex_params(.w = TEXTURE_WIDTH,
+                              .h = TITLE_TEXTURE_HEIGHT,
+                              .format = format, .sampleable = true,
+                              .host_writable = true)))) {
+            set_error(renderer, "could not create Vulkan title texture");
+            success = false;
+        }
+    }
+    if (success && !pl_tex_upload(
+            renderer->vulkan->gpu,
+            pl_tex_transfer_params(
+                .tex = renderer->title_texture,
+                .row_pitch = (size_t) glyph_stride,
+                .ptr = (void *) glyphs))) {
+        set_error(renderer, "could not upload the title to Vulkan");
+        success = false;
+    }
+    if (success) {
+        renderer->title_width = cells * TITLE_CELL_WIDTH - GLYPH_SCALE;
+        renderer->title_height = TITLE_TEXTURE_HEIGHT;
+        renderer->title_layout_width = layout_width;
+        *title_width = renderer->title_width;
+        *title_height = renderer->title_height;
+        snprintf(renderer->cached_title, sizeof(renderer->cached_title), "%s",
+                 safe_title);
+    }
+
+    pango_font_description_free(font);
+    g_object_unref(layout);
+    cairo_font_options_destroy(font_options);
+    cairo_destroy(context);
+    cairo_surface_destroy(surface);
+    return success;
+}
+
+static bool update_text_texture(UpVideoRenderer *renderer, const char *info,
+                                const char *details,
                                 const char *position,
-                                int *title_width, int *info_width,
-                                int *details_width, int *details_height,
-                                int *position_width)
+                                int *info_width, int *details_width,
+                                int *details_height, int *position_width)
 {
     uint8_t pixels[TEXTURE_WIDTH * TEXTURE_HEIGHT] = {0};
-    const char *safe_title = title ? title : "";
     const char *safe_info = info ? info : "";
     const char *safe_details = details ? details : "";
     const char *safe_position = position ? position : "";
 
-    *title_width = text_pixel_width(safe_title);
     *info_width = text_pixel_width(safe_info);
     details_text_metrics(safe_details, details_width, details_height);
     *position_width = text_pixel_width(safe_position);
-    if (!strcmp(renderer->cached_title, safe_title) &&
-        !strcmp(renderer->cached_info, safe_info) &&
+    if (!strcmp(renderer->cached_info, safe_info) &&
         !strcmp(renderer->cached_details, safe_details) &&
         !strcmp(renderer->cached_position, safe_position))
         return true;
 
-    *title_width = draw_text(pixels, 0, safe_title);
     *info_width = draw_text(pixels, INFO_GLYPH_Y, safe_info);
     draw_text_at(pixels, CLOSE_GLYPH_X, CLOSE_GLYPH_Y, "X");
     *position_width = draw_text(pixels, POSITION_GLYPH_Y, safe_position);
@@ -256,8 +440,6 @@ static bool update_text_texture(UpVideoRenderer *renderer, const char *title,
         set_error(renderer, "could not upload overlay text to Vulkan");
         return false;
     }
-    snprintf(renderer->cached_title, sizeof(renderer->cached_title), "%s",
-             safe_title);
     snprintf(renderer->cached_info, sizeof(renderer->cached_info), "%s",
              safe_info);
     snprintf(renderer->cached_details, sizeof(renderer->cached_details), "%s",
@@ -662,8 +844,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
     struct pl_overlay bitmap_overlay = {0};
     struct pl_overlay_part bitmap_part = {0};
     int num_overlays = 0;
-    int title_width = 0, info_width = 0, details_width = 0;
-    int details_height = 0, position_width = 0;
+    int title_width = 0, title_height = 0, info_width = 0;
+    int details_width = 0, details_height = 0, position_width = 0;
     int ret = -1;
 
     if (!renderer || !renderer->renderer || !frame || width <= 0 || height <= 0)
@@ -738,9 +920,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
             goto out;
     }
 
-    if (!update_text_texture(renderer, title, info, details, position,
-                             &title_width, &info_width, &details_width,
-                             &details_height, &position_width))
+    const int title_layout_width = width > 84 ? width - 84 : 1;
+    if (!update_title_texture(renderer, title, title_layout_width,
+                              &title_width, &title_height) ||
+        !update_text_texture(renderer, info, details, position,
+                             &info_width, &details_width, &details_height,
+                             &position_width))
         goto out;
 
     top_bar_alpha = fminf(fmaxf(top_bar_alpha, 0.0f), 1.0f);
@@ -760,14 +945,18 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
         overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
         num_overlays++;
 
-        if (title_width > 0) {
+        if (renderer->title_texture && title_width > 0 && title_height > 0) {
+            const float title_x = fmaxf(
+                ((float) width - title_width) * 0.5f, 14.0f);
+            const float title_y = ((42.0f - title_height) * 0.5f);
             parts[num_overlays] = (struct pl_overlay_part) {
-                .src = {0, 0, title_width, 14},
-                .dst = {14, 14, 14 + title_width, 28},
+                .src = {0, 0, title_width, title_height},
+                .dst = {title_x, title_y,
+                        title_x + title_width, title_y + title_height},
                 .color = {1.0f, 1.0f, 1.0f, top_bar_alpha},
             };
             overlays[num_overlays] = (struct pl_overlay) {
-                .tex = renderer->text_texture,
+                .tex = renderer->title_texture,
                 .mode = PL_OVERLAY_MONOCHROME,
                 .coords = PL_OVERLAY_COORDS_DST_FRAME,
                 .repr = pl_color_repr_rgb,
@@ -797,29 +986,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
     }
 
     if (details && details_width > 0 && details_height > 0) {
-        const float details_y = 54.0f;
-        parts[num_overlays] = (struct pl_overlay_part) {
-            .src = {0, 0, 1, 1},
-            .dst = {6, details_y - 4,
-                    22 + details_width, details_y + details_height + 8},
-            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA},
-        };
-        overlays[num_overlays] = (struct pl_overlay) {
-            .tex = renderer->solid_texture,
-            .mode = PL_OVERLAY_MONOCHROME,
-            .coords = PL_OVERLAY_COORDS_DST_FRAME,
-            .repr = pl_color_repr_rgb,
-            .color = pl_color_space_srgb,
-            .parts = &parts[num_overlays], .num_parts = 1,
-        };
-        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
-        num_overlays++;
-
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, DETAILS_GLYPH_Y,
                     details_width, DETAILS_GLYPH_Y + details_height},
-            .dst = {14, details_y,
-                    14 + details_width, details_y + details_height},
+            .dst = {INFO_TEXT_INSET, INFO_TEXT_INSET,
+                    INFO_TEXT_INSET + details_width,
+                    INFO_TEXT_INSET + details_height},
             .color = {1.0f, 1.0f, 1.0f, 1.0f},
         };
         overlays[num_overlays] = (struct pl_overlay) {
@@ -836,26 +1008,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
 
     info_alpha = fminf(fmaxf(info_alpha, 0.0f), 1.0f);
     if (info && info_width > 0 && info_alpha > 0.001f) {
-        const float info_y = fmaxf(height - 54.0f, 0.0f);
-        parts[num_overlays] = (struct pl_overlay_part) {
-            .src = {0, 0, 1, 1},
-            .dst = {6, info_y - 4, 22 + info_width, info_y + 22},
-            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA * info_alpha},
-        };
-        overlays[num_overlays] = (struct pl_overlay) {
-            .tex = renderer->solid_texture,
-            .mode = PL_OVERLAY_MONOCHROME,
-            .coords = PL_OVERLAY_COORDS_DST_FRAME,
-            .repr = pl_color_repr_rgb,
-            .color = pl_color_space_srgb,
-            .parts = &parts[num_overlays], .num_parts = 1,
-        };
-        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
-        num_overlays++;
+        const float info_y = fmaxf(height - INFO_TEXT_INSET - 14.0f, 0.0f);
 
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, 16, info_width, 30},
-            .dst = {14, info_y, 14 + info_width, info_y + 14},
+            .dst = {INFO_TEXT_INSET, info_y,
+                    INFO_TEXT_INSET + info_width, info_y + 14},
             .color = {1.0f, 1.0f, 1.0f, info_alpha},
         };
         overlays[num_overlays] = (struct pl_overlay) {
@@ -872,24 +1030,10 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
 
     position_alpha = fminf(fmaxf(position_alpha, 0.0f), 1.0f);
     if (position && position_width > 0 && position_alpha > 0.001f) {
-        const float position_y = fmaxf(height - 54.0f, 0.0f);
-        const float position_x = fmaxf(width - position_width - 14.0f, 14.0f);
-        parts[num_overlays] = (struct pl_overlay_part) {
-            .src = {0, 0, 1, 1},
-            .dst = {position_x - 8, position_y - 4,
-                    width - 6, position_y + 22},
-            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA * position_alpha},
-        };
-        overlays[num_overlays] = (struct pl_overlay) {
-            .tex = renderer->solid_texture,
-            .mode = PL_OVERLAY_MONOCHROME,
-            .coords = PL_OVERLAY_COORDS_DST_FRAME,
-            .repr = pl_color_repr_rgb,
-            .color = pl_color_space_srgb,
-            .parts = &parts[num_overlays], .num_parts = 1,
-        };
-        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
-        num_overlays++;
+        const float position_y = fmaxf(
+            height - INFO_TEXT_INSET - 14.0f, 0.0f);
+        const float position_x = fmaxf(
+            width - INFO_TEXT_INSET - position_width, INFO_TEXT_INSET);
 
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, POSITION_GLYPH_Y,
@@ -1078,6 +1222,7 @@ void up_video_renderer_destroy(UpVideoRenderer *renderer)
             pl_tex_destroy(renderer->vulkan->gpu, &renderer->textures[i]);
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->solid_texture);
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->text_texture);
+        pl_tex_destroy(renderer->vulkan->gpu, &renderer->title_texture);
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->subtitle_texture);
         pl_tex_destroy(renderer->vulkan->gpu,
                        &renderer->text_subtitle_texture);
