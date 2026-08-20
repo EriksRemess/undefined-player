@@ -31,7 +31,8 @@ Use `make uninstall` to remove those installed files.
 The player starts playing immediately. The focused video window accepts:
 
 - `F` — toggle fullscreen
-- `I` — toggle the FPS / shown / dropped frame / playback-position overlay
+- `I` — toggle video/color details, FPS / shown / dropped frames, and playback
+  position
 - `Left` / `Right` — seek backward or forward 10 seconds
 - `Space` — pause or resume
 - `S` — toggle subtitles

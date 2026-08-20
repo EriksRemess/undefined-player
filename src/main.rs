@@ -91,6 +91,77 @@ fn rational(value: ffi::AVRational) -> f64 {
     }
 }
 
+unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
+    (!pointer.is_null()).then(|| {
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .to_uppercase()
+    })
+}
+
+unsafe fn stream_metadata_i64(stream: *const ffi::AVStream, key: &CStr) -> Option<i64> {
+    let entry = unsafe {
+        ffi::av_dict_get(
+            (*stream).metadata,
+            key.as_ptr(),
+            ptr::null(),
+            ffi::AV_DICT_IGNORE_SUFFIX as i32,
+        )
+    };
+    (!entry.is_null())
+        .then(|| {
+            unsafe { CStr::from_ptr((*entry).value) }
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()
+        })
+        .flatten()
+}
+
+fn format_bitrate(bits_per_second: i64) -> String {
+    if bits_per_second >= 1_000_000 {
+        format!("{:.1} MBPS", bits_per_second as f64 / 1_000_000.0)
+    } else if bits_per_second >= 1_000 {
+        format!("{:.0} KBPS", bits_per_second as f64 / 1_000.0)
+    } else if bits_per_second > 0 {
+        format!("{bits_per_second} BPS")
+    } else {
+        "UNKNOWN".to_owned()
+    }
+}
+
+fn format_video_bitrate(declared: i64, metadata: Option<i64>, container: i64) -> String {
+    if declared > 0 {
+        format_bitrate(declared)
+    } else if let Some(metadata) = metadata.filter(|value| *value > 0) {
+        format_bitrate(metadata)
+    } else if container > 0 {
+        format!("{} (CONTAINER)", format_bitrate(container))
+    } else {
+        "UNKNOWN".to_owned()
+    }
+}
+
+fn mark_assumed(name: Option<String>, assumed: bool) -> String {
+    let name = name.unwrap_or_else(|| "UNKNOWN".to_owned());
+    if assumed {
+        format!("{name} (ASSUMED)")
+    } else {
+        name
+    }
+}
+
+fn hdr_status(transfer: ffi::AVColorTransferCharacteristic, assumed: bool) -> &'static str {
+    match transfer {
+        ffi::AVColorTransferCharacteristic_AVCOL_TRC_SMPTE2084 => "YES (PQ)",
+        ffi::AVColorTransferCharacteristic_AVCOL_TRC_ARIB_STD_B67 => "YES (HLG)",
+        ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED => "UNKNOWN",
+        _ if assumed => "NO (ASSUMED)",
+        _ => "NO",
+    }
+}
+
 fn close_button_contains(
     x: f32,
     y: f32,
@@ -331,6 +402,7 @@ struct Renderer(*mut ffi::UpVideoRenderer);
 
 struct RendererOverlays<'a> {
     info: Option<(&'a CStr, f32)>,
+    details: Option<&'a CStr>,
     position: Option<(&'a CStr, f32)>,
     scrubber: Option<(f32, f32)>,
     subtitle: Option<&'a SubtitleCue>,
@@ -368,6 +440,7 @@ impl Renderer {
         let (info, info_alpha) = overlays
             .info
             .map_or((ptr::null(), 0.0), |(text, alpha)| (text.as_ptr(), alpha));
+        let details = overlays.details.map_or(ptr::null(), CStr::as_ptr);
         let (position, position_alpha) = overlays
             .position
             .map_or((ptr::null(), 0.0), |(text, alpha)| (text.as_ptr(), alpha));
@@ -407,6 +480,7 @@ impl Renderer {
                 title.as_ptr(),
                 info,
                 info_alpha,
+                details,
                 position,
                 position_alpha,
                 scrubber_progress,
@@ -579,6 +653,153 @@ struct SubtitleCue {
     end: f64,
     serial: u64,
     content: SubtitleContent,
+}
+
+struct VideoInfo {
+    lines: [String; 10],
+    frame_rate: Option<f64>,
+}
+
+impl VideoInfo {
+    unsafe fn inspect(media: &Media, frame: *const ffi::AVFrame) -> Self {
+        let stream = unsafe {
+            *(*media.format)
+                .streams
+                .add(media.video.stream_index as usize)
+        };
+        let parameters = unsafe { (*stream).codecpar };
+        let codec = unsafe { ffmpeg_name(ffi::avcodec_get_name((*parameters).codec_id)) }
+            .unwrap_or_else(|| "UNKNOWN".to_owned());
+        let profile = unsafe {
+            ffmpeg_name(ffi::avcodec_profile_name(
+                (*parameters).codec_id,
+                (*parameters).profile,
+            ))
+        };
+        let codec = profile.map_or(codec.clone(), |profile| format!("{codec} {profile}"));
+
+        let frame_rate =
+            rational(unsafe { ffi::av_guess_frame_rate(media.format, stream, ptr::null_mut()) });
+        let frame_rate = (frame_rate > 0.0).then_some(frame_rate);
+        let bit_rate = format_video_bitrate(
+            unsafe { (*parameters).bit_rate },
+            unsafe { stream_metadata_i64(stream, c"BPS") },
+            unsafe { (*media.format).bit_rate },
+        );
+        let pixel_format = unsafe {
+            let decoded = (*media.video.context).sw_pix_fmt;
+            let format = if decoded != ffi::AVPixelFormat_AV_PIX_FMT_NONE {
+                decoded
+            } else {
+                (*parameters).format
+            };
+            ffmpeg_name(ffi::av_get_pix_fmt_name(format))
+        }
+        .unwrap_or_else(|| "UNKNOWN PIXEL FORMAT".to_owned());
+        let decode_path = if media.video.uses_vulkan {
+            "VULKAN HW"
+        } else {
+            "SOFTWARE"
+        };
+        let resolution_line = format!("RESOLUTION: {}X{}", unsafe { (*frame).width }, unsafe {
+            (*frame).height
+        },);
+        let assume_hd_color = unsafe { (*frame).width >= 1280 || (*frame).height >= 720 };
+
+        let (color_space_value, color_space_assumed) = unsafe {
+            if (*frame).colorspace != ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
+                ((*frame).colorspace, false)
+            } else if (*parameters).color_space != ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
+                ((*parameters).color_space, false)
+            } else if assume_hd_color {
+                (ffi::AVColorSpace_AVCOL_SPC_BT709, true)
+            } else {
+                (ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED, false)
+            }
+        };
+        let color_space = mark_assumed(
+            unsafe { ffmpeg_name(ffi::av_color_space_name(color_space_value)) },
+            color_space_assumed,
+        );
+        let (color_primaries_value, color_primaries_assumed) = unsafe {
+            if (*frame).color_primaries != ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED {
+                ((*frame).color_primaries, false)
+            } else if (*parameters).color_primaries != ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED {
+                ((*parameters).color_primaries, false)
+            } else if assume_hd_color {
+                (ffi::AVColorPrimaries_AVCOL_PRI_BT709, true)
+            } else {
+                (ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED, false)
+            }
+        };
+        let color_primaries = mark_assumed(
+            unsafe { ffmpeg_name(ffi::av_color_primaries_name(color_primaries_value)) },
+            color_primaries_assumed,
+        );
+        let (color_transfer_value, color_transfer_assumed) = unsafe {
+            if (*frame).color_trc != ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED {
+                ((*frame).color_trc, false)
+            } else if (*parameters).color_trc
+                != ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED
+            {
+                ((*parameters).color_trc, false)
+            } else if assume_hd_color {
+                (ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, true)
+            } else {
+                (
+                    ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED,
+                    false,
+                )
+            }
+        };
+        let color_transfer = mark_assumed(
+            unsafe { ffmpeg_name(ffi::av_color_transfer_name(color_transfer_value)) },
+            color_transfer_assumed,
+        );
+        let (color_range_value, color_range_assumed) = unsafe {
+            if (*frame).color_range != ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
+                ((*frame).color_range, false)
+            } else if (*parameters).color_range != ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
+                ((*parameters).color_range, false)
+            } else {
+                let full_range = pixel_format.starts_with("YUVJ")
+                    || pixel_format.starts_with("RGB")
+                    || pixel_format.starts_with("GBR");
+                (
+                    if full_range {
+                        ffi::AVColorRange_AVCOL_RANGE_JPEG
+                    } else {
+                        ffi::AVColorRange_AVCOL_RANGE_MPEG
+                    },
+                    true,
+                )
+            }
+        };
+        let color_range = mark_assumed(
+            unsafe { ffmpeg_name(ffi::av_color_range_name(color_range_value)) },
+            color_range_assumed,
+        );
+        let hdr = hdr_status(color_transfer_value, color_transfer_assumed);
+        Self {
+            lines: [
+                format!("CODEC: {codec}"),
+                resolution_line,
+                format!("BITRATE: {bit_rate}"),
+                format!("PIXEL FORMAT: {pixel_format}"),
+                format!("DECODE: {decode_path}"),
+                format!("MATRIX: {color_space}"),
+                format!("PRIMARIES: {color_primaries}"),
+                format!("TRANSFER: {color_transfer}"),
+                format!("RANGE: {color_range}"),
+                format!("HDR: {hdr}"),
+            ],
+            frame_rate,
+        }
+    }
+
+    fn overlay_text(&self) -> CString {
+        CString::new(self.lines.join("\n")).expect("video information has no NUL bytes")
+    }
 }
 
 // The worker transfers exclusive ownership of each reference-counted AVFrame
@@ -1785,7 +2006,6 @@ impl TopBar {
 struct PresentationStats {
     shown: u64,
     dropped: u64,
-    recent: VecDeque<Instant>,
 }
 
 impl PresentationStats {
@@ -1793,34 +2013,22 @@ impl PresentationStats {
         Self {
             shown: 0,
             dropped: 0,
-            recent: VecDeque::new(),
         }
     }
 
     fn presented(&mut self) {
         self.shown += 1;
-        self.recent.push_back(Instant::now());
-        self.prune();
     }
 
     fn drop_frames(&mut self, count: usize) {
         self.dropped += count as u64;
     }
 
-    fn prune(&mut self) {
-        let cutoff = Instant::now() - Duration::from_secs(1);
-        while self.recent.front().is_some_and(|time| *time < cutoff) {
-            self.recent.pop_front();
-        }
-    }
-
-    fn text(&mut self) -> CString {
-        self.prune();
+    fn text(&self, frame_rate: Option<f64>) -> CString {
+        let frame_rate = frame_rate.map_or_else(|| "UNKNOWN".to_owned(), |fps| format!("{fps:.3}"));
         CString::new(format!(
-            "FPS: {:.1}  SHOWN: {}  DROPPED: {}",
-            self.recent.len() as f32,
-            self.shown,
-            self.dropped
+            "FPS: {frame_rate}  SHOWN: {}  DROPPED: {}",
+            self.shown, self.dropped
         ))
         .expect("statistics text has no NUL bytes")
     }
@@ -1901,6 +2109,9 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     if media.video_queue.is_empty() {
         return Err("the video decoder produced no frames".into());
     }
+    let video_info =
+        unsafe { VideoInfo::inspect(&media, media.video_queue.front().unwrap().frame) };
+    let video_details = video_info.overlay_text();
     unsafe { window.set_minimum_size()? };
     let (mut width, mut height) = unsafe { window.pixel_size()? };
     unsafe { renderer.resize(width, height)? };
@@ -1914,6 +2125,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             &title,
             RendererOverlays {
                 info: None,
+                details: None,
                 position: None,
                 scrubber: None,
                 subtitle: None,
@@ -2236,7 +2448,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         }
 
         if redraw && let Some(frame) = current_video.as_ref().map(|queued| &queued.frame) {
-            let stats_info = info_visible.then(|| stats.text());
+            let stats_info = info_visible.then(|| stats.text(video_info.frame_rate));
             let controls_visible = top_bar.alpha > 0.001;
             let persistent_position = (position_notice.text.is_none()
                 && (info_visible || controls_visible))
@@ -2269,6 +2481,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     &title,
                     RendererOverlays {
                         info: stats_info.as_deref().map(|text| (text, 1.0)),
+                        details: info_visible.then_some(video_details.as_c_str()),
                         position: position.map(|text| (text, position_alpha)),
                         scrubber,
                         subtitle: subtitles_visible
@@ -2415,6 +2628,81 @@ mod tests {
         assert_eq!(
             timeline_text(20.0, Some(313.0)).to_str().unwrap(),
             "0:20 / 5:13"
+        );
+    }
+
+    #[test]
+    fn bitrates_use_compact_overlay_units() {
+        assert_eq!(format_bitrate(18_750_000), "18.8 MBPS");
+        assert_eq!(format_bitrate(192_000), "192 KBPS");
+        assert_eq!(format_bitrate(0), "UNKNOWN");
+        assert_eq!(
+            format_video_bitrate(0, Some(23_963_146), 29_807_000),
+            "24.0 MBPS"
+        );
+        assert_eq!(
+            format_video_bitrate(0, None, 28_846_000),
+            "28.8 MBPS (CONTAINER)"
+        );
+    }
+
+    #[test]
+    fn hdr_status_distinguishes_pq_hlg_sdr_and_unknown() {
+        assert_eq!(
+            hdr_status(
+                ffi::AVColorTransferCharacteristic_AVCOL_TRC_SMPTE2084,
+                false
+            ),
+            "YES (PQ)"
+        );
+        assert_eq!(
+            hdr_status(
+                ffi::AVColorTransferCharacteristic_AVCOL_TRC_ARIB_STD_B67,
+                false
+            ),
+            "YES (HLG)"
+        );
+        assert_eq!(
+            hdr_status(ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, false),
+            "NO"
+        );
+        assert_eq!(
+            hdr_status(
+                ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED,
+                false
+            ),
+            "UNKNOWN"
+        );
+        assert_eq!(
+            hdr_status(ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, true),
+            "NO (ASSUMED)"
+        );
+    }
+
+    #[test]
+    fn video_details_are_kept_separate_from_runtime_statistics() {
+        let info = VideoInfo {
+            lines: [
+                "CODEC: HEVC MAIN 10".into(),
+                "RESOLUTION: 3840X2160".into(),
+                "BITRATE: 18.8 MBPS".into(),
+                "PIXEL FORMAT: YUV420P10LE".into(),
+                "DECODE: VULKAN HW".into(),
+                "MATRIX: BT2020NC".into(),
+                "PRIMARIES: BT2020".into(),
+                "TRANSFER: SMPTE2084".into(),
+                "RANGE: TV".into(),
+                "HDR: YES (PQ)".into(),
+            ],
+            frame_rate: Some(24_000.0 / 1001.0),
+        };
+        assert_eq!(
+            info.overlay_text().to_bytes(),
+            b"CODEC: HEVC MAIN 10\nRESOLUTION: 3840X2160\nBITRATE: 18.8 MBPS\nPIXEL FORMAT: YUV420P10LE\nDECODE: VULKAN HW\nMATRIX: BT2020NC\nPRIMARIES: BT2020\nTRANSFER: SMPTE2084\nRANGE: TV\nHDR: YES (PQ)"
+        );
+        assert_eq!(
+            PresentationStats::new().text(info.frame_rate).to_bytes(),
+            b"FPS: 23.976  SHOWN: 0  DROPPED: 0"
         );
     }
 

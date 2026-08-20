@@ -47,15 +47,21 @@ struct UpVideoRenderer {
     char error[256];
     char cached_title[512];
     char cached_info[256];
+    char cached_details[512];
     char cached_position[128];
 };
 
 #define TEXTURE_WIDTH 1024
-#define TEXTURE_HEIGHT 160
+#define TEXTURE_HEIGHT 256
 #define GLYPH_SCALE 2
+#define INFO_GLYPH_Y 16
 #define CLOSE_GLYPH_X (TEXTURE_WIDTH - 12)
 #define CLOSE_GLYPH_Y 32
 #define POSITION_GLYPH_Y 48
+#define DETAILS_GLYPH_Y 64
+#define DETAILS_LINE_ADVANCE 18
+#define DETAILS_MAX_LINES 10
+#define INFO_PANEL_ALPHA 0.55f
 
 static void set_error(UpVideoRenderer *renderer, const char *message);
 
@@ -67,11 +73,34 @@ static size_t bounded_length(const char *text, size_t maximum)
     return length;
 }
 
+static int text_pixel_width_length(size_t length)
+{
+    const size_t maximum = TEXTURE_WIDTH / (6 * GLYPH_SCALE);
+    if (length > maximum)
+        length = maximum;
+    return length ? (int) (length * 6 * GLYPH_SCALE - GLYPH_SCALE) : 0;
+}
+
 static int text_pixel_width(const char *text)
 {
     const size_t maximum = TEXTURE_WIDTH / (6 * GLYPH_SCALE);
-    const size_t length = bounded_length(text, maximum);
-    return length ? (int) (length * 6 * GLYPH_SCALE - GLYPH_SCALE) : 0;
+    return text_pixel_width_length(bounded_length(text, maximum));
+}
+
+static void details_text_metrics(const char *text, int *width, int *height)
+{
+    int lines = 0;
+    *width = 0;
+    while (text && *text && lines < DETAILS_MAX_LINES) {
+        const char *newline = strchr(text, '\n');
+        const size_t length = newline ? (size_t) (newline - text) : strlen(text);
+        *width = fmax(*width, text_pixel_width_length(length));
+        lines++;
+        if (!newline)
+            break;
+        text = newline + 1;
+    }
+    *height = lines ? (lines - 1) * DETAILS_LINE_ADVANCE + 14 : 0;
 }
 
 static const uint8_t *glyph_rows(char character)
@@ -135,14 +164,18 @@ static const uint8_t *glyph_rows(char character)
     return blank;
 }
 
-static int draw_text_at(uint8_t *pixels, int start_x, int y, const char *text)
+static int draw_text_line(uint8_t *pixels, int start_x, int y,
+                          const char *text, size_t length)
 {
     int x = start_x;
     if (!text)
         return 0;
 
-    for (; *text && x + 6 * GLYPH_SCALE <= TEXTURE_WIDTH; text++) {
-        const uint8_t *rows = glyph_rows(*text);
+    for (size_t index = 0;
+         index < length && x + 6 * GLYPH_SCALE <= TEXTURE_WIDTH;
+         index++) {
+        const char character = text[index];
+        const uint8_t *rows = glyph_rows(character);
         for (int gy = 0; gy < 7; gy++) {
             for (int gx = 0; gx < 5; gx++) {
                 if (!(rows[gy] & (1 << (4 - gx))))
@@ -158,33 +191,63 @@ static int draw_text_at(uint8_t *pixels, int start_x, int y, const char *text)
     return x > start_x ? x - start_x - GLYPH_SCALE : 0;
 }
 
+static int draw_text_at(uint8_t *pixels, int start_x, int y, const char *text)
+{
+    return draw_text_line(pixels, start_x, y, text,
+                          text ? strlen(text) : 0);
+}
+
 static int draw_text(uint8_t *pixels, int y, const char *text)
 {
     return draw_text_at(pixels, 0, y, text);
 }
 
+static int draw_details_text(uint8_t *pixels, int y, const char *text)
+{
+    int width = 0;
+    int lines = 0;
+    while (text && *text && lines < DETAILS_MAX_LINES) {
+        const char *newline = strchr(text, '\n');
+        const size_t length = newline ? (size_t) (newline - text) : strlen(text);
+        width = fmax(width, draw_text_line(pixels, 0,
+                                          y + lines * DETAILS_LINE_ADVANCE,
+                                          text, length));
+        lines++;
+        if (!newline)
+            break;
+        text = newline + 1;
+    }
+    return width;
+}
+
 static bool update_text_texture(UpVideoRenderer *renderer, const char *title,
-                                const char *info, const char *position,
+                                const char *info, const char *details,
+                                const char *position,
                                 int *title_width, int *info_width,
+                                int *details_width, int *details_height,
                                 int *position_width)
 {
     uint8_t pixels[TEXTURE_WIDTH * TEXTURE_HEIGHT] = {0};
     const char *safe_title = title ? title : "";
     const char *safe_info = info ? info : "";
+    const char *safe_details = details ? details : "";
     const char *safe_position = position ? position : "";
 
     *title_width = text_pixel_width(safe_title);
     *info_width = text_pixel_width(safe_info);
+    details_text_metrics(safe_details, details_width, details_height);
     *position_width = text_pixel_width(safe_position);
     if (!strcmp(renderer->cached_title, safe_title) &&
         !strcmp(renderer->cached_info, safe_info) &&
+        !strcmp(renderer->cached_details, safe_details) &&
         !strcmp(renderer->cached_position, safe_position))
         return true;
 
     *title_width = draw_text(pixels, 0, safe_title);
-    *info_width = draw_text(pixels, 16, safe_info);
+    *info_width = draw_text(pixels, INFO_GLYPH_Y, safe_info);
     draw_text_at(pixels, CLOSE_GLYPH_X, CLOSE_GLYPH_Y, "X");
     *position_width = draw_text(pixels, POSITION_GLYPH_Y, safe_position);
+    *details_width = draw_details_text(pixels, DETAILS_GLYPH_Y, safe_details);
     if (!pl_tex_upload(renderer->vulkan->gpu,
                        pl_tex_transfer_params(
                            .tex = renderer->text_texture,
@@ -197,6 +260,8 @@ static bool update_text_texture(UpVideoRenderer *renderer, const char *title,
              safe_title);
     snprintf(renderer->cached_info, sizeof(renderer->cached_info), "%s",
              safe_info);
+    snprintf(renderer->cached_details, sizeof(renderer->cached_details), "%s",
+             safe_details);
     snprintf(renderer->cached_position, sizeof(renderer->cached_position), "%s",
              safe_position);
     return true;
@@ -579,7 +644,8 @@ AVBufferRef *up_video_renderer_device(UpVideoRenderer *renderer)
 int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
                               int width, int height, float top_bar_alpha,
                               const char *title, const char *info,
-                              float info_alpha, const char *position,
+                              float info_alpha, const char *details,
+                              const char *position,
                               float position_alpha, float scrubber_progress,
                               float scrubber_alpha, const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
@@ -596,7 +662,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
     struct pl_overlay bitmap_overlay = {0};
     struct pl_overlay_part bitmap_part = {0};
     int num_overlays = 0;
-    int title_width = 0, info_width = 0, position_width = 0;
+    int title_width = 0, info_width = 0, details_width = 0;
+    int details_height = 0, position_width = 0;
     int ret = -1;
 
     if (!renderer || !renderer->renderer || !frame || width <= 0 || height <= 0)
@@ -671,8 +738,9 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
             goto out;
     }
 
-    if (!update_text_texture(renderer, title, info, position,
-                             &title_width, &info_width, &position_width))
+    if (!update_text_texture(renderer, title, info, details, position,
+                             &title_width, &info_width, &details_width,
+                             &details_height, &position_width))
         goto out;
 
     top_bar_alpha = fminf(fmaxf(top_bar_alpha, 0.0f), 1.0f);
@@ -728,13 +796,51 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
         num_overlays++;
     }
 
+    if (details && details_width > 0 && details_height > 0) {
+        const float details_y = 54.0f;
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, 0, 1, 1},
+            .dst = {6, details_y - 4,
+                    22 + details_width, details_y + details_height + 8},
+            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->solid_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+
+        parts[num_overlays] = (struct pl_overlay_part) {
+            .src = {0, DETAILS_GLYPH_Y,
+                    details_width, DETAILS_GLYPH_Y + details_height},
+            .dst = {14, details_y,
+                    14 + details_width, details_y + details_height},
+            .color = {1.0f, 1.0f, 1.0f, 1.0f},
+        };
+        overlays[num_overlays] = (struct pl_overlay) {
+            .tex = renderer->text_texture,
+            .mode = PL_OVERLAY_MONOCHROME,
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_srgb,
+            .parts = &parts[num_overlays], .num_parts = 1,
+        };
+        overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
+        num_overlays++;
+    }
+
     info_alpha = fminf(fmaxf(info_alpha, 0.0f), 1.0f);
     if (info && info_width > 0 && info_alpha > 0.001f) {
         const float info_y = fmaxf(height - 54.0f, 0.0f);
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, 0, 1, 1},
             .dst = {6, info_y - 4, 22 + info_width, info_y + 22},
-            .color = {0.0f, 0.0f, 0.0f, 0.72f * info_alpha},
+            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA * info_alpha},
         };
         overlays[num_overlays] = (struct pl_overlay) {
             .tex = renderer->solid_texture,
@@ -772,7 +878,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
             .src = {0, 0, 1, 1},
             .dst = {position_x - 8, position_y - 4,
                     width - 6, position_y + 22},
-            .color = {0.0f, 0.0f, 0.0f, 0.72f * position_alpha},
+            .color = {0.0f, 0.0f, 0.0f, INFO_PANEL_ALPHA * position_alpha},
         };
         overlays[num_overlays] = (struct pl_overlay) {
             .tex = renderer->solid_texture,
