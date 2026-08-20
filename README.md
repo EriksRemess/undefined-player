@@ -1,15 +1,70 @@
 # undefined-player
 
-A deliberately machine-specific Wayland video-player MVP. It uses the local
-FFmpeg 9 checkout at `/home/eriks/Development/ffmpeg`, decodes supported codecs
-directly with NVIDIA Vulkan Video, renders with libplacebo to a Vulkan Wayland
-swapchain, and plays audio through PipeWire.
+A deliberately machine-specific Wayland video-player MVP. It uses a local
+FFmpeg 9 checkout, decodes supported codecs directly with NVIDIA Vulkan Video,
+renders with libplacebo to a Vulkan Wayland swapchain, and plays audio through
+PipeWire.
+
+## Requirements
+
+Building requires:
+
+- Rust 1.85 or newer and Cargo (the crate uses Rust 2024 edition)
+- a C compiler, `ar`, `pkg-config`, `bindgen`, and libclang
+- `wayland-scanner` and the stable Wayland protocol definitions
+- development files for SDL3, libplacebo, Vulkan, Wayland, Pango, and Cairo
+- an FFmpeg 9 source checkout built with shared `libavformat`, `libavcodec`,
+  `libswresample`, and `libavutil` libraries; Vulkan Video support is needed for
+  hardware decoding
+
+On Ubuntu 26.04, the packaged build dependencies can be installed with:
+
+```sh
+sudo apt install build-essential binutils clang libclang-dev pkg-config \
+  wayland-protocols libwayland-dev libvulkan-dev libsdl3-dev libplacebo-dev \
+  libpango1.0-dev libcairo2-dev
+cargo install bindgen-cli
+```
+
+FFmpeg itself and any libraries enabled in that FFmpeg build must be provided
+separately.
+
+Running requires a Wayland session, the Vulkan loader and a working Vulkan
+driver, SDL3 with its Wayland and PipeWire backends, libplacebo, Wayland client,
+Pango/Cairo, and the shared libraries from the selected FFmpeg checkout. The
+linker records the selected FFmpeg and non-system library directories as
+runtime search paths. NVIDIA Vulkan Video support enables hardware decoding;
+unsupported codecs fall back to software decoding but still use Vulkan for
+presentation.
+
+When the player is built against Ubuntu 26.04's packaged libraries, the base
+runtime packages can be installed with:
+
+```sh
+sudo apt install libvulkan1 libsdl3-0 libplacebo360 libwayland-client0 \
+  libpangocairo-1.0-0 libcairo2 pipewire-audio
+```
+
+The NVIDIA driver and the selected FFmpeg build's shared-library dependencies
+are additional runtime requirements.
 
 ## Build and run
 
 ```sh
 cargo build --release
 target/release/undefined-player ~/Videos/example.mp4
+```
+
+The FFmpeg checkout defaults to `../ffmpeg`, relative to this repository. Set
+`FFMPEG_DIR` to use a different checkout. Other headers and libraries are
+located through `pkg-config`, so `PKG_CONFIG_PATH` can select non-system
+installations. `WAYLAND_PROTOCOLS_DIR` can override the Wayland protocol data
+directory when needed:
+
+```sh
+FFMPEG_DIR=/path/to/ffmpeg \
+WAYLAND_PROTOCOLS_DIR=/path/to/wayland-protocols \
+cargo build --release
 ```
 
 Add `--perf` to print shown/dropped frame rates and average decoder-fill and

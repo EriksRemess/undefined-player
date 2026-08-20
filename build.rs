@@ -1,8 +1,6 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-
-const FFMPEG: &str = "/home/eriks/Development/ffmpeg";
 
 fn run(mut command: Command, description: &str) {
     let status = command.status().unwrap_or_else(|error| {
@@ -11,14 +9,21 @@ fn run(mut command: Command, description: &str) {
     assert!(status.success(), "{description} failed with {status}");
 }
 
-fn pkg_config(option: &str, package: &str) -> Vec<String> {
+fn pkg_config(option: &str, packages: &[&str]) -> Vec<String> {
     let output = Command::new("pkg-config")
-        .args([option, package])
+        .arg(option)
+        .args(packages)
         .output()
-        .unwrap_or_else(|error| panic!("failed to start pkg-config for {package}: {error}"));
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to start pkg-config for {}: {error}",
+                packages.join(", ")
+            )
+        });
     assert!(
         output.status.success(),
-        "pkg-config could not find {package}: {}",
+        "pkg-config could not find {}: {}",
+        packages.join(", "),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)
@@ -28,7 +33,43 @@ fn pkg_config(option: &str, package: &str) -> Vec<String> {
         .collect()
 }
 
+fn pkg_config_path(variable: &str, package: &str) -> PathBuf {
+    let option = format!("--variable={variable}");
+    let values = pkg_config(&option, &[package]);
+    assert_eq!(
+        values.len(),
+        1,
+        "pkg-config returned an invalid {variable} for {package}"
+    );
+    PathBuf::from(&values[0])
+}
+
 fn main() {
+    for variable in [
+        "FFMPEG_DIR",
+        "WAYLAND_PROTOCOLS_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let ffmpeg_dir = env::var_os("FFMPEG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            manifest_dir
+                .parent()
+                .expect("the project directory has a parent")
+                .join("ffmpeg")
+        });
+    let wayland_protocols_dir = env::var_os("WAYLAND_PROTOCOLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| pkg_config_path("pkgdatadir", "wayland-protocols"));
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let bindings = out_dir.join("bindings.rs");
     let renderer_object = out_dir.join("video_renderer.o");
@@ -44,15 +85,18 @@ fn main() {
     println!("cargo:rerun-if-changed=native/wayland_input.c");
     println!("cargo:rerun-if-changed=native/wayland_input.h");
 
-    let protocol_xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
+    let protocol_xml = wayland_protocols_dir.join("stable/xdg-shell/xdg-shell.xml");
+    println!("cargo:rerun-if-changed={}", protocol_xml.display());
     let mut scanner_header = Command::new("wayland-scanner");
     scanner_header
-        .args(["client-header", protocol_xml])
+        .arg("client-header")
+        .arg(&protocol_xml)
         .arg(&protocol_header);
     run(scanner_header, "Wayland xdg-shell header generation");
     let mut scanner_source = Command::new("wayland-scanner");
     scanner_source
-        .args(["private-code", protocol_xml])
+        .arg("private-code")
+        .arg(&protocol_xml)
         .arg(&protocol_source);
     run(scanner_source, "Wayland xdg-shell code generation");
 
@@ -72,18 +116,18 @@ fn main() {
         .arg("--output")
         .arg(&bindings)
         .arg("--")
-        .arg(format!("-I{FFMPEG}"))
-        .arg("-I/usr/local/include")
-        .arg("-I/usr/include/x86_64-linux-gnu");
+        .arg(format!("-I{}", ffmpeg_dir.display()))
+        .args(pkg_config("--cflags", &["sdl3"]));
     run(bindgen, "bindgen");
 
     let mut cc = Command::new("cc");
     cc.arg("-std=c11")
         .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
-        .args(pkg_config("--cflags", "pangocairo"))
-        .arg(format!("-I{FFMPEG}"))
-        .arg("-I/usr/local/include")
-        .arg("-I/usr/include/x86_64-linux-gnu")
+        .args(pkg_config(
+            "--cflags",
+            &["libplacebo", "sdl3", "pangocairo"],
+        ))
+        .arg(format!("-I{}", ffmpeg_dir.display()))
         .arg("-c")
         .arg("native/video_renderer.c")
         .arg("-o")
@@ -94,7 +138,7 @@ fn main() {
     input_cc
         .arg("-std=c11")
         .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
-        .arg("-I/usr/include/x86_64-linux-gnu")
+        .args(pkg_config("--cflags", &["sdl3", "wayland-client"]))
         .arg("-I")
         .arg(&out_dir)
         .arg("-c")
@@ -123,29 +167,28 @@ fn main() {
     run(ar, "C Vulkan renderer archive creation");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-search=native=/usr/local/lib/x86_64-linux-gnu");
     println!("cargo:rustc-link-lib=static=video_renderer");
 
     for library in ["avformat", "avcodec", "swresample", "avutil"] {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
-    println!("cargo:rustc-link-lib=dylib=placebo");
-    println!("cargo:rustc-link-lib=dylib=SDL3");
-    println!("cargo:rustc-link-lib=dylib=wayland-client");
-    for argument in pkg_config("--libs", "pangocairo") {
+    for argument in pkg_config(
+        "--libs",
+        &["libplacebo", "sdl3", "wayland-client", "pangocairo"],
+    ) {
         if let Some(library) = argument.strip_prefix("-l") {
             println!("cargo:rustc-link-lib=dylib={library}");
         } else if let Some(directory) = argument.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={directory}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{directory}");
         } else {
             println!("cargo:rustc-link-arg={argument}");
         }
     }
 
     for directory in ["libavformat", "libavcodec", "libswresample", "libavutil"] {
-        let path = Path::new(FFMPEG).join(directory);
+        let path = ffmpeg_dir.join(directory);
         println!("cargo:rustc-link-search=native={}", path.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
     }
-    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/local/lib/x86_64-linux-gnu");
 }
