@@ -1,0 +1,149 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  arch-linux:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install Arch Linux build dependencies
+        run: >-
+          pacman -Syu --noconfirm
+          base-devel rust pkgconf wayland wayland-protocols vulkan-headers
+          sdl3 libplacebo pango cairo glib2 ffmpeg desktop-file-utils
+
+      - uses: actions/checkout@v6
+
+      - name: Restore build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
+          restore-keys: |
+            cargo-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Check
+        run: make check
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  debian-package:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - name: Install Debian packaging tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y devscripts lintian
+
+      - uses: actions/checkout@v6
+
+      - name: Restore build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
+          restore-keys: |
+            cargo-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Install declared build dependencies
+        run: DEBIAN_FRONTEND=noninteractive apt-get build-dep -y .
+
+      - name: Validate tag version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Build and lint package
+        run: |
+          dpkg-buildpackage --build=binary --no-sign --no-pre-clean
+          lintian --fail-on error ../undefined-player_*.deb
+
+      - name: Build binary tarball
+        run: make tarball
+
+      - name: Collect release assets
+        run: |
+          mkdir release-assets
+          cp ../undefined-player_*.deb target/dist/undefined-player-*.tar.gz release-assets/
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: undefined-player-packages
+          if-no-files-found: error
+          retention-days: 1
+          path: release-assets/
+
+  publish-release:
+    needs:
+      - arch-linux
+      - debian-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: undefined-player-packages
+          path: release-assets
+
+      - name: Update rolling tip release
+        if: github.ref_type == 'branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/tip" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/tip" \
+              -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/tip" -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+
+          if gh release view tip --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit tip --repo "${GITHUB_REPOSITORY}" \
+              --title "Development build (tip)" --prerelease \
+              --notes "Latest successful build from the main branch."
+          else
+            gh release create tip --repo "${GITHUB_REPOSITORY}" --verify-tag \
+              --title "Development build (tip)" --prerelease \
+              --notes "Latest successful build from the main branch."
+          fi
+
+          gh release upload tip release-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" --clobber

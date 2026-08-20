@@ -11,15 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[allow(warnings, clippy::all)]
-mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+mod ffi;
 
-const SDL_WINDOW_RESIZABLE: u64 = 0x20;
-const SDL_WINDOW_BORDERLESS: u64 = 0x10;
-const SDL_WINDOW_HIGH_PIXEL_DENSITY: u64 = 0x2000;
-const SDL_WINDOW_VULKAN: u64 = 0x1000_0000;
-const SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK: u32 = u32::MAX;
 const AUDIO_RATE: i32 = 48_000;
 const AUDIO_CHANNELS: i32 = 2;
 const AUDIO_BYTES_PER_FRAME: i64 = (size_of::<f32>() * AUDIO_CHANNELS as usize) as i64;
@@ -50,20 +43,20 @@ enum Action {
 
 fn action_for_key(key: u32) -> Option<Action> {
     match key {
-        ffi::SDLK_Q => Some(Action::Quit),
-        ffi::SDLK_J => Some(Action::CycleSubtitles),
-        ffi::SDLK_LEFT => Some(Action::SeekBackward),
-        ffi::SDLK_RIGHT => Some(Action::SeekForward),
-        ffi::SDLK_F => Some(Action::ToggleFullscreen),
-        ffi::SDLK_I => Some(Action::ToggleInfo),
-        ffi::SDLK_SPACE => Some(Action::TogglePause),
-        ffi::SDLK_S => Some(Action::ToggleSubtitles),
+        ffi::UpKey_UP_KEY_Q => Some(Action::Quit),
+        ffi::UpKey_UP_KEY_J => Some(Action::CycleSubtitles),
+        ffi::UpKey_UP_KEY_LEFT => Some(Action::SeekBackward),
+        ffi::UpKey_UP_KEY_RIGHT => Some(Action::SeekForward),
+        ffi::UpKey_UP_KEY_F => Some(Action::ToggleFullscreen),
+        ffi::UpKey_UP_KEY_I => Some(Action::ToggleInfo),
+        ffi::UpKey_UP_KEY_SPACE => Some(Action::TogglePause),
+        ffi::UpKey_UP_KEY_S => Some(Action::ToggleSubtitles),
         _ => None,
     }
 }
 
 unsafe fn sdl_error() -> String {
-    let error = unsafe { ffi::SDL_GetError() };
+    let error = unsafe { ffi::up_platform_error() };
     if error.is_null() {
         "unknown SDL error".into()
     } else {
@@ -75,20 +68,12 @@ unsafe fn sdl_error() -> String {
 
 unsafe fn ffmpeg_error(code: i32) -> String {
     let mut buffer = [0_i8; 128];
-    if unsafe { ffi::av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } < 0 {
+    if unsafe { ffi::up_av_error_string(code, buffer.as_mut_ptr(), buffer.len()) } < 0 {
         return format!("FFmpeg error {code}");
     }
     unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_string_lossy()
         .into_owned()
-}
-
-fn rational(value: ffi::AVRational) -> f64 {
-    if value.den == 0 {
-        0.0
-    } else {
-        value.num as f64 / value.den as f64
-    }
 }
 
 unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
@@ -97,26 +82,6 @@ unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
             .to_string_lossy()
             .to_uppercase()
     })
-}
-
-unsafe fn stream_metadata_i64(stream: *const ffi::AVStream, key: &CStr) -> Option<i64> {
-    let entry = unsafe {
-        ffi::av_dict_get(
-            (*stream).metadata,
-            key.as_ptr(),
-            ptr::null(),
-            ffi::AV_DICT_IGNORE_SUFFIX as i32,
-        )
-    };
-    (!entry.is_null())
-        .then(|| {
-            unsafe { CStr::from_ptr((*entry).value) }
-                .to_str()
-                .ok()?
-                .parse()
-                .ok()
-        })
-        .flatten()
 }
 
 fn format_bitrate(bits_per_second: i64) -> String {
@@ -152,12 +117,12 @@ fn mark_assumed(name: Option<String>, assumed: bool) -> String {
     }
 }
 
-fn hdr_status(transfer: ffi::AVColorTransferCharacteristic, assumed: bool) -> &'static str {
-    match transfer {
-        ffi::AVColorTransferCharacteristic_AVCOL_TRC_SMPTE2084 => "YES (PQ)",
-        ffi::AVColorTransferCharacteristic_AVCOL_TRC_ARIB_STD_B67 => "YES (HLG)",
-        ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED => "UNKNOWN",
-        _ if assumed => "NO (ASSUMED)",
+fn hdr_status(kind: ffi::UpHdrKind, assumed: bool) -> &'static str {
+    match kind {
+        ffi::UpHdrKind_UP_HDR_KIND_PQ => "YES (PQ)",
+        ffi::UpHdrKind_UP_HDR_KIND_HLG => "YES (HLG)",
+        ffi::UpHdrKind_UP_HDR_KIND_UNKNOWN => "UNKNOWN",
+        ffi::UpHdrKind_UP_HDR_KIND_SDR if assumed => "NO (ASSUMED)",
         _ => "NO",
     }
 }
@@ -221,7 +186,7 @@ impl Sdl {
             env::set_var("SDL_VIDEODRIVER", "wayland");
             env::set_var("SDL_AUDIODRIVER", "pipewire");
         }
-        if !unsafe { ffi::SDL_Init(ffi::SDL_INIT_VIDEO | ffi::SDL_INIT_AUDIO) } {
+        if unsafe { ffi::up_platform_init() } == 0 {
             return Err(format!("SDL initialization failed: {}", unsafe {
                 sdl_error()
             }));
@@ -232,69 +197,19 @@ impl Sdl {
 
 impl Drop for Sdl {
     fn drop(&mut self) {
-        unsafe { ffi::SDL_Quit() };
+        unsafe { ffi::up_platform_quit() };
     }
 }
 
-struct Window(*mut ffi::SDL_Window);
-
-unsafe extern "C" fn resize_hit_test(
-    window: *mut ffi::SDL_Window,
-    point: *const ffi::SDL_Point,
-    _data: *mut c_void,
-) -> ffi::SDL_HitTestResult {
-    const BORDER: i32 = 10;
-    let mut width = 0;
-    let mut height = 0;
-    let mut pixel_width = 0;
-    let mut pixel_height = 0;
-    unsafe { ffi::SDL_GetWindowSize(window, &mut width, &mut height) };
-    unsafe { ffi::SDL_GetWindowSizeInPixels(window, &mut pixel_width, &mut pixel_height) };
-    let point = unsafe { &*point };
-    if close_button_contains(
-        point.x as f32,
-        point.y as f32,
-        width,
-        height,
-        pixel_width,
-        pixel_height,
-    ) {
-        return ffi::SDL_HitTestResult_SDL_HITTEST_NORMAL;
-    }
-    let left = point.x <= BORDER;
-    let right = point.x >= width - BORDER;
-    let top = point.y <= BORDER;
-    let bottom = point.y >= height - BORDER;
-
-    match (top, bottom, left, right) {
-        (true, _, true, _) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_TOPLEFT,
-        (true, _, _, true) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_TOPRIGHT,
-        (_, true, true, _) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_BOTTOMLEFT,
-        (_, true, _, true) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_BOTTOMRIGHT,
-        (true, _, _, _) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_TOP,
-        (_, true, _, _) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_BOTTOM,
-        (_, _, true, _) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_LEFT,
-        (_, _, _, true) => ffi::SDL_HitTestResult_SDL_HITTEST_RESIZE_RIGHT,
-        _ => ffi::SDL_HitTestResult_SDL_HITTEST_NORMAL,
-    }
-}
+struct Window(*mut ffi::UpWindow);
 
 impl Window {
     unsafe fn create(title: &CStr) -> Result<Self> {
-        let flags = SDL_WINDOW_VULKAN
-            | SDL_WINDOW_RESIZABLE
-            | SDL_WINDOW_HIGH_PIXEL_DENSITY
-            | SDL_WINDOW_BORDERLESS;
-        let window = unsafe { ffi::SDL_CreateWindow(title.as_ptr(), 1280, 720, flags) };
+        let window = unsafe { ffi::up_window_create(title.as_ptr(), 1280, 720) };
         if window.is_null() {
             return Err(format!("could not create the Wayland window: {}", unsafe {
                 sdl_error()
             }));
-        }
-        if !unsafe { ffi::SDL_SetWindowHitTest(window, Some(resize_hit_test), ptr::null_mut()) } {
-            let error = unsafe { sdl_error() };
-            unsafe { ffi::SDL_DestroyWindow(window) };
-            return Err(format!("could not enable mouse resizing: {error}"));
         }
         Ok(Self(window))
     }
@@ -302,7 +217,7 @@ impl Window {
     unsafe fn pixel_size(&self) -> Result<(i32, i32)> {
         let mut width = 0;
         let mut height = 0;
-        if !unsafe { ffi::SDL_GetWindowSizeInPixels(self.0, &mut width, &mut height) } {
+        if unsafe { ffi::up_window_pixel_size(self.0, &mut width, &mut height) } == 0 {
             return Err(format!("could not query window size: {}", unsafe {
                 sdl_error()
             }));
@@ -315,10 +230,9 @@ impl Window {
         let mut logical_height = 0;
         let mut pixel_width = 0;
         let mut pixel_height = 0;
-        if !unsafe { ffi::SDL_GetWindowSize(self.0, &mut logical_width, &mut logical_height) }
-            || !unsafe {
-                ffi::SDL_GetWindowSizeInPixels(self.0, &mut pixel_width, &mut pixel_height)
-            }
+        if unsafe { ffi::up_window_size(self.0, &mut logical_width, &mut logical_height) } == 0
+            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
+                == 0
         {
             return false;
         }
@@ -338,10 +252,9 @@ impl Window {
         let mut logical_height = 0;
         let mut pixel_width = 0;
         let mut pixel_height = 0;
-        if !unsafe { ffi::SDL_GetWindowSize(self.0, &mut logical_width, &mut logical_height) }
-            || !unsafe {
-                ffi::SDL_GetWindowSizeInPixels(self.0, &mut pixel_width, &mut pixel_height)
-            }
+        if unsafe { ffi::up_window_size(self.0, &mut logical_width, &mut logical_height) } == 0
+            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
+                == 0
         {
             return None;
         }
@@ -357,7 +270,7 @@ impl Window {
     }
 
     unsafe fn set_minimum_size(&self) -> Result<()> {
-        if !unsafe { ffi::SDL_SetWindowMinimumSize(self.0, 320, 180) } {
+        if unsafe { ffi::up_window_set_minimum_size(self.0, 320, 180) } == 0 {
             return Err(format!(
                 "could not set the minimum window size: {}",
                 unsafe { sdl_error() }
@@ -369,7 +282,7 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        unsafe { ffi::SDL_DestroyWindow(self.0) };
+        unsafe { ffi::up_window_destroy(self.0) };
     }
 }
 
@@ -377,7 +290,7 @@ struct WaylandInput(*mut ffi::UpWaylandInput);
 
 impl WaylandInput {
     unsafe fn create(window: &Window) -> Result<Self> {
-        let input = unsafe { ffi::up_wayland_input_create(window.0) };
+        let input = unsafe { ffi::up_wayland_input_create(window.0.cast()) };
         if input.is_null() {
             return Err("out of memory while creating Wayland input".into());
         }
@@ -474,7 +387,7 @@ struct RendererOverlays<'a> {
 
 impl Renderer {
     unsafe fn create(window: &Window) -> Result<Self> {
-        let renderer = unsafe { ffi::up_video_renderer_create(window.0) };
+        let renderer = unsafe { ffi::up_video_renderer_create(window.0.cast()) };
         if renderer.is_null() {
             return Err("out of memory while creating the Vulkan renderer".into());
         }
@@ -488,13 +401,13 @@ impl Renderer {
         Ok(Self(renderer))
     }
 
-    unsafe fn device(&self) -> *mut ffi::AVBufferRef {
+    unsafe fn device(&self) -> *mut c_void {
         unsafe { ffi::up_video_renderer_device(self.0) }
     }
 
     unsafe fn display(
         &self,
-        frame: *mut ffi::AVFrame,
+        frame: *mut ffi::UpAvFrame,
         width: i32,
         height: i32,
         top_bar_alpha: f32,
@@ -537,7 +450,7 @@ impl Renderer {
         if unsafe {
             ffi::up_video_renderer_display(
                 self.0,
-                frame,
+                frame.cast(),
                 width,
                 height,
                 top_bar_alpha,
@@ -585,118 +498,48 @@ impl Drop for Renderer {
 }
 
 struct Decoder {
-    context: *mut ffi::AVCodecContext,
+    context: *mut ffi::UpAvDecoder,
     stream_index: i32,
-    time_base: ffi::AVRational,
+    time_base: f64,
     uses_vulkan: bool,
 }
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        unsafe { ffi::avcodec_free_context(&mut self.context) };
-    }
-}
-
-unsafe extern "C" fn choose_vulkan_format(
-    _context: *mut ffi::AVCodecContext,
-    formats: *const ffi::AVPixelFormat,
-) -> ffi::AVPixelFormat {
-    let mut current = formats;
-    while !current.is_null() && unsafe { *current } != ffi::AVPixelFormat_AV_PIX_FMT_NONE {
-        if unsafe { *current } == ffi::AVPixelFormat_AV_PIX_FMT_VULKAN {
-            return ffi::AVPixelFormat_AV_PIX_FMT_VULKAN;
-        }
-        current = unsafe { current.add(1) };
-    }
-    ffi::AVPixelFormat_AV_PIX_FMT_NONE
-}
-
-unsafe fn decoder_supports_vulkan(codec: *const ffi::AVCodec) -> bool {
-    let mut index = 0;
-    loop {
-        let config = unsafe { ffi::avcodec_get_hw_config(codec, index) };
-        if config.is_null() {
-            return false;
-        }
-        if unsafe {
-            (*config).device_type == ffi::AVHWDeviceType_AV_HWDEVICE_TYPE_VULKAN
-                && (*config).pix_fmt == ffi::AVPixelFormat_AV_PIX_FMT_VULKAN
-                && ((*config).methods as u32 & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0
-        } {
-            return true;
-        }
-        index += 1;
+        unsafe { ffi::up_av_decoder_free(&mut self.context) };
     }
 }
 
 impl Decoder {
     unsafe fn open(
-        format: *mut ffi::AVFormatContext,
+        format: *mut ffi::UpAvFormat,
         stream_index: i32,
-        vulkan_device: Option<*mut ffi::AVBufferRef>,
+        vulkan_device: Option<*mut c_void>,
     ) -> Result<Self> {
-        let stream = unsafe { *(*format).streams.add(stream_index as usize) };
-        let parameters = unsafe { (*stream).codecpar };
-        let codec = if vulkan_device.is_some() {
-            // Do not use avcodec_find_decoder(): this local FFmpeg intentionally
-            // puts CUVID first. The generic decoder is what exposes Vulkan Video.
-            let name = unsafe { ffi::avcodec_get_name((*parameters).codec_id) };
-            unsafe { ffi::avcodec_find_decoder_by_name(name) }
-        } else {
-            unsafe { ffi::avcodec_find_decoder((*parameters).codec_id) }
-        };
-        if codec.is_null() {
-            return Err("no decoder is available for the selected stream".into());
-        }
-        let uses_vulkan = vulkan_device.is_some() && unsafe { decoder_supports_vulkan(codec) };
-
-        let mut context = unsafe { ffi::avcodec_alloc_context3(codec) };
-        if context.is_null() {
-            return Err("out of memory while allocating a decoder".into());
-        }
-        let result = (|| {
-            let ret = unsafe { ffi::avcodec_parameters_to_context(context, parameters) };
-            if ret < 0 {
-                return Err(format!("could not configure decoder: {}", unsafe {
-                    ffmpeg_error(ret)
-                }));
-            }
-            unsafe { (*context).pkt_timebase = (*stream).time_base };
-
-            if uses_vulkan {
-                let device = vulkan_device.expect("a Vulkan decoder has a Vulkan device");
-                unsafe {
-                    (*context).get_format = Some(choose_vulkan_format);
-                    (*context).hw_device_ctx = ffi::av_buffer_ref(device);
-                    (*context).extra_hw_frames = 16;
-                }
-                if unsafe { (*context).hw_device_ctx }.is_null() {
-                    return Err("could not retain the Vulkan decoder device".into());
-                }
-            }
-
-            let ret = unsafe { ffi::avcodec_open2(context, codec, ptr::null_mut()) };
-            if ret < 0 {
-                return Err(format!("could not open decoder: {}", unsafe {
-                    ffmpeg_error(ret)
-                }));
-            }
-            Ok(Self {
-                context,
+        let context = unsafe {
+            ffi::up_av_decoder_open(
+                format,
                 stream_index,
-                time_base: unsafe { (*stream).time_base },
-                uses_vulkan,
-            })
-        })();
-        if result.is_err() {
-            unsafe { ffi::avcodec_free_context(&mut context) };
+                vulkan_device.unwrap_or(ptr::null_mut()),
+                i32::from(vulkan_device.is_some()),
+            )
+        };
+        if context.is_null() {
+            return Err(unsafe { CStr::from_ptr(ffi::up_av_decoder_error()) }
+                .to_string_lossy()
+                .into_owned());
         }
-        result
+        Ok(Self {
+            context,
+            stream_index: unsafe { ffi::up_av_decoder_stream_index(context) },
+            time_base: unsafe { ffi::up_av_decoder_time_base(context) },
+            uses_vulkan: unsafe { ffi::up_av_decoder_uses_vulkan(context) } != 0,
+        })
     }
 }
 
 struct VideoFrame {
-    frame: *mut ffi::AVFrame,
+    frame: *mut ffi::UpAvFrame,
     pts: f64,
     duration: f64,
 }
@@ -725,125 +568,49 @@ struct VideoInfo {
 }
 
 impl VideoInfo {
-    unsafe fn inspect(media: &Media, frame: *const ffi::AVFrame) -> Self {
-        let stream = unsafe {
-            *(*media.format)
-                .streams
-                .add(media.video.stream_index as usize)
-        };
-        let parameters = unsafe { (*stream).codecpar };
-        let codec = unsafe { ffmpeg_name(ffi::avcodec_get_name((*parameters).codec_id)) }
-            .unwrap_or_else(|| "UNKNOWN".to_owned());
-        let profile = unsafe {
-            ffmpeg_name(ffi::avcodec_profile_name(
-                (*parameters).codec_id,
-                (*parameters).profile,
-            ))
-        };
+    unsafe fn inspect(media: &Media, frame: *const ffi::UpAvFrame) -> Self {
+        let mut info: ffi::UpVideoInfo = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { ffi::up_av_video_info(media.format, media.video.context, frame, &mut info) },
+            0,
+            "opened video has inspectable stream information"
+        );
+        let codec = unsafe { ffmpeg_name(info.codec) }.unwrap_or_else(|| "UNKNOWN".to_owned());
+        let profile = unsafe { ffmpeg_name(info.profile) };
         let codec = profile.map_or(codec.clone(), |profile| format!("{codec} {profile}"));
 
         let frame_rate =
-            rational(unsafe { ffi::av_guess_frame_rate(media.format, stream, ptr::null_mut()) });
-        let frame_rate = (frame_rate > 0.0).then_some(frame_rate);
+            (info.frame_rate.is_finite() && info.frame_rate > 0.0).then_some(info.frame_rate);
         let bit_rate = format_video_bitrate(
-            unsafe { (*parameters).bit_rate },
-            unsafe { stream_metadata_i64(stream, c"BPS") },
-            unsafe { (*media.format).bit_rate },
+            info.declared_bitrate,
+            (info.metadata_bitrate > 0).then_some(info.metadata_bitrate),
+            info.container_bitrate,
         );
-        let pixel_format = unsafe {
-            let decoded = (*media.video.context).sw_pix_fmt;
-            let format = if decoded != ffi::AVPixelFormat_AV_PIX_FMT_NONE {
-                decoded
-            } else {
-                (*parameters).format
-            };
-            ffmpeg_name(ffi::av_get_pix_fmt_name(format))
-        }
-        .unwrap_or_else(|| "UNKNOWN PIXEL FORMAT".to_owned());
+        let pixel_format = unsafe { ffmpeg_name(info.pixel_format) }
+            .unwrap_or_else(|| "UNKNOWN PIXEL FORMAT".to_owned());
         let decode_path = if media.video.uses_vulkan {
             "VULKAN HW"
         } else {
             "SOFTWARE"
         };
-        let resolution_line = format!("RESOLUTION: {}X{}", unsafe { (*frame).width }, unsafe {
-            (*frame).height
-        },);
-        let assume_hd_color = unsafe { (*frame).width >= 1280 || (*frame).height >= 720 };
-
-        let (color_space_value, color_space_assumed) = unsafe {
-            if (*frame).colorspace != ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
-                ((*frame).colorspace, false)
-            } else if (*parameters).color_space != ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
-                ((*parameters).color_space, false)
-            } else if assume_hd_color {
-                (ffi::AVColorSpace_AVCOL_SPC_BT709, true)
-            } else {
-                (ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED, false)
-            }
-        };
+        let resolution_line = format!("RESOLUTION: {}X{}", info.width, info.height);
         let color_space = mark_assumed(
-            unsafe { ffmpeg_name(ffi::av_color_space_name(color_space_value)) },
-            color_space_assumed,
+            unsafe { ffmpeg_name(info.color_space) },
+            info.color_space_assumed != 0,
         );
-        let (color_primaries_value, color_primaries_assumed) = unsafe {
-            if (*frame).color_primaries != ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED {
-                ((*frame).color_primaries, false)
-            } else if (*parameters).color_primaries != ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED {
-                ((*parameters).color_primaries, false)
-            } else if assume_hd_color {
-                (ffi::AVColorPrimaries_AVCOL_PRI_BT709, true)
-            } else {
-                (ffi::AVColorPrimaries_AVCOL_PRI_UNSPECIFIED, false)
-            }
-        };
         let color_primaries = mark_assumed(
-            unsafe { ffmpeg_name(ffi::av_color_primaries_name(color_primaries_value)) },
-            color_primaries_assumed,
+            unsafe { ffmpeg_name(info.color_primaries) },
+            info.color_primaries_assumed != 0,
         );
-        let (color_transfer_value, color_transfer_assumed) = unsafe {
-            if (*frame).color_trc != ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED {
-                ((*frame).color_trc, false)
-            } else if (*parameters).color_trc
-                != ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED
-            {
-                ((*parameters).color_trc, false)
-            } else if assume_hd_color {
-                (ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, true)
-            } else {
-                (
-                    ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED,
-                    false,
-                )
-            }
-        };
         let color_transfer = mark_assumed(
-            unsafe { ffmpeg_name(ffi::av_color_transfer_name(color_transfer_value)) },
-            color_transfer_assumed,
+            unsafe { ffmpeg_name(info.color_transfer) },
+            info.color_transfer_assumed != 0,
         );
-        let (color_range_value, color_range_assumed) = unsafe {
-            if (*frame).color_range != ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
-                ((*frame).color_range, false)
-            } else if (*parameters).color_range != ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
-                ((*parameters).color_range, false)
-            } else {
-                let full_range = pixel_format.starts_with("YUVJ")
-                    || pixel_format.starts_with("RGB")
-                    || pixel_format.starts_with("GBR");
-                (
-                    if full_range {
-                        ffi::AVColorRange_AVCOL_RANGE_JPEG
-                    } else {
-                        ffi::AVColorRange_AVCOL_RANGE_MPEG
-                    },
-                    true,
-                )
-            }
-        };
         let color_range = mark_assumed(
-            unsafe { ffmpeg_name(ffi::av_color_range_name(color_range_value)) },
-            color_range_assumed,
+            unsafe { ffmpeg_name(info.color_range) },
+            info.color_range_assumed != 0,
         );
-        let hdr = hdr_status(color_transfer_value, color_transfer_assumed);
+        let hdr = hdr_status(info.hdr_kind, info.color_transfer_assumed != 0);
         Self {
             lines: [
                 format!("CODEC: {codec}"),
@@ -872,14 +639,13 @@ unsafe impl Send for VideoFrame {}
 
 impl Drop for VideoFrame {
     fn drop(&mut self) {
-        unsafe { ffi::av_frame_free(&mut self.frame) };
+        unsafe { ffi::up_av_frame_free(&mut self.frame) };
     }
 }
 
 struct AudioOutput {
-    stream: *mut ffi::SDL_AudioStream,
-    resampler: *mut ffi::SwrContext,
-    output_layout: ffi::AVChannelLayout,
+    stream: *mut ffi::UpAudioStream,
+    converter: *mut ffi::UpAvAudioConverter,
     first_pts: Option<f64>,
     submitted_frames: i64,
     resumed: bool,
@@ -887,65 +653,34 @@ struct AudioOutput {
 
 impl AudioOutput {
     unsafe fn create() -> Result<Self> {
-        let spec = ffi::SDL_AudioSpec {
-            format: ffi::SDL_AudioFormat_SDL_AUDIO_F32,
-            channels: AUDIO_CHANNELS,
-            freq: AUDIO_RATE,
-        };
-        let stream = unsafe {
-            ffi::SDL_OpenAudioDeviceStream(
-                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-                &spec,
-                None,
-                ptr::null_mut(),
-            )
-        };
+        let stream = unsafe { ffi::up_audio_stream_create(AUDIO_RATE, AUDIO_CHANNELS) };
         if stream.is_null() {
             return Err(format!("could not open PipeWire audio: {}", unsafe {
                 sdl_error()
             }));
         }
 
-        let mut output_layout = unsafe { std::mem::zeroed() };
-        unsafe { ffi::av_channel_layout_default(&mut output_layout, AUDIO_CHANNELS) };
         Ok(Self {
             stream,
-            resampler: ptr::null_mut(),
-            output_layout,
+            converter: ptr::null_mut(),
             first_pts: None,
             submitted_frames: 0,
             resumed: false,
         })
     }
 
-    unsafe fn initialize_resampler(&mut self, frame: *const ffi::AVFrame) -> Result<()> {
-        if !self.resampler.is_null() {
+    unsafe fn initialize_converter(&mut self, frame: *const ffi::UpAvFrame) -> Result<()> {
+        if !self.converter.is_null() {
             return Ok(());
         }
-        let ret = unsafe {
-            ffi::swr_alloc_set_opts2(
-                &mut self.resampler,
-                &self.output_layout,
-                ffi::AVSampleFormat_AV_SAMPLE_FMT_FLT,
-                AUDIO_RATE,
-                &(*frame).ch_layout,
-                (*frame).format,
-                (*frame).sample_rate,
-                0,
-                ptr::null_mut(),
-            )
+        let mut error = 0;
+        self.converter = unsafe {
+            ffi::up_av_audio_converter_create(frame, AUDIO_RATE, AUDIO_CHANNELS, &mut error)
         };
-        if ret < 0 || self.resampler.is_null() {
+        if self.converter.is_null() {
             return Err(format!(
                 "could not configure audio conversion: {}",
-                unsafe { ffmpeg_error(ret) }
-            ));
-        }
-        let ret = unsafe { ffi::swr_init(self.resampler) };
-        if ret < 0 {
-            return Err(format!(
-                "could not initialize audio conversion: {}",
-                unsafe { ffmpeg_error(ret) }
+                unsafe { ffmpeg_error(error) }
             ));
         }
         Ok(())
@@ -953,29 +688,26 @@ impl AudioOutput {
 
     unsafe fn push(
         &mut self,
-        frame: *const ffi::AVFrame,
-        time_base: ffi::AVRational,
+        frame: *const ffi::UpAvFrame,
+        time_base: f64,
         discard_before: Option<f64>,
     ) -> Result<bool> {
-        unsafe { self.initialize_resampler(frame)? };
+        unsafe { self.initialize_converter(frame)? };
 
-        let timestamp = unsafe { (*frame).best_effort_timestamp };
-        let frame_pts =
-            (timestamp != AV_NOPTS_VALUE).then(|| timestamp as f64 * rational(time_base));
+        let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
+        let frame_pts = (timestamp != AV_NOPTS_VALUE).then_some(timestamp as f64 * time_base);
 
-        let capacity = unsafe { ffi::swr_get_out_samples(self.resampler, (*frame).nb_samples) };
+        let capacity = unsafe { ffi::up_av_audio_converter_capacity(self.converter, frame) };
         if capacity < 0 {
             return Err("could not calculate converted audio size".into());
         }
         let mut samples = vec![0_f32; capacity as usize * AUDIO_CHANNELS as usize];
-        let output = [samples.as_mut_ptr().cast::<u8>()];
         let converted = unsafe {
-            ffi::swr_convert(
-                self.resampler,
-                output.as_ptr(),
+            ffi::up_av_audio_converter_convert(
+                self.converter,
+                frame,
+                samples.as_mut_ptr(),
                 capacity,
-                (*frame).extended_data.cast::<*const u8>(),
-                (*frame).nb_samples,
             )
         };
         if converted < 0 {
@@ -995,8 +727,8 @@ impl AudioOutput {
         }
         let bytes = queued as usize * AUDIO_BYTES_PER_FRAME as usize;
         if bytes > 0
-            && !unsafe {
-                ffi::SDL_PutAudioStreamData(
+            && unsafe {
+                ffi::up_audio_stream_put(
                     self.stream,
                     samples
                         .as_ptr()
@@ -1004,7 +736,7 @@ impl AudioOutput {
                         .cast::<c_void>(),
                     bytes as i32,
                 )
-            }
+            } == 0
         {
             return Err(format!("could not queue audio: {}", unsafe { sdl_error() }));
         }
@@ -1013,7 +745,7 @@ impl AudioOutput {
     }
 
     unsafe fn queued_bytes(&self) -> i32 {
-        unsafe { ffi::SDL_GetAudioStreamQueued(self.stream) }.max(0)
+        unsafe { ffi::up_audio_stream_queued(self.stream) }.max(0)
     }
 
     unsafe fn clock(&self) -> Option<f64> {
@@ -1024,7 +756,7 @@ impl AudioOutput {
 
     unsafe fn resume(&mut self) -> Result<()> {
         if !self.resumed {
-            if !unsafe { ffi::SDL_ResumeAudioStreamDevice(self.stream) } {
+            if unsafe { ffi::up_audio_stream_resume(self.stream) } == 0 {
                 return Err(format!("could not start audio: {}", unsafe { sdl_error() }));
             }
             self.resumed = true;
@@ -1034,11 +766,11 @@ impl AudioOutput {
 
     unsafe fn set_paused(&self, paused: bool) -> Result<()> {
         let ok = if paused {
-            unsafe { ffi::SDL_PauseAudioStreamDevice(self.stream) }
+            unsafe { ffi::up_audio_stream_pause(self.stream) }
         } else {
-            unsafe { ffi::SDL_ResumeAudioStreamDevice(self.stream) }
+            unsafe { ffi::up_audio_stream_resume(self.stream) }
         };
-        if !ok {
+        if ok == 0 {
             return Err(format!("could not change audio pause state: {}", unsafe {
                 sdl_error()
             }));
@@ -1047,12 +779,12 @@ impl AudioOutput {
     }
 
     unsafe fn reset(&mut self) -> Result<()> {
-        if !unsafe { ffi::SDL_ClearAudioStream(self.stream) } {
+        if unsafe { ffi::up_audio_stream_clear(self.stream) } == 0 {
             return Err(format!("could not clear queued audio: {}", unsafe {
                 sdl_error()
             }));
         }
-        unsafe { ffi::swr_free(&mut self.resampler) };
+        unsafe { ffi::up_av_audio_converter_free(&mut self.converter) };
         self.first_pts = None;
         self.submitted_frames = 0;
         Ok(())
@@ -1062,16 +794,15 @@ impl AudioOutput {
 impl Drop for AudioOutput {
     fn drop(&mut self) {
         unsafe {
-            ffi::swr_free(&mut self.resampler);
-            ffi::av_channel_layout_uninit(&mut self.output_layout);
-            ffi::SDL_DestroyAudioStream(self.stream);
+            ffi::up_av_audio_converter_free(&mut self.converter);
+            ffi::up_audio_stream_destroy(self.stream);
         }
     }
 }
 
 struct Media {
-    format: *mut ffi::AVFormatContext,
-    packet: *mut ffi::AVPacket,
+    format: *mut ffi::UpAvFormat,
+    packet: *mut ffi::UpAvPacket,
     video: Decoder,
     audio_decoder: Option<Decoder>,
     audio: Option<AudioOutput>,
@@ -1089,17 +820,11 @@ struct Media {
 }
 
 impl Media {
-    unsafe fn open(
-        path: &Path,
-        vulkan_device: *mut ffi::AVBufferRef,
-        log_subtitles: bool,
-    ) -> Result<Self> {
+    unsafe fn open(path: &Path, vulkan_device: *mut c_void, log_subtitles: bool) -> Result<Self> {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| "media path contains a NUL byte".to_string())?;
         let mut format = ptr::null_mut();
-        let ret = unsafe {
-            ffi::avformat_open_input(&mut format, path.as_ptr(), ptr::null(), ptr::null_mut())
-        };
+        let ret = unsafe { ffi::up_av_format_open(&mut format, path.as_ptr()) };
         if ret < 0 {
             return Err(format!("could not open media: {}", unsafe {
                 ffmpeg_error(ret)
@@ -1107,7 +832,7 @@ impl Media {
         }
 
         let result = (|| {
-            let ret = unsafe { ffi::avformat_find_stream_info(format, ptr::null_mut()) };
+            let ret = unsafe { ffi::up_av_format_find_stream_info(format) };
             if ret < 0 {
                 return Err(format!("could not inspect media streams: {}", unsafe {
                     ffmpeg_error(ret)
@@ -1115,51 +840,38 @@ impl Media {
             }
 
             let video_index = unsafe {
-                ffi::av_find_best_stream(
-                    format,
-                    ffi::AVMediaType_AVMEDIA_TYPE_VIDEO,
-                    -1,
-                    -1,
-                    ptr::null_mut(),
-                    0,
-                )
+                ffi::up_av_find_best_stream(format, ffi::UpMediaType_UP_MEDIA_TYPE_VIDEO, -1)
             };
             if video_index < 0 {
                 return Err("the input has no video stream".into());
             }
             let video = unsafe { Decoder::open(format, video_index, Some(vulkan_device))? };
-            let video_stream = unsafe { *(*format).streams.add(video_index as usize) };
-            let video_parameters = unsafe { (*video_stream).codecpar };
             let video_name =
-                unsafe { CStr::from_ptr(ffi::avcodec_get_name((*video_parameters).codec_id)) }
+                unsafe { CStr::from_ptr(ffi::up_av_stream_codec_name(format, video_index as u32)) }
                     .to_string_lossy();
             let decode_path = if video.uses_vulkan {
-                "NVIDIA Vulkan Video"
+                "Vulkan Video"
             } else {
                 "software decode, Vulkan presentation"
             };
             eprintln!(
                 "video: {video_name} {}x{} via {decode_path}",
-                unsafe { (*video_parameters).width },
-                unsafe { (*video_parameters).height }
+                unsafe { ffi::up_av_decoder_width(video.context) },
+                unsafe { ffi::up_av_decoder_height(video.context) }
             );
 
             let audio_index = unsafe {
-                ffi::av_find_best_stream(
+                ffi::up_av_find_best_stream(
                     format,
-                    ffi::AVMediaType_AVMEDIA_TYPE_AUDIO,
-                    -1,
+                    ffi::UpMediaType_UP_MEDIA_TYPE_AUDIO,
                     video_index,
-                    ptr::null_mut(),
-                    0,
                 )
             };
             let (audio_decoder, audio) = if audio_index >= 0 {
-                let audio_stream = unsafe { *(*format).streams.add(audio_index as usize) };
-                let audio_parameters = unsafe { (*audio_stream).codecpar };
-                let audio_name =
-                    unsafe { CStr::from_ptr(ffi::avcodec_get_name((*audio_parameters).codec_id)) }
-                        .to_string_lossy();
+                let audio_name = unsafe {
+                    CStr::from_ptr(ffi::up_av_stream_codec_name(format, audio_index as u32))
+                }
+                .to_string_lossy();
                 eprintln!("audio: {audio_name} via PipeWire");
                 (
                     Some(unsafe { Decoder::open(format, audio_index, None)? }),
@@ -1169,24 +881,21 @@ impl Media {
                 (None, None)
             };
 
-            let mut subtitle_indices = (0..unsafe { (*format).nb_streams } as usize)
-                .filter(|&index| {
-                    let stream = unsafe { *(*format).streams.add(index) };
-                    let parameters = unsafe { (*stream).codecpar };
-                    (unsafe { (*parameters).codec_type }) == ffi::AVMediaType_AVMEDIA_TYPE_SUBTITLE
+            let mut subtitle_indices = (0..unsafe { ffi::up_av_stream_count(format) } as usize)
+                .filter(|&index| unsafe {
+                    ffi::up_av_stream_type(format, index as u32)
+                        == ffi::UpMediaType_UP_MEDIA_TYPE_SUBTITLE
                 })
                 .collect::<Vec<_>>();
-            subtitle_indices.sort_by_key(|&index| {
-                let stream = unsafe { *(*format).streams.add(index) };
-                unsafe { ((*stream).disposition as u32 & ffi::AV_DISPOSITION_DEFAULT) == 0 }
+            subtitle_indices.sort_by_key(|&index| unsafe {
+                ffi::up_av_stream_is_default(format, index as u32) == 0
             });
             let mut subtitle_decoders = Vec::new();
             for stream_index in subtitle_indices {
-                let stream = unsafe { *(*format).streams.add(stream_index) };
-                let parameters = unsafe { (*stream).codecpar };
-                let subtitle_name =
-                    unsafe { CStr::from_ptr(ffi::avcodec_get_name((*parameters).codec_id)) }
-                        .to_string_lossy();
+                let subtitle_name = unsafe {
+                    CStr::from_ptr(ffi::up_av_stream_codec_name(format, stream_index as u32))
+                }
+                .to_string_lossy();
                 match unsafe { Decoder::open(format, stream_index as i32, None) } {
                     Ok(decoder) => {
                         eprintln!(
@@ -1204,7 +913,7 @@ impl Media {
                 eprintln!("subtitles: S toggles, J switches tracks");
             }
 
-            let packet = unsafe { ffi::av_packet_alloc() };
+            let packet = unsafe { ffi::up_av_packet_alloc() };
             if packet.is_null() {
                 return Err("out of memory while allocating a packet".into());
             }
@@ -1230,41 +939,33 @@ impl Media {
         })();
 
         if result.is_err() {
-            unsafe { ffi::avformat_close_input(&mut format) };
+            unsafe { ffi::up_av_format_close(&mut format) };
         }
         result
     }
 
     unsafe fn receive_video(&mut self) -> Result<()> {
         loop {
-            let mut frame = unsafe { ffi::av_frame_alloc() };
-            if frame.is_null() {
-                return Err("out of memory while decoding video".into());
-            }
-            let ret = unsafe { ffi::avcodec_receive_frame(self.video.context, frame) };
+            let mut frame = ptr::null_mut();
+            let ret = unsafe { ffi::up_av_decoder_receive_frame(self.video.context, &mut frame) };
             if ret < 0 {
-                unsafe { ffi::av_frame_free(&mut frame) };
                 break;
             }
-            if self.video.uses_vulkan
-                && unsafe { (*frame).format } != ffi::AVPixelFormat_AV_PIX_FMT_VULKAN
-            {
-                unsafe { ffi::av_frame_free(&mut frame) };
-                return Err(
-                    "the selected codec/profile is not supported by NVIDIA Vulkan Video".into(),
-                );
+            if self.video.uses_vulkan && unsafe { ffi::up_av_frame_is_vulkan(frame) } == 0 {
+                unsafe { ffi::up_av_frame_free(&mut frame) };
+                return Err("the selected codec/profile is not supported by Vulkan Video".into());
             }
-            let timestamp = unsafe { (*frame).best_effort_timestamp };
+            let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
             let pts = if timestamp == AV_NOPTS_VALUE {
                 self.video_queue.back().map_or(0.0, |previous| {
                     previous.pts + previous.duration.max(1.0 / 60.0)
                 })
             } else {
-                timestamp as f64 * rational(self.video.time_base)
+                timestamp as f64 * self.video.time_base
             };
-            let raw_duration = unsafe { (*frame).duration };
+            let raw_duration = unsafe { ffi::up_av_frame_duration(frame) };
             let duration = if raw_duration > 0 {
-                raw_duration as f64 * rational(self.video.time_base)
+                raw_duration as f64 * self.video.time_base
             } else {
                 0.0
             };
@@ -1272,7 +973,7 @@ impl Media {
                 .video_seek_target
                 .is_some_and(|target| pts + duration.max(1.0 / 120.0) < target)
             {
-                unsafe { ffi::av_frame_free(&mut frame) };
+                unsafe { ffi::up_av_frame_free(&mut frame) };
                 continue;
             }
             self.video_seek_target = None;
@@ -1293,23 +994,19 @@ impl Media {
         let context = decoder.context;
         let time_base = decoder.time_base;
         loop {
-            let mut frame = unsafe { ffi::av_frame_alloc() };
-            if frame.is_null() {
-                return Err("out of memory while decoding audio".into());
-            }
-            let ret = unsafe { ffi::avcodec_receive_frame(context, frame) };
+            let mut frame = ptr::null_mut();
+            let ret = unsafe { ffi::up_av_decoder_receive_frame(context, &mut frame) };
             if ret < 0 {
-                unsafe { ffi::av_frame_free(&mut frame) };
                 break;
             }
             if let Some(audio) = self.audio.as_mut() {
                 let result = unsafe { audio.push(frame, time_base, self.audio_seek_target) };
-                unsafe { ffi::av_frame_free(&mut frame) };
+                unsafe { ffi::up_av_frame_free(&mut frame) };
                 if result? {
                     self.audio_seek_target = None;
                 }
             } else {
-                unsafe { ffi::av_frame_free(&mut frame) };
+                unsafe { ffi::up_av_frame_free(&mut frame) };
             }
         }
         Ok(())
@@ -1319,44 +1016,42 @@ impl Media {
         let decoder = &self.subtitle_decoders[track];
         let context = decoder.context;
         let time_base = decoder.time_base;
-        let mut subtitle: ffi::AVSubtitle = unsafe { std::mem::zeroed() };
-        let mut got_subtitle = 0;
-        let packet_pts = unsafe { (*self.packet).pts };
-        let packet_duration = unsafe { (*self.packet).duration };
-        let ret = unsafe {
-            ffi::avcodec_decode_subtitle2(context, &mut subtitle, &mut got_subtitle, self.packet)
-        };
+        let mut ret = 0;
+        let mut subtitle = unsafe { ffi::up_av_decode_subtitle(context, self.packet, &mut ret) };
         if ret < 0 {
             return Err(format!("subtitle decoder rejected a packet: {}", unsafe {
                 ffmpeg_error(ret)
             }));
         }
-        if got_subtitle == 0 {
+        if subtitle.is_null() {
             return Ok(());
         }
+        let packet_pts = unsafe { ffi::up_av_packet_pts(self.packet) };
+        let packet_duration = unsafe { ffi::up_av_packet_duration(self.packet) };
+        let mut subtitle_info: ffi::UpSubtitleInfo = unsafe { std::mem::zeroed() };
+        unsafe { ffi::up_av_subtitle_info(subtitle, &mut subtitle_info) };
 
         let cue = {
-            let packet_time_base = rational(time_base);
-            let base_pts = if subtitle.pts != AV_NOPTS_VALUE {
-                subtitle.pts as f64 / ffi::AV_TIME_BASE as f64
+            let base_pts = if subtitle_info.pts != AV_NOPTS_VALUE {
+                subtitle_info.pts as f64 / 1_000_000.0
             } else if packet_pts != AV_NOPTS_VALUE {
-                packet_pts as f64 * packet_time_base
+                packet_pts as f64 * time_base
             } else {
                 0.0
             };
-            let start = base_pts + subtitle.start_display_time as f64 / 1000.0;
-            let end = if subtitle.end_display_time > subtitle.start_display_time {
-                base_pts + subtitle.end_display_time as f64 / 1000.0
+            let start = base_pts + subtitle_info.start_display_time as f64 / 1000.0;
+            let end = if subtitle_info.end_display_time > subtitle_info.start_display_time {
+                base_pts + subtitle_info.end_display_time as f64 / 1000.0
             } else if packet_duration > 0 {
-                start + packet_duration as f64 * packet_time_base
+                start + packet_duration as f64 * time_base
             } else {
                 f64::INFINITY
             };
 
-            let video_width = unsafe { (*self.video.context).width };
-            let video_height = unsafe { (*self.video.context).height };
-            let subtitle_width = unsafe { (*context).width };
-            let subtitle_height = unsafe { (*context).height };
+            let video_width = unsafe { ffi::up_av_decoder_width(self.video.context) };
+            let video_height = unsafe { ffi::up_av_decoder_height(self.video.context) };
+            let subtitle_width = unsafe { ffi::up_av_decoder_width(context) };
+            let subtitle_height = unsafe { ffi::up_av_decoder_height(context) };
             let canvas_width = if subtitle_width > 0 {
                 subtitle_width
             } else {
@@ -1380,42 +1075,41 @@ impl Media {
             let mut has_bitmap = false;
             let mut text = Vec::new();
 
-            for index in 0..subtitle.num_rects as usize {
-                let rect = unsafe { *subtitle.rects.add(index) };
-                if rect.is_null() {
+            for index in 0..subtitle_info.rect_count {
+                let mut rect: ffi::UpSubtitleRectView = unsafe { std::mem::zeroed() };
+                if unsafe { ffi::up_av_subtitle_rect(subtitle, index, &mut rect) } == 0 {
                     continue;
                 }
-                match unsafe { (*rect).type_ } {
-                    ffi::AVSubtitleType_SUBTITLE_BITMAP => {
+                match rect.type_ {
+                    ffi::UpSubtitleRectType_UP_SUBTITLE_RECT_BITMAP => {
                         let Some(pixels) = bitmap.as_mut() else {
                             continue;
                         };
-                        let rect = unsafe { &*rect };
-                        if rect.w <= 0
-                            || rect.h <= 0
-                            || rect.linesize[0] <= 0
-                            || rect.data[0].is_null()
-                            || rect.data[1].is_null()
+                        if rect.width <= 0
+                            || rect.height <= 0
+                            || rect.line_size <= 0
+                            || rect.pixels.is_null()
+                            || rect.palette.is_null()
                         {
                             continue;
                         }
                         let x0 = rect.x.clamp(0, canvas_width);
                         let y0 = rect.y.clamp(0, canvas_height);
-                        let x1 = rect.x.saturating_add(rect.w).clamp(0, canvas_width);
-                        let y1 = rect.y.saturating_add(rect.h).clamp(0, canvas_height);
+                        let x1 = rect.x.saturating_add(rect.width).clamp(0, canvas_width);
+                        let y1 = rect.y.saturating_add(rect.height).clamp(0, canvas_height);
                         for y in y0..y1 {
                             let source_y = y - rect.y;
                             let source = unsafe {
-                                rect.data[0].add(source_y as usize * rect.linesize[0] as usize)
+                                rect.pixels.add(source_y as usize * rect.line_size as usize)
                             };
                             for x in x0..x1 {
                                 let palette_index = unsafe { *source.add((x - rect.x) as usize) };
-                                if palette_index as i32 >= rect.nb_colors {
+                                if palette_index as i32 >= rect.color_count {
                                     continue;
                                 }
                                 let color = unsafe {
                                     ptr::read_unaligned(
-                                        rect.data[1].cast::<u32>().add(palette_index as usize),
+                                        rect.palette.cast::<u32>().add(palette_index as usize),
                                     )
                                 };
                                 let destination =
@@ -1428,15 +1122,11 @@ impl Media {
                         }
                         has_bitmap = true;
                     }
-                    ffi::AVSubtitleType_SUBTITLE_TEXT | ffi::AVSubtitleType_SUBTITLE_ASS => {
-                        let ass = unsafe { (*rect).type_ } == ffi::AVSubtitleType_SUBTITLE_ASS;
-                        let value = if ass {
-                            unsafe { (*rect).ass }
-                        } else {
-                            unsafe { (*rect).text }
-                        };
-                        if !value.is_null() {
-                            let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+                    ffi::UpSubtitleRectType_UP_SUBTITLE_RECT_TEXT
+                    | ffi::UpSubtitleRectType_UP_SUBTITLE_RECT_ASS => {
+                        let ass = rect.type_ == ffi::UpSubtitleRectType_UP_SUBTITLE_RECT_ASS;
+                        if !rect.text.is_null() {
+                            let value = unsafe { CStr::from_ptr(rect.text) }.to_string_lossy();
                             let value = subtitle_dialogue_text(&value, ass);
                             if !value.is_empty() {
                                 text.push(value);
@@ -1467,7 +1157,7 @@ impl Media {
                 content,
             }
         };
-        unsafe { ffi::avsubtitle_free(&mut subtitle) };
+        unsafe { ffi::up_av_subtitle_free(&mut subtitle) };
         if self
             .subtitle_seek_target
             .is_some_and(|target| cue.end <= target)
@@ -1494,9 +1184,9 @@ impl Media {
     }
 
     unsafe fn decode_packet(&mut self) -> Result<()> {
-        let stream_index = unsafe { (*self.packet).stream_index };
+        let stream_index = unsafe { ffi::up_av_packet_stream_index(self.packet) };
         if stream_index == self.video.stream_index {
-            let ret = unsafe { ffi::avcodec_send_packet(self.video.context, self.packet) };
+            let ret = unsafe { ffi::up_av_decoder_send_packet(self.video.context, self.packet) };
             if ret < 0 {
                 return Err(format!("video decoder rejected a packet: {}", unsafe {
                     ffmpeg_error(ret)
@@ -1509,7 +1199,7 @@ impl Media {
             .is_some_and(|decoder| decoder.stream_index == stream_index)
         {
             let context = self.audio_decoder.as_ref().unwrap().context;
-            let ret = unsafe { ffi::avcodec_send_packet(context, self.packet) };
+            let ret = unsafe { ffi::up_av_decoder_send_packet(context, self.packet) };
             if ret < 0 {
                 return Err(format!("audio decoder rejected a packet: {}", unsafe {
                     ffmpeg_error(ret)
@@ -1532,12 +1222,12 @@ impl Media {
         }
         self.drained = true;
         unsafe {
-            ffi::avcodec_send_packet(self.video.context, ptr::null());
+            ffi::up_av_decoder_send_packet(self.video.context, ptr::null());
             self.receive_video()?;
         }
         if let Some(decoder) = self.audio_decoder.as_ref() {
             unsafe {
-                ffi::avcodec_send_packet(decoder.context, ptr::null());
+                ffi::up_av_decoder_send_packet(decoder.context, ptr::null());
                 self.receive_audio()?;
             }
         }
@@ -1560,14 +1250,14 @@ impl Media {
                 break;
             }
 
-            let ret = unsafe { ffi::av_read_frame(self.format, self.packet) };
+            let ret = unsafe { ffi::up_av_read_frame(self.format, self.packet) };
             if ret < 0 {
                 self.eof = true;
                 unsafe { self.drain()? };
                 break;
             }
             let decode = unsafe { self.decode_packet() };
-            unsafe { ffi::av_packet_unref(self.packet) };
+            unsafe { ffi::up_av_packet_unref(self.packet) };
             decode?;
         }
         Ok(())
@@ -1588,61 +1278,52 @@ impl Media {
     }
 
     fn duration(&self) -> Option<f64> {
-        let duration = unsafe { (*self.format).duration };
-        (duration != AV_NOPTS_VALUE && duration > 0)
-            .then(|| duration as f64 / ffi::AV_TIME_BASE as f64)
+        let duration = unsafe { ffi::up_av_format_duration(self.format) };
+        (duration.is_finite() && duration > 0.0).then_some(duration)
     }
 
     unsafe fn nearest_keyframe(&self, target: f64) -> Option<f64> {
-        let time_base = rational(self.video.time_base);
-        if time_base <= 0.0 {
+        if self.video.time_base <= 0.0 {
             return None;
         }
-        let timestamp = (target / time_base).round() as i64;
-        let stream = unsafe { *(*self.format).streams.add(self.video.stream_index as usize) };
-        let entry_time = |flags| {
-            let entry =
-                unsafe { ffi::avformat_index_get_entry_from_timestamp(stream, timestamp, flags) };
-            (!entry.is_null()).then(|| unsafe { (*entry).timestamp as f64 * time_base })
+        let entry_time = |backward| {
+            let mut entry = 0.0;
+            (unsafe {
+                ffi::up_av_index_entry_time(
+                    self.format,
+                    self.video.stream_index,
+                    target,
+                    i32::from(backward),
+                    &mut entry,
+                )
+            } != 0)
+                .then_some(entry)
         };
-        closest_seek_point(
-            target,
-            entry_time(ffi::AVSEEK_FLAG_BACKWARD as i32),
-            entry_time(0),
-        )
+        closest_seek_point(target, entry_time(true), entry_time(false))
     }
 
     unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
-        let time_base = rational(self.video.time_base);
-        if time_base <= 0.0 {
+        if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
         // Keyframe seeking avoids decoding an entire GOP before presenting a
         // new position. That matters for 8K60 AV1, where decoding is already
         // close to real time and keyframes can be several seconds apart.
         let target = unsafe { self.nearest_keyframe(requested_target) }.unwrap_or(requested_target);
-        let timestamp = (target / time_base).round() as i64;
-        let ret = unsafe {
-            ffi::av_seek_frame(
-                self.format,
-                self.video.stream_index,
-                timestamp,
-                ffi::AVSEEK_FLAG_BACKWARD as i32,
-            )
-        };
+        let ret = unsafe { ffi::up_av_seek(self.format, self.video.stream_index, target) };
         if ret < 0 {
             return Err(format!("could not seek: {}", unsafe { ffmpeg_error(ret) }));
         }
 
         unsafe {
-            ffi::av_packet_unref(self.packet);
-            ffi::avcodec_flush_buffers(self.video.context);
+            ffi::up_av_packet_unref(self.packet);
+            ffi::up_av_decoder_flush(self.video.context);
         }
         if let Some(decoder) = self.audio_decoder.as_ref() {
-            unsafe { ffi::avcodec_flush_buffers(decoder.context) };
+            unsafe { ffi::up_av_decoder_flush(decoder.context) };
         }
         for decoder in &self.subtitle_decoders {
-            unsafe { ffi::avcodec_flush_buffers(decoder.context) };
+            unsafe { ffi::up_av_decoder_flush(decoder.context) };
         }
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.reset()? };
@@ -1673,8 +1354,8 @@ impl Media {
 impl Drop for Media {
     fn drop(&mut self) {
         unsafe {
-            ffi::av_packet_free(&mut self.packet);
-            ffi::avformat_close_input(&mut self.format);
+            ffi::up_av_packet_free(&mut self.packet);
+            ffi::up_av_format_close(&mut self.format);
         }
     }
 }
@@ -2100,7 +1781,7 @@ impl PresentationStats {
 
 unsafe fn toggle_fullscreen(window: &Window, fullscreen: &mut bool) -> Result<()> {
     *fullscreen = !*fullscreen;
-    if !unsafe { ffi::SDL_SetWindowFullscreen(window.0, *fullscreen) } {
+    if unsafe { ffi::up_window_set_fullscreen(window.0, i32::from(*fullscreen)) } == 0 {
         return Err(format!("could not toggle fullscreen: {}", unsafe {
             sdl_error()
         }));
@@ -2298,68 +1979,64 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mut report_display_time = Duration::ZERO;
     let mut report_display_calls = 0_u64;
     while running {
-        let mut event: ffi::SDL_Event = unsafe { std::mem::zeroed() };
-        while unsafe { ffi::SDL_PollEvent(&mut event) } {
-            let event_type = unsafe { event.type_ };
-            match event_type {
-                ffi::SDL_EventType_SDL_EVENT_QUIT
-                | ffi::SDL_EventType_SDL_EVENT_WINDOW_CLOSE_REQUESTED => running = false,
-                ffi::SDL_EventType_SDL_EVENT_WINDOW_RESIZED
-                | ffi::SDL_EventType_SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
+        let mut event: ffi::UpEvent = unsafe { std::mem::zeroed() };
+        while unsafe { ffi::up_platform_poll_event(&mut event) } != 0 {
+            match event.type_ {
+                ffi::UpEventType_UP_EVENT_QUIT | ffi::UpEventType_UP_EVENT_WINDOW_CLOSE => {
+                    running = false
+                }
+                ffi::UpEventType_UP_EVENT_WINDOW_RESIZED => {
                     (width, height) = unsafe { window.pixel_size()? };
                     unsafe { renderer.resize(width, height)? };
                     redraw = true;
                 }
-                ffi::SDL_EventType_SDL_EVENT_WINDOW_EXPOSED => redraw = true,
-                ffi::SDL_EventType_SDL_EVENT_WINDOW_FOCUS_GAINED => {
+                ffi::UpEventType_UP_EVENT_WINDOW_EXPOSED => redraw = true,
+                ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_GAINED => {
                     top_bar.set_focused(true);
                     redraw = true;
                 }
-                ffi::SDL_EventType_SDL_EVENT_WINDOW_FOCUS_LOST => {
+                ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_LOST => {
                     top_bar.set_focused(false);
                     if scrubbing {
                         pending_scrub_target = scrub_preview.take();
                     }
                     scrubbing = false;
-                    unsafe { ffi::SDL_CaptureMouse(false) };
+                    unsafe { ffi::up_platform_capture_mouse(0) };
                     redraw = true;
                 }
-                ffi::SDL_EventType_SDL_EVENT_MOUSE_MOTION => {
-                    let motion = unsafe { event.motion };
+                ffi::UpEventType_UP_EVENT_MOUSE_MOTION => {
                     top_bar.mouse_activity();
                     if scrubbing
                         && let Some(target) =
-                            unsafe { window.scrubber_target(motion.x, motion.y, media_duration) }
+                            unsafe { window.scrubber_target(event.x, event.y, media_duration) }
                     {
                         scrub_preview = Some(target);
                         position_notice.show(target, media_duration);
                     }
                     redraw = true;
                 }
-                ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_DOWN => {
-                    let button = unsafe { event.button };
+                ffi::UpEventType_UP_EVENT_MOUSE_BUTTON_DOWN => {
                     top_bar.mouse_activity();
                     redraw = true;
-                    if button.button == ffi::SDL_BUTTON_LEFT as u8 {
+                    if event.button == ffi::UP_MOUSE_BUTTON_LEFT as u8 {
                         if let Some(target) =
-                            unsafe { window.scrubber_target(button.x, button.y, media_duration) }
+                            unsafe { window.scrubber_target(event.x, event.y, media_duration) }
                         {
                             scrubbing = true;
                             scrub_preview = Some(target);
                             position_notice.show(target, media_duration);
-                            unsafe { ffi::SDL_CaptureMouse(true) };
-                        } else if unsafe { window.close_button_contains(button.x, button.y) } {
+                            unsafe { ffi::up_platform_capture_mouse(1) };
+                        } else if unsafe { window.close_button_contains(event.x, event.y) } {
                             running = false;
-                        } else if button.clicks >= 2 {
+                        } else if event.clicks >= 2 {
                             unsafe { toggle_fullscreen(&window, &mut fullscreen)? };
                         }
                     }
                 }
-                ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_UP => {
-                    let button = unsafe { event.button };
-                    if button.button == ffi::SDL_BUTTON_LEFT as u8 && scrubbing {
+                ffi::UpEventType_UP_EVENT_MOUSE_BUTTON_UP => {
+                    if event.button == ffi::UP_MOUSE_BUTTON_LEFT as u8 && scrubbing {
                         if let Some(target) =
-                            unsafe { window.scrubber_target(button.x, button.y, media_duration) }
+                            unsafe { window.scrubber_target(event.x, event.y, media_duration) }
                         {
                             pending_scrub_target = Some(target);
                             position_notice.show(target, media_duration);
@@ -2368,16 +2045,15 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         }
                         scrubbing = false;
                         scrub_preview = None;
-                        unsafe { ffi::SDL_CaptureMouse(false) };
+                        unsafe { ffi::up_platform_capture_mouse(0) };
                         redraw = true;
                     }
                 }
-                ffi::SDL_EventType_SDL_EVENT_KEY_DOWN => {
-                    let keyboard = unsafe { event.key };
-                    if keyboard.repeat {
+                ffi::UpEventType_UP_EVENT_KEY_DOWN => {
+                    if event.repeat != 0 {
                         continue;
                     }
-                    match action_for_key(keyboard.key) {
+                    match action_for_key(event.key) {
                         Some(Action::Quit) => running = false,
                         Some(Action::SeekBackward) => {
                             let mut media = decoder.lock()?;
@@ -2746,7 +2422,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             break;
         }
 
-        unsafe { ffi::SDL_Delay(2) };
+        unsafe { ffi::up_platform_delay(2) };
     }
 
     Ok(())
@@ -2791,15 +2467,36 @@ mod tests {
 
     #[test]
     fn requested_keys_map_to_requested_actions() {
-        assert_eq!(action_for_key(ffi::SDLK_F), Some(Action::ToggleFullscreen));
-        assert_eq!(action_for_key(ffi::SDLK_I), Some(Action::ToggleInfo));
-        assert_eq!(action_for_key(ffi::SDLK_LEFT), Some(Action::SeekBackward));
-        assert_eq!(action_for_key(ffi::SDLK_RIGHT), Some(Action::SeekForward));
-        assert_eq!(action_for_key(ffi::SDLK_SPACE), Some(Action::TogglePause));
-        assert_eq!(action_for_key(ffi::SDLK_S), Some(Action::ToggleSubtitles));
-        assert_eq!(action_for_key(ffi::SDLK_J), Some(Action::CycleSubtitles));
-        assert_eq!(action_for_key(ffi::SDLK_Q), Some(Action::Quit));
-        assert_eq!(action_for_key(ffi::SDLK_A), None);
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_F),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_I),
+            Some(Action::ToggleInfo)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_LEFT),
+            Some(Action::SeekBackward)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_RIGHT),
+            Some(Action::SeekForward)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_SPACE),
+            Some(Action::TogglePause)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_S),
+            Some(Action::ToggleSubtitles)
+        );
+        assert_eq!(
+            action_for_key(ffi::UpKey_UP_KEY_J),
+            Some(Action::CycleSubtitles)
+        );
+        assert_eq!(action_for_key(ffi::UpKey_UP_KEY_Q), Some(Action::Quit));
+        assert_eq!(action_for_key(ffi::UpKey_UP_KEY_OTHER), None);
     }
 
     #[test]
@@ -2884,33 +2581,18 @@ mod tests {
 
     #[test]
     fn hdr_status_distinguishes_pq_hlg_sdr_and_unknown() {
+        assert_eq!(hdr_status(ffi::UpHdrKind_UP_HDR_KIND_PQ, false), "YES (PQ)");
         assert_eq!(
-            hdr_status(
-                ffi::AVColorTransferCharacteristic_AVCOL_TRC_SMPTE2084,
-                false
-            ),
-            "YES (PQ)"
-        );
-        assert_eq!(
-            hdr_status(
-                ffi::AVColorTransferCharacteristic_AVCOL_TRC_ARIB_STD_B67,
-                false
-            ),
+            hdr_status(ffi::UpHdrKind_UP_HDR_KIND_HLG, false),
             "YES (HLG)"
         );
+        assert_eq!(hdr_status(ffi::UpHdrKind_UP_HDR_KIND_SDR, false), "NO");
         assert_eq!(
-            hdr_status(ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, false),
-            "NO"
-        );
-        assert_eq!(
-            hdr_status(
-                ffi::AVColorTransferCharacteristic_AVCOL_TRC_UNSPECIFIED,
-                false
-            ),
+            hdr_status(ffi::UpHdrKind_UP_HDR_KIND_UNKNOWN, false),
             "UNKNOWN"
         );
         assert_eq!(
-            hdr_status(ffi::AVColorTransferCharacteristic_AVCOL_TRC_BT709, true),
+            hdr_status(ffi::UpHdrKind_UP_HDR_KIND_SDR, true),
             "NO (ASSUMED)"
         );
     }

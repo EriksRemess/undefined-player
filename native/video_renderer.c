@@ -16,6 +16,10 @@
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/mem.h>
 
+#if LIBAVUTIL_VERSION_MAJOR < 60
+#error "undefined-player requires FFmpeg 8 or newer development headers"
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -640,14 +644,15 @@ static char *join_extensions(const char *const *first, size_t first_count,
 
 static void hwctx_lock_queue(void *private_data, uint32_t family, uint32_t index)
 {
+#if FF_API_VULKAN_SYNC_QUEUES
     AVHWDeviceContext *device = private_data;
     const AVVulkanDeviceContext *vulkan = device->hwctx;
-#if FF_API_VULKAN_SYNC_QUEUES
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     vulkan->lock_queue(device, family, index);
 #pragma GCC diagnostic pop
 #else
+    (void) private_data;
     (void) family;
     (void) index;
 #endif
@@ -655,21 +660,23 @@ static void hwctx_lock_queue(void *private_data, uint32_t family, uint32_t index
 
 static void hwctx_unlock_queue(void *private_data, uint32_t family, uint32_t index)
 {
+#if FF_API_VULKAN_SYNC_QUEUES
     AVHWDeviceContext *device = private_data;
     const AVVulkanDeviceContext *vulkan = device->hwctx;
-#if FF_API_VULKAN_SYNC_QUEUES
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     vulkan->unlock_queue(device, family, index);
 #pragma GCC diagnostic pop
 #else
+    (void) private_data;
     (void) family;
     (void) index;
 #endif
 }
 
-UpVideoRenderer *up_video_renderer_create(SDL_Window *window)
+UpVideoRenderer *up_video_renderer_create(void *window_pointer)
 {
+    SDL_Window *window = window_pointer;
     UpVideoRenderer *renderer = av_mallocz(sizeof(*renderer));
     AVDictionary *options = NULL;
     uint32_t instance_count = 0;
@@ -713,12 +720,15 @@ UpVideoRenderer *up_video_renderer_create(SDL_Window *window)
                 AV_DICT_DONT_STRDUP_VAL);
     device_list = NULL;
 
+    const char *vulkan_device = getenv("UP_VULKAN_DEVICE");
+    if (vulkan_device && !*vulkan_device)
+        vulkan_device = NULL;
     ret = av_hwdevice_ctx_create(&renderer->hw_device,
                                  AV_HWDEVICE_TYPE_VULKAN,
-                                 "NVIDIA RTX A4000", options, 0);
+                                 vulkan_device, options, 0);
     av_dict_free(&options);
     if (ret < 0) {
-        set_error(renderer, "FFmpeg could not create the NVIDIA Vulkan device");
+        set_error(renderer, "FFmpeg could not create a Vulkan device");
         goto fail;
     }
 
@@ -816,14 +826,14 @@ fail:
     return renderer;
 }
 
-AVBufferRef *up_video_renderer_device(UpVideoRenderer *renderer)
+void *up_video_renderer_device(UpVideoRenderer *renderer)
 {
     if (!renderer || !renderer->renderer)
         return NULL;
     return renderer->hw_device;
 }
 
-int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
+int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               int width, int height, float top_bar_alpha,
                               const char *title, const char *info,
                               float info_alpha, const char *details,
@@ -834,6 +844,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
                               int subtitle_width, int subtitle_height,
                               uint64_t subtitle_serial)
 {
+    AVFrame *frame = frame_pointer;
     struct pl_swapchain_frame swap_frame = {0};
     struct pl_frame image = {0};
     struct pl_frame target = {0};

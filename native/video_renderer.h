@@ -1,14 +1,12 @@
 #pragma once
 
-#include <SDL3/SDL.h>
-#include <libavutil/buffer.h>
-#include <libavutil/frame.h>
+#include <stdint.h>
 
 typedef struct UpVideoRenderer UpVideoRenderer;
 
-UpVideoRenderer *up_video_renderer_create(SDL_Window *window);
-AVBufferRef *up_video_renderer_device(UpVideoRenderer *renderer);
-int up_video_renderer_display(UpVideoRenderer *renderer, AVFrame *frame,
+UpVideoRenderer *up_video_renderer_create(void *window);
+void *up_video_renderer_device(UpVideoRenderer *renderer);
+int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               int width, int height, float top_bar_alpha,
                               const char *title, const char *info,
                               float info_alpha, const char *details,

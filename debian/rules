@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+export CARGO_NET_OFFLINE = true
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --locked
+	desktop-file-validate data/undefined-player.desktop
+endif
+
+override_dh_auto_install:
+	:
+
+override_dh_auto_clean:
+	cargo clean

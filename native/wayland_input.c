@@ -1,5 +1,6 @@
 #include "wayland_input.h"
 
+#include <SDL3/SDL.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
@@ -247,8 +248,9 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_remove,
 };
 
-UpWaylandInput *up_wayland_input_create(SDL_Window *window)
+UpWaylandInput *up_wayland_input_create(void *window_pointer)
 {
+    SDL_Window *window = window_pointer;
     UpWaylandInput *input = calloc(1, sizeof(*input));
     if (!input)
         return NULL;

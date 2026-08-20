@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Undefined Player
-Comment=Play videos with NVIDIA Vulkan acceleration
+Comment=Play videos with Vulkan acceleration
 Icon=video-x-generic
 Exec=undefined-player %f
 TryExec=undefined-player

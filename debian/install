@@ -1,0 +1,2 @@
+target/release/undefined-player usr/bin
+data/undefined-player.desktop usr/share/applications

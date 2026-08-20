@@ -1,0 +1,16 @@
+undefined-player binary tarball
+================================
+
+Run the player directly from bin/undefined-player, or install it for the
+current user with:
+
+    ./install.sh
+
+Set PREFIX to install somewhere other than ~/.local:
+
+    PREFIX=/opt/undefined-player ./install.sh
+
+This tarball is dynamically linked. It does not install or bundle FFmpeg,
+SDL3, libplacebo, Wayland, Vulkan, Pango, Cairo, GLib, PipeWire, or a Vulkan
+driver. Those libraries must already be available with compatible SONAMEs.
+Use the Debian package when automatic dependency installation is preferred.

@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: undefined-player
+Source: https://github.com/EriksRemess/undefined-player
+
+Files: *
+Copyright: 2026 Ēriks Remess
+License: UNLICENSED
+ No redistribution license has been declared for this source tree.

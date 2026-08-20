@@ -1,0 +1,5 @@
+undefined-player (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian package.
+
+ -- Ēriks Remess <eriks@remess.lv>  Thu, 20 Aug 2026 22:17:48 +0300

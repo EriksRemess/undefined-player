@@ -1,0 +1,39 @@
+Source: undefined-player
+Section: video
+Priority: optional
+Maintainer: Ēriks Remess <eriks@remess.lv>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc (>= 1.85),
+ binutils,
+ pkgconf,
+ wayland-protocols,
+ libwayland-dev,
+ libvulkan-dev,
+ libsdl3-dev,
+ libplacebo-dev (>= 7),
+ libpango1.0-dev,
+ libcairo2-dev,
+ libglib2.0-dev,
+ libavformat-dev (>= 7:8),
+ libavcodec-dev (>= 7:8),
+ libswresample-dev (>= 7:8),
+ libavutil-dev (>= 7:8),
+ desktop-file-utils,
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/EriksRemess/undefined-player
+Vcs-Git: https://github.com/EriksRemess/undefined-player.git
+
+Package: undefined-player
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Recommends: pipewire-audio
+Description: minimal Vulkan-accelerated Wayland video player
+ undefined-player decodes video through FFmpeg, presents it through Vulkan and
+ libplacebo, and sends audio through SDL3's PipeWire backend. It provides a
+ borderless Wayland interface, embedded subtitle support, HDR metadata
+ handling, and MPRIS desktop integration.
