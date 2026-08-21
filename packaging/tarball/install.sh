@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 prefix=${PREFIX:-"$HOME/.local"}
 
 install -Dm755 "$script_dir/bin/undefined-player" \

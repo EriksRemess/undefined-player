@@ -110,6 +110,16 @@ int up_av_error_string(int code, char *buffer, size_t buffer_size)
     return av_strerror(code, buffer, buffer_size);
 }
 
+int up_av_error_is_again(int code)
+{
+    return code == AVERROR(EAGAIN);
+}
+
+int up_av_error_is_eof(int code)
+{
+    return code == AVERROR_EOF;
+}
+
 int up_av_format_open(UpAvFormat **format, const char *path)
 {
     AVFormatContext *native = NULL;
@@ -402,6 +412,11 @@ static int64_t metadata_bitrate(AVStream *stream)
     return errno == 0 && end != entry->value ? value : 0;
 }
 
+static int unusable_color_name(const char *name)
+{
+    return !name || !strcmp(name, "unknown") || !strcmp(name, "reserved");
+}
+
 int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
                      const UpAvFrame *frame, UpVideoInfo *info)
 {
@@ -430,19 +445,29 @@ int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
     const int is_rgb = pixel_description &&
         (pixel_description->flags & AV_PIX_FMT_FLAG_RGB);
     enum AVColorSpace space = native_frame->colorspace;
-    if (space == AVCOL_SPC_UNSPECIFIED)
+    const char *space_name = av_color_space_name(space);
+    if (space == AVCOL_SPC_UNSPECIFIED || unusable_color_name(space_name) ||
+        (space == AVCOL_SPC_RGB && !is_rgb)) {
         space = parameters->color_space;
-    if (space == AVCOL_SPC_UNSPECIFIED) {
+        space_name = av_color_space_name(space);
+    }
+    if (space == AVCOL_SPC_UNSPECIFIED || unusable_color_name(space_name) ||
+        (space == AVCOL_SPC_RGB && !is_rgb)) {
         info->color_space = is_rgb ? "rgb" : assume_hd ? "bt709" : "bt601";
         info->color_space_assumed = 1;
     } else {
-        info->color_space = av_color_space_name(space);
+        info->color_space = space_name;
     }
 
     enum AVColorPrimaries primaries = native_frame->color_primaries;
-    if (primaries == AVCOL_PRI_UNSPECIFIED)
+    const char *primaries_name = av_color_primaries_name(primaries);
+    if (primaries == AVCOL_PRI_UNSPECIFIED ||
+        unusable_color_name(primaries_name)) {
         primaries = parameters->color_primaries;
-    if (primaries == AVCOL_PRI_UNSPECIFIED) {
+        primaries_name = av_color_primaries_name(primaries);
+    }
+    if (primaries == AVCOL_PRI_UNSPECIFIED ||
+        unusable_color_name(primaries_name)) {
         if (assume_hd)
             info->color_primaries = "bt709";
         else if (info->height == 576)
@@ -453,18 +478,21 @@ int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
             info->color_primaries = "bt709";
         info->color_primaries_assumed = 1;
     } else {
-        info->color_primaries = av_color_primaries_name(primaries);
+        info->color_primaries = primaries_name;
     }
 
     enum AVColorTransferCharacteristic transfer = native_frame->color_trc;
-    if (transfer == AVCOL_TRC_UNSPECIFIED)
+    const char *transfer_name = av_color_transfer_name(transfer);
+    if (transfer == AVCOL_TRC_UNSPECIFIED || unusable_color_name(transfer_name)) {
         transfer = parameters->color_trc;
-    if (transfer == AVCOL_TRC_UNSPECIFIED) {
+        transfer_name = av_color_transfer_name(transfer);
+    }
+    if (transfer == AVCOL_TRC_UNSPECIFIED || unusable_color_name(transfer_name)) {
         /* This is libplacebo's effective default for unknown SDR transfer. */
         info->color_transfer = "bt1886";
         info->color_transfer_assumed = 1;
     } else {
-        info->color_transfer = av_color_transfer_name(transfer);
+        info->color_transfer = transfer_name;
     }
     if (transfer == AVCOL_TRC_SMPTE2084)
         info->hdr_kind = UP_HDR_KIND_PQ;

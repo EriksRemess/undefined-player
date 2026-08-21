@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, CString, OsString, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +28,47 @@ const RESIZE_BORDER_LOGICAL: f32 = 10.0;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
 
 type Result<T> = std::result::Result<T, String>;
+
+#[derive(Debug, Eq, PartialEq)]
+enum CliAction {
+    Help,
+    Version,
+    Play { path: PathBuf, perf_log: bool },
+}
+
+fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
+    let mut path = None;
+    let mut perf_log = false;
+    let mut parse_options = true;
+    for argument in arguments {
+        if parse_options && argument == "--" {
+            parse_options = false;
+        } else if parse_options && argument == "--perf" {
+            perf_log = true;
+        } else if parse_options && (argument == "-h" || argument == "--help") {
+            return Ok(CliAction::Help);
+        } else if parse_options && (argument == "-V" || argument == "--version") {
+            return Ok(CliAction::Version);
+        } else if parse_options && argument.as_encoded_bytes().starts_with(b"-") {
+            return Err(format!("unknown option: {}", argument.to_string_lossy()));
+        } else if path.is_none() {
+            path = Some(PathBuf::from(argument));
+        } else {
+            return Err("only one media file can be played at a time".into());
+        }
+    }
+    path.map_or_else(
+        || Err("no media file was specified".into()),
+        |path| Ok(CliAction::Play { path, perf_log }),
+    )
+}
+
+fn usage(program: &Path) -> String {
+    format!(
+        "Usage: {} [OPTIONS] VIDEO\n\nOptions:\n  --perf         print playback performance statistics\n  -h, --help     show this help\n  -V, --version  show the version",
+        program.display()
+    )
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
@@ -76,6 +117,14 @@ unsafe fn ffmpeg_error(code: i32) -> String {
     unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+unsafe fn ffmpeg_error_is_again(code: i32) -> bool {
+    unsafe { ffi::up_av_error_is_again(code) != 0 }
+}
+
+unsafe fn ffmpeg_error_is_eof(code: i32) -> bool {
+    unsafe { ffi::up_av_error_is_eof(code) != 0 }
 }
 
 unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
@@ -881,7 +930,11 @@ struct Media {
 }
 
 impl Media {
-    unsafe fn open(path: &Path, vulkan_device: *mut c_void, log_subtitles: bool) -> Result<Self> {
+    unsafe fn open(
+        path: &Path,
+        vulkan_device: Option<*mut c_void>,
+        log_subtitles: bool,
+    ) -> Result<Self> {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| "media path contains a NUL byte".to_string())?;
         let mut format = ptr::null_mut();
@@ -906,7 +959,16 @@ impl Media {
             if video_index < 0 {
                 return Err("the input has no video stream".into());
             }
-            let video = unsafe { Decoder::open(format, video_index, Some(vulkan_device))? };
+            let video = match unsafe { Decoder::open(format, video_index, vulkan_device) } {
+                Ok(video) => video,
+                Err(hardware_error) if vulkan_device.is_some() => {
+                    eprintln!(
+                        "warning: Vulkan decoder initialization failed ({hardware_error}); trying software decoding"
+                    );
+                    unsafe { Decoder::open(format, video_index, None)? }
+                }
+                Err(error) => return Err(error),
+            };
             let video_name =
                 unsafe { CStr::from_ptr(ffi::up_av_stream_codec_name(format, video_index as u32)) }
                     .to_string_lossy();
@@ -1047,7 +1109,12 @@ impl Media {
             let mut frame = ptr::null_mut();
             let ret = unsafe { ffi::up_av_decoder_receive_frame(self.video.context, &mut frame) };
             if ret < 0 {
-                break;
+                if unsafe { ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) } {
+                    break;
+                }
+                return Err(format!("video decoding failed: {}", unsafe {
+                    ffmpeg_error(ret)
+                }));
             }
             if self.video.uses_vulkan && unsafe { ffi::up_av_frame_is_vulkan(frame) } == 0 {
                 unsafe { ffi::up_av_frame_free(&mut frame) };
@@ -1096,7 +1163,12 @@ impl Media {
             let mut frame = ptr::null_mut();
             let ret = unsafe { ffi::up_av_decoder_receive_frame(context, &mut frame) };
             if ret < 0 {
-                break;
+                if unsafe { ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) } {
+                    break;
+                }
+                return Err(format!("audio decoding failed: {}", unsafe {
+                    ffmpeg_error(ret)
+                }));
             }
             if let Some(audio) = self.audio.as_mut() {
                 let result = unsafe { audio.push(frame, time_base, self.audio_seek_target) };
@@ -1263,6 +1335,7 @@ impl Media {
         {
             return Ok(());
         }
+        self.subtitle_seek_target = None;
         if self.log_subtitles {
             let kind = match &cue.content {
                 SubtitleContent::Clear => "clear".to_owned(),
@@ -1320,15 +1393,22 @@ impl Media {
             return Ok(());
         }
         self.drained = true;
-        unsafe {
-            ffi::up_av_decoder_send_packet(self.video.context, ptr::null());
-            self.receive_video()?;
+        let video_ret = unsafe { ffi::up_av_decoder_send_packet(self.video.context, ptr::null()) };
+        if video_ret < 0 && !unsafe { ffmpeg_error_is_eof(video_ret) } {
+            return Err(format!("could not drain video decoder: {}", unsafe {
+                ffmpeg_error(video_ret)
+            }));
         }
+        unsafe { self.receive_video()? };
         if let Some(track) = self.audio_tracks.get(self.selected_audio_track) {
-            unsafe {
-                ffi::up_av_decoder_send_packet(track.decoder.context, ptr::null());
-                self.receive_audio()?;
+            let audio_ret =
+                unsafe { ffi::up_av_decoder_send_packet(track.decoder.context, ptr::null()) };
+            if audio_ret < 0 && !unsafe { ffmpeg_error_is_eof(audio_ret) } {
+                return Err(format!("could not drain audio decoder: {}", unsafe {
+                    ffmpeg_error(audio_ret)
+                }));
             }
+            unsafe { self.receive_audio()? };
         }
         Ok(())
     }
@@ -1351,6 +1431,14 @@ impl Media {
 
             let ret = unsafe { ffi::up_av_read_frame(self.format, self.packet) };
             if ret < 0 {
+                if unsafe { ffmpeg_error_is_again(ret) } {
+                    break;
+                }
+                if !unsafe { ffmpeg_error_is_eof(ret) } {
+                    return Err(format!("could not read media packet: {}", unsafe {
+                        ffmpeg_error(ret)
+                    }));
+                }
                 self.eof = true;
                 unsafe { self.drain()? };
                 break;
@@ -1358,6 +1446,13 @@ impl Media {
             let decode = unsafe { self.decode_packet() };
             unsafe { ffi::up_av_packet_unref(self.packet) };
             decode?;
+        }
+        Ok(())
+    }
+
+    unsafe fn fill_until_video(&mut self) -> Result<()> {
+        while self.video_queue.is_empty() && !self.eof {
+            unsafe { self.fill_queues()? };
         }
         Ok(())
     }
@@ -1922,12 +2017,13 @@ impl PresentationStats {
 }
 
 unsafe fn toggle_fullscreen(window: &Window, fullscreen: &mut bool) -> Result<()> {
-    *fullscreen = !*fullscreen;
-    if unsafe { ffi::up_window_set_fullscreen(window.0, i32::from(*fullscreen)) } == 0 {
+    let requested = !*fullscreen;
+    if unsafe { ffi::up_window_set_fullscreen(window.0, i32::from(requested)) } == 0 {
         return Err(format!("could not toggle fullscreen: {}", unsafe {
             sdl_error()
         }));
     }
+    *fullscreen = requested;
     Ok(())
 }
 
@@ -2053,9 +2149,19 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         }
     };
     let renderer = unsafe { Renderer::create(&window)? };
-    let mut media = unsafe { Media::open(&path, renderer.device(), perf_log)? };
+    let mut media = unsafe { Media::open(&path, Some(renderer.device()), perf_log)? };
 
-    unsafe { media.fill_queues()? };
+    if let Err(hardware_error) = unsafe { media.fill_until_video() } {
+        if !media.video.uses_vulkan {
+            return Err(hardware_error);
+        }
+        eprintln!(
+            "warning: Vulkan decoding failed ({hardware_error}); restarting with software decoding"
+        );
+        drop(media);
+        media = unsafe { Media::open(&path, None, perf_log)? };
+        unsafe { media.fill_until_video()? };
+    }
     if media.video_queue.is_empty() {
         return Err("the video decoder produced no frames".into());
     }
@@ -2662,24 +2768,29 @@ fn main() {
         .next()
         .and_then(|path| PathBuf::from(path).file_name().map(|name| name.to_owned()))
         .unwrap_or_else(|| "undefined-player".into());
-    let mut path = None;
-    let mut perf_log = false;
-    for argument in arguments {
-        if argument == "--perf" {
-            perf_log = true;
-        } else if path.is_none() {
-            path = Some(PathBuf::from(argument));
-        } else {
-            eprintln!("only one media file can be played at a time");
+    let action = match parse_cli(arguments) {
+        Ok(action) => action,
+        Err(error) => {
+            eprintln!(
+                "undefined-player: {error}\n\n{}",
+                usage(Path::new(&program))
+            );
             std::process::exit(2);
         }
-    }
-    let Some(path) = path else {
-        eprintln!("usage: {} [--perf] VIDEO", Path::new(&program).display());
-        std::process::exit(2);
+    };
+    let (path, perf_log) = match action {
+        CliAction::Help => {
+            println!("{}", usage(Path::new(&program)));
+            return;
+        }
+        CliAction::Version => {
+            println!("undefined-player {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        CliAction::Play { path, perf_log } => (path, perf_log),
     };
     if !path.is_file() {
-        eprintln!("{} is not a file", path.display());
+        eprintln!("undefined-player: {} is not a file", path.display());
         std::process::exit(2);
     }
 
@@ -2692,6 +2803,48 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static EXTERNAL_MEDIA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cli(arguments: &[&str]) -> Result<CliAction> {
+        parse_cli(arguments.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn command_line_supports_standard_information_options() {
+        assert_eq!(cli(&["--help"]), Ok(CliAction::Help));
+        assert_eq!(cli(&["-h"]), Ok(CliAction::Help));
+        assert_eq!(cli(&["--version"]), Ok(CliAction::Version));
+        assert_eq!(cli(&["-V"]), Ok(CliAction::Version));
+    }
+
+    #[test]
+    fn command_line_parses_playback_options_and_paths() {
+        assert_eq!(
+            cli(&["--perf", "movie.mkv"]),
+            Ok(CliAction::Play {
+                path: PathBuf::from("movie.mkv"),
+                perf_log: true,
+            })
+        );
+        assert_eq!(
+            cli(&["--", "--unusual-name.mkv"]),
+            Ok(CliAction::Play {
+                path: PathBuf::from("--unusual-name.mkv"),
+                perf_log: false,
+            })
+        );
+    }
+
+    #[test]
+    fn command_line_rejects_missing_files_and_unknown_options() {
+        assert_eq!(cli(&[]), Err("no media file was specified".into()));
+        assert_eq!(cli(&["--wat"]), Err("unknown option: --wat".into()));
+        assert_eq!(
+            cli(&["one.mkv", "two.mkv"]),
+            Err("only one media file can be played at a time".into())
+        );
+    }
 
     #[test]
     fn requested_keys_map_to_requested_actions() {
@@ -2936,13 +3089,15 @@ mod tests {
     #[test]
     #[ignore = "requires UP_TEST_MEDIA pointing to a local video file"]
     fn external_media_reports_complete_video_info() {
+        let _serial = EXTERNAL_MEDIA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = env::var_os("UP_TEST_MEDIA")
             .map(PathBuf::from)
             .expect("UP_TEST_MEDIA is set");
         let _sdl = unsafe { Sdl::init() }.expect("SDL initializes");
-        let mut media =
-            unsafe { Media::open(&path, ptr::null_mut(), false) }.expect("test media opens");
-        unsafe { media.fill_queues() }.expect("initial queues fill");
+        let mut media = unsafe { Media::open(&path, None, false) }.expect("test media opens");
+        unsafe { media.fill_until_video() }.expect("initial queues fill");
         let info = unsafe {
             VideoInfo::inspect(
                 &media,
@@ -2967,18 +3122,20 @@ mod tests {
     #[test]
     #[ignore = "requires UP_TEST_MEDIA pointing to a local file with multiple audio tracks"]
     fn external_media_switches_every_audio_track() {
+        let _serial = EXTERNAL_MEDIA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = env::var_os("UP_TEST_MEDIA")
             .map(PathBuf::from)
             .expect("UP_TEST_MEDIA is set");
         let _sdl = unsafe { Sdl::init() }.expect("SDL initializes");
-        let mut media =
-            unsafe { Media::open(&path, ptr::null_mut(), false) }.expect("test media opens");
+        let mut media = unsafe { Media::open(&path, None, false) }.expect("test media opens");
         assert!(
             media.audio_tracks.len() > 1,
             "test media has multiple audio tracks"
         );
 
-        unsafe { media.fill_queues() }.expect("initial queues fill");
+        unsafe { media.fill_until_video() }.expect("initial queues fill");
         let target = media.video_queue.front().map_or(0.0, |frame| frame.pts) + 5.0;
         for track in 1..media.audio_tracks.len() {
             unsafe { media.select_audio_track(track, target) }.expect("audio track switches");

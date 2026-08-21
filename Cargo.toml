@@ -1,8 +1,16 @@
 [package]
 name = "undefined-player"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
+rust-version = "1.88"
 build = "build.rs"
+authors = ["Ēriks Remess <eriks@remess.lv>"]
+description = "Minimal Vulkan-accelerated Wayland video player"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/EriksRemess/undefined-player"
+homepage = "https://github.com/EriksRemess/undefined-player"
+readme = "README.md"
+keywords = ["video-player", "wayland", "vulkan", "ffmpeg", "libplacebo"]
+categories = ["multimedia::video"]
 
 [dependencies]

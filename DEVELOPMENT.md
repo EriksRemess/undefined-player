@@ -95,7 +95,7 @@ unsigned binary package:
 ```sh
 sudo apt build-dep .
 make deb
-sudo apt install ../undefined-player_0.1.2-1_amd64.deb
+sudo apt install ../undefined-player_*_amd64.deb
 ```
 
 Installing through `apt` resolves the shared-library runtime dependencies

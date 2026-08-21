@@ -1,3 +1,11 @@
+undefined-player (0.1.6-1) unstable; urgency=medium
+
+  * Improve Vulkan compatibility, seeking, track information, and playback
+    error handling.
+  * Keep subtitles hidden until requested.
+
+ -- Ēriks Remess <eriks@remess.lv>  Fri, 21 Aug 2026 19:06:53 +0300
+
 undefined-player (0.1.2-1) unstable; urgency=medium
 
   * Prepare the 0.1.2 release.

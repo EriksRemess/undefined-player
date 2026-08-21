@@ -98,6 +98,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn up_av_error_is_again(code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn up_av_error_is_eof(code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn up_av_format_open(
         format: *mut *mut UpAvFormat,
         path: *const ::std::os::raw::c_char,

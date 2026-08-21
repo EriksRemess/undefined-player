@@ -72,6 +72,8 @@ typedef struct UpSubtitleRectView {
 } UpSubtitleRectView;
 
 int up_av_error_string(int code, char *buffer, size_t buffer_size);
+int up_av_error_is_again(int code);
+int up_av_error_is_eof(int code);
 
 int up_av_format_open(UpAvFormat **format, const char *path);
 int up_av_format_find_stream_info(UpAvFormat *format);

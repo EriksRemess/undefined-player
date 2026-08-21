@@ -1,8 +1,8 @@
 # undefined-player
 
-A Wayland video-player MVP. It uses FFmpeg 8 or newer, decodes supported codecs directly
-with Vulkan Video when available, renders with libplacebo to a Vulkan Wayland
-swapchain, and plays audio through PipeWire.
+A focused Wayland video player. It uses FFmpeg 8 or newer, decodes supported
+codecs directly with Vulkan Video when available, renders with libplacebo to a
+Vulkan Wayland swapchain, and plays audio through PipeWire.
 
 ## Installation
 
@@ -84,10 +84,11 @@ together once both are ready.
 
 ## Scope
 
-The MVP accepts one local media path on the command line. Hardware video decode
-currently covers the codecs exposed by both the selected FFmpeg build and the
-installed Vulkan driver. Unsupported codecs and profiles fall back to FFmpeg's
-software decoder and are uploaded for Vulkan presentation.
+The player accepts one local media path on the command line. Hardware video
+decode covers the codecs and profiles exposed by both the selected FFmpeg build
+and the installed Vulkan driver. If Vulkan decoder initialization or initial
+decoding fails, playback restarts with FFmpeg's software decoder and uploads
+frames for Vulkan presentation.
 HDR metadata is retained from FFmpeg through libplacebo, which supplies the
 matching colorspace hint to the Vulkan swapchain for an HDR-enabled compositor.
 Sources at 720p and below automatically use libplacebo's GPU EWA Lanczos-sharp
@@ -102,8 +103,9 @@ The current platform scope is:
 - system SDL3 and libplacebo
 - system Pango/Cairo and Wayland client libraries
 
-The default embedded subtitle track is selected automatically; `J` cycles
-through all decodable embedded tracks and briefly shows the selected number.
+The default embedded subtitle track is preselected, but subtitles start hidden;
+`S` shows them and `J` cycles through all decodable embedded tracks while
+briefly showing the selected number.
 DVD/PGS bitmap subtitles retain their authored placement. Text and ASS dialogue
 use a compact bold monospace Pango font with Unicode shaping and automatic font
 fallback; advanced ASS styling is ignored. There is no playlist or audio-stream
