@@ -161,15 +161,6 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn up_av_index_entry_time(
-        format: *const UpAvFormat,
-        stream_index: ::std::os::raw::c_int,
-        target_seconds: f64,
-        backward: ::std::os::raw::c_int,
-        entry_seconds: *mut f64,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
     pub fn up_av_decoder_open(
         format: *mut UpAvFormat,
         stream_index: ::std::os::raw::c_int,

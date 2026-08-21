@@ -1381,36 +1381,15 @@ impl Media {
         (duration.is_finite() && duration > 0.0).then_some(duration)
     }
 
-    unsafe fn nearest_keyframe(&self, target: f64) -> Option<f64> {
-        if self.video.time_base <= 0.0 {
-            return None;
-        }
-        let entry_time = |backward| {
-            let mut entry = 0.0;
-            (unsafe {
-                ffi::up_av_index_entry_time(
-                    self.format,
-                    self.video.stream_index,
-                    target,
-                    i32::from(backward),
-                    &mut entry,
-                )
-            } != 0)
-                .then_some(entry)
-        };
-        closest_seek_point(target, entry_time(true), entry_time(false))
-    }
-
-    unsafe fn seek_internal(&mut self, requested_target: f64, precise: bool) -> Result<f64> {
+    unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
         if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
-        // Keyframe seeking avoids decoding an entire GOP before presenting a
-        // new position. That matters for 8K60 AV1, where decoding is already
-        // close to real time and keyframes can be several seconds apart.
-        let seek_target =
-            unsafe { self.nearest_keyframe(requested_target) }.unwrap_or(requested_target);
-        let ret = unsafe { ffi::up_av_seek(self.format, self.video.stream_index, seek_target) };
+        // av_seek_frame with AVSEEK_FLAG_BACKWARD resolves the usable keyframe
+        // for the requested timestamp. Do not preselect a container index
+        // entry here: sparse Matroska cues can be many seconds behind it.
+        let ret =
+            unsafe { ffi::up_av_seek(self.format, self.video.stream_index, requested_target) };
         if ret < 0 {
             return Err(format!("could not seek: {}", unsafe { ffmpeg_error(ret) }));
         }
@@ -1426,25 +1405,20 @@ impl Media {
             unsafe { ffi::up_av_decoder_flush(track.decoder.context) };
         }
         if let Some(audio) = self.audio.as_mut() {
-            unsafe { audio.reset()? };
+            unsafe {
+                audio.set_paused(true)?;
+                audio.reset()?;
+            }
         }
         self.video_queue.clear();
         self.subtitle_queue.clear();
         self.eof = false;
         self.drained = false;
-        let playback_target = if precise {
-            requested_target
-        } else {
-            seek_target
-        };
+        let playback_target = requested_target;
         self.video_seek_target = Some(playback_target);
         self.audio_seek_target = self.audio.as_ref().map(|_| playback_target);
         self.subtitle_seek_target = (!self.subtitle_tracks.is_empty()).then_some(playback_target);
         Ok(playback_target)
-    }
-
-    unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
-        unsafe { self.seek_internal(requested_target, false) }
     }
 
     unsafe fn select_audio_track(&mut self, track: usize, playback_target: f64) -> Result<f64> {
@@ -1453,7 +1427,7 @@ impl Media {
         }
         let previous = self.selected_audio_track;
         self.selected_audio_track = track;
-        match unsafe { self.seek_internal(playback_target, true) } {
+        match unsafe { self.seek(playback_target) } {
             Ok(target) => {
                 let label = &self.audio_tracks[track].label;
                 eprintln!("audio: track {} selected ({})", track + 1, label.codec);
@@ -1470,6 +1444,26 @@ impl Media {
         self.audio
             .as_ref()
             .and_then(|audio| unsafe { audio.clock() })
+    }
+
+    unsafe fn finish_seek(
+        &self,
+        video_pts: Option<f64>,
+        fallback: f64,
+        paused: bool,
+    ) -> Result<Option<f64>> {
+        let audio_clock = unsafe { self.audio_clock() };
+        let Some(anchor) = completed_seek_anchor(
+            video_pts,
+            audio_clock,
+            self.audio.is_some(),
+            self.eof,
+            fallback,
+        ) else {
+            return Ok(None);
+        };
+        unsafe { self.set_paused(paused)? };
+        Ok(Some(anchor))
     }
 
     unsafe fn audio_empty(&self) -> bool {
@@ -1756,16 +1750,17 @@ fn subtitle_dialogue_text(raw: &str, ass: bool) -> String {
     text.trim().to_owned()
 }
 
-fn closest_seek_point(target: f64, before: Option<f64>, after: Option<f64>) -> Option<f64> {
-    match (before, after) {
-        (Some(before), Some(after)) => Some(if target - before <= after - target {
-            before
-        } else {
-            after
-        }),
-        (Some(before), None) => Some(before),
-        (None, Some(after)) => Some(after),
-        (None, None) => None,
+fn completed_seek_anchor(
+    video_pts: Option<f64>,
+    audio_clock: Option<f64>,
+    has_audio: bool,
+    eof: bool,
+    fallback: f64,
+) -> Option<f64> {
+    if (video_pts.is_none() || (has_audio && audio_clock.is_none())) && !eof {
+        None
+    } else {
+        Some(audio_clock.or(video_pts).unwrap_or(fallback))
     }
 }
 
@@ -1952,6 +1947,22 @@ unsafe fn set_playback_paused(
     Ok(())
 }
 
+unsafe fn finish_seek_blocking(
+    media: &mut Media,
+    clock: &mut WallClock,
+    fallback: f64,
+    paused: bool,
+) -> Result<f64> {
+    loop {
+        let video_pts = media.video_queue.front().map(|frame| frame.pts);
+        if let Some(playback_target) = unsafe { media.finish_seek(video_pts, fallback, paused)? } {
+            clock.seek(playback_target);
+            return Ok(playback_target);
+        }
+        unsafe { media.fill_queues()? };
+    }
+}
+
 unsafe fn seek_by(
     media: &mut Media,
     clock: &mut WallClock,
@@ -1965,12 +1976,8 @@ unsafe fn seek_by(
     });
     let target = (clock.now() + offset).clamp(playback_start, maximum);
     let target = unsafe { media.seek(target)? };
-    while media.video_queue.is_empty() && !media.eof {
-        unsafe { media.fill_queues()? };
-    }
-    let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
-    clock.seek(displayed_target);
-    let position = displayed_target - playback_start;
+    clock.seek(target);
+    let position = target - playback_start;
     notice.show(position, duration);
     Ok(position)
 }
@@ -1985,13 +1992,11 @@ unsafe fn seek_to(
 ) -> Result<f64> {
     let position = position.clamp(0.0, (duration - 0.05).max(0.0));
     let target = playback_start + position;
+    // Timeline seeks can require decoding a long GOP. Leave that work to the
+    // decode worker so the window continues dispatching compositor events.
     let target = unsafe { media.seek(target)? };
-    while media.video_queue.is_empty() && !media.eof {
-        unsafe { media.fill_queues()? };
-    }
-    let displayed_target = media.video_queue.front().map_or(target, |frame| frame.pts);
-    clock.seek(displayed_target);
-    let position = displayed_target - playback_start;
+    clock.seek(target);
+    let position = target - playback_start;
     notice.show(position, Some(duration));
     Ok(position)
 }
@@ -2133,6 +2138,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mut scrubbing = false;
     let mut scrub_preview = None;
     let mut pending_scrub_target = None;
+    let mut pending_seek_anchor = None;
     let mut stats = PresentationStats::new();
     let mut last_info_refresh = Instant::now();
     let mut last_perf_report = Instant::now();
@@ -2240,6 +2246,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 mpris.seeked(seconds_to_microseconds(position));
                             }
                             mpris_stopped = false;
+                            pending_seek_anchor = Some(playback_start + position);
                             redraw = true;
                             new_frame_pending = true;
                         }
@@ -2265,6 +2272,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 mpris.seeked(seconds_to_microseconds(position));
                             }
                             mpris_stopped = false;
+                            pending_seek_anchor = Some(playback_start + position);
                             redraw = true;
                             new_frame_pending = true;
                         }
@@ -2284,6 +2292,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             mpris_stopped = false;
                         }
                         Some(Action::CycleAudio) if audio_track_count > 1 => {
+                            pending_seek_anchor = None;
                             let next = next_track(selected_audio_track, audio_track_count);
                             let requested_target = clock.now();
                             let mut media = decoder.lock()?;
@@ -2294,14 +2303,14 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 &mut current_subtitles,
                             );
                             unsafe { media.select_audio_track(next, requested_target)? };
-                            while media.video_queue.is_empty() && !media.eof {
-                                unsafe { media.fill_queues()? };
-                            }
-                            let displayed_target = media
-                                .video_queue
-                                .front()
-                                .map_or(requested_target, |frame| frame.pts);
-                            clock.seek(displayed_target);
+                            let playback_target = unsafe {
+                                finish_seek_blocking(
+                                    &mut media,
+                                    &mut clock,
+                                    requested_target,
+                                    paused,
+                                )?
+                            };
                             selected_audio_track = next;
                             video_details = video_info.overlay_text(Some((
                                 selected_audio_track,
@@ -2316,7 +2325,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             ));
                             if let Some(mpris) = &mpris {
                                 mpris.seeked(seconds_to_microseconds(
-                                    displayed_target - playback_start,
+                                    playback_target - playback_start,
                                 ));
                             }
                             redraw = true;
@@ -2401,6 +2410,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         };
                         mpris.seeked(seconds_to_microseconds(position));
                         mpris_stopped = false;
+                        pending_seek_anchor = Some(playback_start + position);
                         redraw = true;
                         new_frame_pending = true;
                     }
@@ -2436,6 +2446,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             if let Some(mpris) = &mpris {
                 mpris.seeked(seconds_to_microseconds(position));
             }
+            pending_seek_anchor = Some(playback_start + position);
             redraw = true;
             new_frame_pending = true;
         }
@@ -2449,10 +2460,21 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             }
         }
 
+        if let Some(target) = pending_seek_anchor
+            && let Some(media) = decoder.try_lock()?
+        {
+            let video_pts = video_queue.front().map(|frame| frame.frame.pts);
+            if let Some(playback_target) = unsafe { media.finish_seek(video_pts, target, paused)? }
+            {
+                clock.seek(playback_target);
+                pending_seek_anchor = None;
+            }
+        }
+
         // SDL/PipeWire consumes audio in period-sized chunks (1024 samples on
         // this machine), so the continuous audio-anchored wall clock is used
         // for video presentation instead of the quantized queue counter.
-        let playback_time = clock.now();
+        let playback_time = pending_seek_anchor.unwrap_or_else(|| clock.now());
         if let Some(mpris) = &mpris {
             let status = if mpris_stopped {
                 ffi::UpMprisStatus_UP_MPRIS_STATUS_STOPPED
@@ -2873,11 +2895,27 @@ mod tests {
     }
 
     #[test]
-    fn seeking_chooses_the_closest_available_keyframe() {
-        assert_eq!(closest_seek_point(10.0, Some(6.0), Some(12.0)), Some(12.0));
-        assert_eq!(closest_seek_point(10.0, Some(8.0), Some(14.0)), Some(8.0));
-        assert_eq!(closest_seek_point(10.0, Some(8.0), None), Some(8.0));
-        assert_eq!(closest_seek_point(10.0, None, None), None);
+    fn seek_completion_waits_for_audio_and_video_and_uses_audio_clock() {
+        assert_eq!(
+            completed_seek_anchor(Some(10.0), None, true, false, 9.0),
+            None
+        );
+        assert_eq!(
+            completed_seek_anchor(None, Some(10.0), true, false, 9.0),
+            None
+        );
+        assert_eq!(
+            completed_seek_anchor(Some(10.02), Some(10.0), true, false, 9.0),
+            Some(10.0)
+        );
+        assert_eq!(
+            completed_seek_anchor(Some(10.02), None, false, false, 9.0),
+            Some(10.02)
+        );
+        assert_eq!(
+            completed_seek_anchor(None, None, true, true, 9.0),
+            Some(9.0)
+        );
     }
 
     #[test]

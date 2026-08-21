@@ -148,8 +148,10 @@ where needed. Double-click anywhere to toggle fullscreen. Its custom title bar
 fades after 1.5 seconds without mouse movement and whenever the window loses
 focus. Its close button is at the top-right. The minimum window size is 320x180.
 The bottom timeline appears with the controls; click it or drag its handle to
-seek. Seeking uses the closest indexed keyframe for a quick response and briefly
-shows the resulting playback position above the timeline.
+seek. Timeline, keyboard, and MPRIS seeking target the requested position;
+FFmpeg resolves its nearest usable preceding keyframe. Decoding continues in
+the background so the window remains responsive, and audio and video resume
+together once both are ready.
 
 ## Scope
 

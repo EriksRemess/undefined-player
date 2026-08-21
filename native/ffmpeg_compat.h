@@ -91,10 +91,6 @@ const char *up_av_stream_metadata(const UpAvFormat *format,
 double up_av_format_duration(const UpAvFormat *format);
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet);
 int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds);
-int up_av_index_entry_time(const UpAvFormat *format, int stream_index,
-                           double target_seconds, int backward,
-                           double *entry_seconds);
-
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
                                 void *vulkan_device, int prefer_vulkan);
 const char *up_av_decoder_error(void);

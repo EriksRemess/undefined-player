@@ -206,23 +206,6 @@ int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
                          AVSEEK_FLAG_BACKWARD);
 }
 
-int up_av_index_entry_time(const UpAvFormat *format, int stream_index,
-                           double target_seconds, int backward,
-                           double *entry_seconds)
-{
-    AVStream *stream = stream_at(format, (unsigned int) stream_index);
-    if (!stream || stream->time_base.num <= 0 || stream->time_base.den <= 0)
-        return 0;
-    int64_t timestamp = llround(target_seconds * stream->time_base.den /
-                                stream->time_base.num);
-    const AVIndexEntry *entry = avformat_index_get_entry_from_timestamp(
-        stream, timestamp, backward ? AVSEEK_FLAG_BACKWARD : 0);
-    if (!entry)
-        return 0;
-    *entry_seconds = entry->timestamp * av_q2d(stream->time_base);
-    return 1;
-}
-
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
                                 void *vulkan_device, int prefer_vulkan)
 {
