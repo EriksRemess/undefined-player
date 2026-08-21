@@ -739,6 +739,13 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
 
     AVHWDeviceContext *device = (AVHWDeviceContext *) renderer->hw_device->data;
     AVVulkanDeviceContext *vulkan = device->hwctx;
+    PFN_vkGetInstanceProcAddr sdl_get_proc_addr =
+        (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!sdl_get_proc_addr || vulkan->get_proc_addr != sdl_get_proc_addr) {
+        set_error(renderer,
+                  "FFmpeg and SDL loaded different Vulkan implementations");
+        goto fail;
+    }
     renderer->get_proc_addr = vulkan->get_proc_addr;
     renderer->instance = vulkan->inst;
 
@@ -756,6 +763,7 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
         .queue_graphics = { .index = VK_QUEUE_FAMILY_IGNORED },
         .queue_compute = { .index = VK_QUEUE_FAMILY_IGNORED },
         .queue_transfer = { .index = VK_QUEUE_FAMILY_IGNORED },
+        .max_api_version = VK_API_VERSION_1_3,
     };
 
     for (int i = 0; i < vulkan->nb_qf; i++) {
