@@ -1,6 +1,6 @@
 [package]
 name = "undefined-player"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 build = "build.rs"
 license = "GPL-3.0-or-later"
