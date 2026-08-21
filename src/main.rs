@@ -2129,7 +2129,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mut mpris_stopped = false;
     let mut fullscreen = false;
     let mut info_visible = false;
-    let mut subtitles_visible = subtitles_available;
+    let mut subtitles_visible = false;
     let mut selected_subtitle_track = 0;
     let mut redraw = true;
     let mut new_frame_pending = true;

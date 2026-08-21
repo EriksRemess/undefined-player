@@ -608,9 +608,56 @@ static void set_error(UpVideoRenderer *renderer, const char *message)
     snprintf(renderer->error, sizeof(renderer->error), "%s", message);
 }
 
+#if LIBAVUTIL_VERSION_MAJOR >= 61 && PL_API_VER < 365
+/* libplacebo before API 365 always retrieves imported queues with
+ * vkGetDeviceQueue. FFmpeg 9 may create them with flags that require the
+ * equivalent vkGetDeviceQueue2 call, so intercept only that proc lookup. */
+static PFN_vkGetInstanceProcAddr queue_compat_get_instance_proc_addr;
+static PFN_vkGetDeviceProcAddr queue_compat_get_device_proc_addr;
+static PFN_vkGetDeviceQueue2 queue_compat_get_device_queue2;
+static VkDeviceQueueCreateFlags queue_compat_flags;
+
+static VKAPI_ATTR void VKAPI_CALL
+queue_compat_get_device_queue(VkDevice device, uint32_t family, uint32_t index,
+                              VkQueue *queue)
+{
+    const VkDeviceQueueInfo2 info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+        .flags = queue_compat_flags,
+        .queueFamilyIndex = family,
+        .queueIndex = index,
+    };
+    queue_compat_get_device_queue2(device, &info, queue);
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+queue_compat_device_proc_addr(VkDevice device, const char *name)
+{
+    if (!strcmp(name, "vkGetDeviceQueue"))
+        return (PFN_vkVoidFunction) queue_compat_get_device_queue;
+    return queue_compat_get_device_proc_addr(device, name);
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+queue_compat_instance_proc_addr(VkInstance instance, const char *name)
+{
+    if (!strcmp(name, "vkGetDeviceProcAddr"))
+        return (PFN_vkVoidFunction) queue_compat_device_proc_addr;
+    return queue_compat_get_instance_proc_addr(instance, name);
+}
+#endif
+
+static bool excluded_extension(const char *extension, const char *first,
+                               const char *second)
+{
+    return (first && !strcmp(extension, first)) ||
+           (second && !strcmp(extension, second));
+}
+
 static char *join_extensions(const char *const *first, size_t first_count,
                              const char *const *second, size_t second_count,
-                             const char *prefix, const char *excluded)
+                             const char *prefix, const char *excluded_first,
+                             const char *excluded_second)
 {
     size_t length = prefix ? strlen(prefix) : 0;
     size_t count = first_count + second_count + (prefix ? 1 : 0);
@@ -630,14 +677,14 @@ static char *join_extensions(const char *const *first, size_t first_count,
     if (prefix)
         strcat(result, prefix);
     for (size_t i = 0; i < first_count; i++) {
-        if (excluded && !strcmp(first[i], excluded))
+        if (excluded_extension(first[i], excluded_first, excluded_second))
             continue;
         if (result[0])
             strcat(result, "+");
         strcat(result, first[i]);
     }
     for (size_t i = 0; i < second_count; i++) {
-        if (excluded && !strcmp(second[i], excluded))
+        if (excluded_extension(second[i], excluded_first, excluded_second))
             continue;
         if (result[0])
             strcat(result, "+");
@@ -708,11 +755,12 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
     }
 
     instance_list = join_extensions(instance_extensions, instance_count,
-                                    NULL, 0, NULL, NULL);
+                                    NULL, 0, NULL, NULL, NULL);
     device_list = join_extensions(pl_vulkan_recommended_extensions,
                                   pl_vulkan_num_recommended_extensions,
                                   NULL, 0, VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                                  VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+                                  VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+                                  VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
     if (!instance_list || !device_list) {
         set_error(renderer, "out of memory while preparing Vulkan extensions");
         goto fail;
@@ -749,9 +797,30 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
     renderer->get_proc_addr = vulkan->get_proc_addr;
     renderer->instance = vulkan->inst;
 
+    PFN_vkGetInstanceProcAddr placebo_get_proc_addr = vulkan->get_proc_addr;
+#if LIBAVUTIL_VERSION_MAJOR >= 61 && PL_API_VER < 365
+    if (vulkan->queue_flags) {
+        queue_compat_get_instance_proc_addr = vulkan->get_proc_addr;
+        queue_compat_get_device_proc_addr = (PFN_vkGetDeviceProcAddr)
+            vulkan->get_proc_addr(vulkan->inst, "vkGetDeviceProcAddr");
+        if (queue_compat_get_device_proc_addr)
+            queue_compat_get_device_queue2 = (PFN_vkGetDeviceQueue2)
+                queue_compat_get_device_proc_addr(vulkan->act_dev,
+                                                  "vkGetDeviceQueue2");
+        if (!queue_compat_get_device_proc_addr ||
+            !queue_compat_get_device_queue2) {
+            set_error(renderer,
+                      "Vulkan queue compatibility functions are unavailable");
+            goto fail;
+        }
+        queue_compat_flags = vulkan->queue_flags;
+        placebo_get_proc_addr = queue_compat_instance_proc_addr;
+    }
+#endif
+
     struct pl_vulkan_import_params import = {
         .instance = vulkan->inst,
-        .get_proc_addr = vulkan->get_proc_addr,
+        .get_proc_addr = placebo_get_proc_addr,
         .phys_device = vulkan->phys_dev,
         .device = vulkan->act_dev,
         .extensions = vulkan->enabled_dev_extensions,
@@ -768,18 +837,30 @@ UpVideoRenderer *up_video_renderer_create(void *window_pointer)
 
     for (int i = 0; i < vulkan->nb_qf; i++) {
         const AVVulkanDeviceQueueFamily *queue = &vulkan->qf[i];
-        if (queue->flags & VK_QUEUE_GRAPHICS_BIT)
+        if (queue->flags & VK_QUEUE_GRAPHICS_BIT) {
             import.queue_graphics = (struct pl_vulkan_queue) {
                 .index = queue->idx, .count = queue->num,
             };
-        if (queue->flags & VK_QUEUE_COMPUTE_BIT)
+#if LIBAVUTIL_VERSION_MAJOR >= 61 && PL_API_VER >= 365
+            import.queue_graphics.flags = vulkan->queue_flags;
+#endif
+        }
+        if (queue->flags & VK_QUEUE_COMPUTE_BIT) {
             import.queue_compute = (struct pl_vulkan_queue) {
                 .index = queue->idx, .count = queue->num,
             };
-        if (queue->flags & VK_QUEUE_TRANSFER_BIT)
+#if LIBAVUTIL_VERSION_MAJOR >= 61 && PL_API_VER >= 365
+            import.queue_compute.flags = vulkan->queue_flags;
+#endif
+        }
+        if (queue->flags & VK_QUEUE_TRANSFER_BIT) {
             import.queue_transfer = (struct pl_vulkan_queue) {
                 .index = queue->idx, .count = queue->num,
             };
+#if LIBAVUTIL_VERSION_MAJOR >= 61 && PL_API_VER >= 365
+            import.queue_transfer.flags = vulkan->queue_flags;
+#endif
+        }
     }
 
     renderer->vulkan = pl_vulkan_import(renderer->log, &import);
