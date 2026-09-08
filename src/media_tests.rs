@@ -124,9 +124,9 @@ fn playback_child() {
     match case.as_str() {
         "audio-gaps" => {
             for extra_gap in [0, 3600] {
-                let filter = format!(
-                    "aselect='not(between(t,1,3))',asetpts='PTS+if(gte(T,3),{extra_gap}/TB,0)'"
-                );
+                // Shift the last two seconds of a three-second source instead
+                // of dropping frames: aselect is broken in FFmpeg 8.0.1.
+                let filter = format!("asetpts='PTS+if(gte(T,1),{}/TB,0)'", extra_gap + 2);
                 let path = fixture.generate(
                     &[
                         "-f",
@@ -136,7 +136,7 @@ fn playback_child() {
                         "-f",
                         "lavfi",
                         "-i",
-                        "sine=sample_rate=48000:duration=5",
+                        "sine=sample_rate=48000:duration=3",
                         "-af",
                         &filter,
                         "-c:v",
@@ -178,14 +178,15 @@ fn playback_child() {
                         break;
                     }
                 }
-                assert!(media.eof && saw_gap);
+                assert!(media.eof, "gap-{extra_gap}: playback did not reach EOF");
+                assert!(saw_gap, "gap-{extra_gap}: no future audio segment observed");
                 let audio = media.audio.as_ref().unwrap();
                 let end = unsafe { audio.clock() }.unwrap();
                 assert!(
                     (end - f64::from(extra_gap) - 5.0).abs() < 0.002,
                     "audio ends at {end}"
                 );
-                assert!((audio.submitted_frames as f64 / 48_000.0 - 3.0).abs() < 0.025);
+                assert_eq!(audio.submitted_frames, 3 * 48_000);
             }
         }
         "audio-underrun" => {
