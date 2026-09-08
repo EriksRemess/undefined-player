@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "input_geometry.h"
 
 #include <SDL3/SDL.h>
 
@@ -37,39 +38,21 @@ static SDL_HitTestResult resize_hit_test(SDL_Window *window,
                                          const SDL_Point *point, void *data)
 {
     (void) data;
-    const int border = 10;
-    const float top_bar_pixels = 42.0f;
     int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
-    SDL_GetWindowSize(window, &width, &height);
-    SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height);
-    if (width > 0 && height > 0 && pixel_width > 0 && pixel_height > 0) {
-        const float button_width = top_bar_pixels * width / pixel_width;
-        const float button_height = top_bar_pixels * height / pixel_height;
-        if (point->x >= width - button_width && point->x < width &&
-            point->y >= 0 && point->y < button_height)
-            return SDL_HITTEST_NORMAL;
+    if (!SDL_GetWindowSize(window, &width, &height) ||
+        !SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height))
+        return SDL_HITTEST_NORMAL;
+    switch (up_input_hit_test(point->x, point->y, width, height, pixel_width, pixel_height)) {
+    case UP_HIT_TOP_LEFT: return SDL_HITTEST_RESIZE_TOPLEFT;
+    case UP_HIT_TOP_RIGHT: return SDL_HITTEST_RESIZE_TOPRIGHT;
+    case UP_HIT_BOTTOM_LEFT: return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    case UP_HIT_BOTTOM_RIGHT: return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    case UP_HIT_TOP: return SDL_HITTEST_RESIZE_TOP;
+    case UP_HIT_BOTTOM: return SDL_HITTEST_RESIZE_BOTTOM;
+    case UP_HIT_LEFT: return SDL_HITTEST_RESIZE_LEFT;
+    case UP_HIT_RIGHT: return SDL_HITTEST_RESIZE_RIGHT;
+    default: return SDL_HITTEST_NORMAL;
     }
-    const int left = point->x <= border;
-    const int right = point->x >= width - border;
-    const int top = point->y <= border;
-    const int bottom = point->y >= height - border;
-    if (top && left)
-        return SDL_HITTEST_RESIZE_TOPLEFT;
-    if (top && right)
-        return SDL_HITTEST_RESIZE_TOPRIGHT;
-    if (bottom && left)
-        return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-    if (bottom && right)
-        return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-    if (top)
-        return SDL_HITTEST_RESIZE_TOP;
-    if (bottom)
-        return SDL_HITTEST_RESIZE_BOTTOM;
-    if (left)
-        return SDL_HITTEST_RESIZE_LEFT;
-    if (right)
-        return SDL_HITTEST_RESIZE_RIGHT;
-    return SDL_HITTEST_NORMAL;
 }
 
 int up_platform_init(void)

@@ -1,4 +1,5 @@
 #include "wayland_input.h"
+#include "input_geometry.h"
 
 #include <SDL3/SDL.h>
 #include <wayland-client.h>
@@ -12,9 +13,6 @@
 #define BTN_LEFT 0x110
 #define DOUBLE_CLICK_MS 400
 #define DOUBLE_CLICK_DISTANCE 8.0
-#define RESIZE_BORDER 10.0
-#define TOP_BAR_HEIGHT_PIXELS 42.0
-#define SCRUBBER_HIT_HEIGHT_PIXELS 42.0
 
 struct UpWaylandInput {
     SDL_Window *window;
@@ -33,40 +31,6 @@ struct UpWaylandInput {
     bool ready;
     char error[256];
 };
-
-static bool is_resize_edge(UpWaylandInput *input)
-{
-    int width = 0, height = 0;
-    SDL_GetWindowSize(input->window, &width, &height);
-    return input->x <= RESIZE_BORDER || input->x >= width - RESIZE_BORDER ||
-           input->y <= RESIZE_BORDER || input->y >= height - RESIZE_BORDER;
-}
-
-static bool is_close_button(UpWaylandInput *input)
-{
-    int width = 0, height = 0;
-    int pixel_width = 0, pixel_height = 0;
-    if (!SDL_GetWindowSize(input->window, &width, &height) ||
-        !SDL_GetWindowSizeInPixels(input->window, &pixel_width, &pixel_height) ||
-        width <= 0 || height <= 0 || pixel_width <= 0 || pixel_height <= 0)
-        return false;
-    const double button_width = TOP_BAR_HEIGHT_PIXELS * width / pixel_width;
-    const double button_height = TOP_BAR_HEIGHT_PIXELS * height / pixel_height;
-    return input->x >= width - button_width && input->x < width &&
-           input->y >= 0.0 && input->y < button_height;
-}
-
-static bool is_scrubber(UpWaylandInput *input)
-{
-    int width = 0, height = 0;
-    int pixel_width = 0, pixel_height = 0;
-    if (!SDL_GetWindowSize(input->window, &width, &height) ||
-        !SDL_GetWindowSizeInPixels(input->window, &pixel_width, &pixel_height) ||
-        height <= 0 || pixel_height <= 0)
-        return false;
-    const double hit_height = SCRUBBER_HIT_HEIGHT_PIXELS * height / pixel_height;
-    return input->y >= height - hit_height;
-}
 
 static void pointer_enter(void *data, struct wl_pointer *pointer,
                           uint32_t serial, struct wl_surface *surface,
@@ -110,22 +74,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         state != WL_POINTER_BUTTON_STATE_PRESSED)
         return;
 
-    // Leave the close-button click to SDL instead of starting a window move.
-    if (is_close_button(input)) {
-        input->last_click_time = 0;
-        return;
-    }
-
-    // SDL's edge-only hit test consumes this click and sends the corresponding
-    // xdg_toplevel.resize request. Do not race it with a move request.
-    if (is_resize_edge(input)) {
-        input->last_click_time = 0;
-        return;
-    }
-
-    // Leave timeline clicks and drags to SDL instead of asking the compositor
-    // to move the window.
-    if (is_scrubber(input)) {
+    // Rust owns the same close, resize, and scrubber regions used by SDL
+    // and playback. Only content clicks may start a compositor window move.
+    int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
+    if (!SDL_GetWindowSize(input->window, &width, &height) ||
+        !SDL_GetWindowSizeInPixels(input->window, &pixel_width, &pixel_height) ||
+        up_input_hit_test(input->x, input->y, width, height,
+                           pixel_width, pixel_height) != UP_HIT_CONTENT) {
         input->last_click_time = 0;
         return;
     }

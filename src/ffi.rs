@@ -451,15 +451,7 @@ unsafe extern "C" {
         frame: *mut ::std::os::raw::c_void,
         width: ::std::os::raw::c_int,
         height: ::std::os::raw::c_int,
-        top_bar_alpha: f32,
-        title: *const ::std::os::raw::c_char,
-        info: *const ::std::os::raw::c_char,
-        info_alpha: f32,
-        details: *const ::std::os::raw::c_char,
-        position: *const ::std::os::raw::c_char,
-        position_alpha: f32,
-        scrubber_progress: f32,
-        scrubber_alpha: f32,
+        overlay: *const UpOverlayFrame,
         subtitle_text: *const ::std::os::raw::c_char,
         subtitle_pixels: *const u8,
         subtitle_width: ::std::os::raw::c_int,
@@ -504,44 +496,97 @@ unsafe extern "C" {
 pub struct UpMpris {
     _unused: [u8; 0],
 }
-pub const UpMprisCommand_UP_MPRIS_COMMAND_NONE: UpMprisCommand = 0;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_QUIT: UpMprisCommand = 1;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_PLAY: UpMprisCommand = 2;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_PAUSE: UpMprisCommand = 3;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_PLAY_PAUSE: UpMprisCommand = 4;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_STOP: UpMprisCommand = 5;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_SEEK: UpMprisCommand = 6;
-pub const UpMprisCommand_UP_MPRIS_COMMAND_SET_POSITION: UpMprisCommand = 7;
-pub type UpMprisCommand = ::std::os::raw::c_uint;
-pub const UpMprisStatus_UP_MPRIS_STATUS_PLAYING: UpMprisStatus = 0;
-pub const UpMprisStatus_UP_MPRIS_STATUS_PAUSED: UpMprisStatus = 1;
-pub const UpMprisStatus_UP_MPRIS_STATUS_STOPPED: UpMprisStatus = 2;
-pub type UpMprisStatus = ::std::os::raw::c_uint;
+pub const UP_MPRIS_VALUE_BOOL: u32 = 1;
+pub const UP_MPRIS_VALUE_INT64: u32 = 2;
+pub const UP_MPRIS_VALUE_DOUBLE: u32 = 3;
+pub const UP_MPRIS_VALUE_STRING: u32 = 4;
+pub const UP_MPRIS_VALUE_EMPTY_STRINGS: u32 = 5;
+pub const UP_MPRIS_VALUE_METADATA: u32 = 6;
+#[repr(C)]
+#[derive(Default)]
+pub struct UpMprisValue {
+    pub kind: u32,
+    pub integer: i64,
+    pub real: f64,
+    pub text: *const ::std::ffi::c_char,
+    pub track_id: *const ::std::ffi::c_char,
+    pub title: *const ::std::ffi::c_char,
+    pub uri: *const ::std::ffi::c_char,
+    pub duration_us: i64,
+}
+#[repr(C)]
+pub struct UpMprisCallbacks {
+    pub data: *mut ::std::ffi::c_void,
+    pub command: unsafe extern "C" fn(
+        *mut ::std::ffi::c_void,
+        bool,
+        *const ::std::ffi::c_char,
+        *const ::std::ffi::c_char,
+        i64,
+    ),
+    pub property: unsafe extern "C" fn(
+        *mut ::std::ffi::c_void,
+        bool,
+        *const ::std::ffi::c_char,
+        *mut UpMprisValue,
+    ) -> bool,
+}
 unsafe extern "C" {
     pub fn up_mpris_create(
-        title: *const ::std::os::raw::c_char,
-        filename: *const ::std::os::raw::c_char,
-        duration_us: i64,
+        bus_name: *const ::std::ffi::c_char,
+        xml: *const ::std::ffi::c_char,
+        callbacks: *const UpMprisCallbacks,
     ) -> *mut UpMpris;
-}
-unsafe extern "C" {
-    pub fn up_mpris_active(mpris: *const UpMpris) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn up_mpris_error(mpris: *const UpMpris) -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
+    pub fn up_mpris_active(mpris: *const UpMpris) -> i32;
+    pub fn up_mpris_error(mpris: *const UpMpris) -> *const ::std::ffi::c_char;
     pub fn up_mpris_dispatch(mpris: *mut UpMpris);
-}
-unsafe extern "C" {
-    pub fn up_mpris_take_command(mpris: *mut UpMpris, value: *mut i64) -> UpMprisCommand;
-}
-unsafe extern "C" {
-    pub fn up_mpris_update(mpris: *mut UpMpris, status: UpMprisStatus, position_us: i64);
-}
-unsafe extern "C" {
+    pub fn up_mpris_status_changed(mpris: *mut UpMpris, status: *const ::std::ffi::c_char);
     pub fn up_mpris_seeked(mpris: *mut UpMpris, position_us: i64);
+    pub fn up_mpris_destroy(mpris: *mut UpMpris);
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct UpTextMask {
+    pub pixels: *const u8,
+    pub surface: *mut ::std::ffi::c_void,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
 }
 unsafe extern "C" {
-    pub fn up_mpris_destroy(mpris: *mut UpMpris);
+    pub fn up_text_normalize(
+        text: *const ::std::ffi::c_char,
+        length: usize,
+    ) -> *mut ::std::ffi::c_char;
+    pub fn up_text_free(text: *mut ::std::ffi::c_char);
+    pub fn up_text_decompose(character: u32, result: *mut u32, capacity: usize) -> usize;
+    pub fn up_text_mask_create(
+        text: *const ::std::ffi::c_char,
+        length: usize,
+        mask: *mut UpTextMask,
+    ) -> bool;
+    pub fn up_text_mask_free(mask: *mut UpTextMask);
+}
+#[repr(C)]
+pub struct UpOverlayImage {
+    pub pixels: *const u8,
+    pub width: i32,
+    pub height: i32,
+    pub serial: u64,
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct UpOverlayPart {
+    pub texture: u32,
+    pub src: [f32; 4],
+    pub dst: [f32; 4],
+    pub color: [f32; 4],
+}
+#[repr(C)]
+pub struct UpOverlayFrame {
+    pub text: UpOverlayImage,
+    pub title: UpOverlayImage,
+    pub parts: *const UpOverlayPart,
+    pub count: usize,
 }

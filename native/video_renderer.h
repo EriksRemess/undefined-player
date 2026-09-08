@@ -1,18 +1,33 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct UpVideoRenderer UpVideoRenderer;
+
+// Borrowed A8 images and player-owned geometry, valid for one display call.
+typedef struct UpOverlayImage {
+    const uint8_t *pixels;
+    int width, height;
+    uint64_t serial;
+} UpOverlayImage;
+
+typedef struct UpOverlayPart {
+    unsigned int texture; // 0: solid white, 1: controls, 2: title
+    float src[4], dst[4], color[4];
+} UpOverlayPart;
+
+typedef struct UpOverlayFrame {
+    UpOverlayImage text, title;
+    const UpOverlayPart *parts;
+    size_t count;
+} UpOverlayFrame;
 
 UpVideoRenderer *up_video_renderer_create(void *window);
 void *up_video_renderer_device(UpVideoRenderer *renderer);
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
-                              int width, int height, float top_bar_alpha,
-                              const char *title, const char *info,
-                              float info_alpha, const char *details,
-                              const char *position,
-                              float position_alpha, float scrubber_progress,
-                              float scrubber_alpha, const char *subtitle_text,
+                              int width, int height, const UpOverlayFrame *overlay,
+                              const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
                               uint64_t subtitle_serial);

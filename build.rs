@@ -67,6 +67,7 @@ fn main() {
         .unwrap_or_else(|| pkg_config_path("pkgdatadir", "wayland-protocols"));
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let text_raster_object = out_dir.join("text_raster.o");
     let renderer_object = out_dir.join("video_renderer.o");
     let ffmpeg_compat_object = out_dir.join("ffmpeg_compat.o");
     let platform_object = out_dir.join("platform.o");
@@ -77,12 +78,15 @@ fn main() {
     let protocol_header = out_dir.join("xdg-shell-client-protocol.h");
     let protocol_source = out_dir.join("xdg-shell-protocol.c");
 
+    println!("cargo:rerun-if-changed=native/text_raster.c");
+    println!("cargo:rerun-if-changed=native/text_raster.h");
     println!("cargo:rerun-if-changed=native/video_renderer.c");
     println!("cargo:rerun-if-changed=native/video_renderer.h");
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.c");
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.h");
     println!("cargo:rerun-if-changed=native/platform.c");
     println!("cargo:rerun-if-changed=native/platform.h");
+    println!("cargo:rerun-if-changed=native/input_geometry.h");
     println!("cargo:rerun-if-changed=native/wayland_input.c");
     println!("cargo:rerun-if-changed=native/wayland_input.h");
     println!("cargo:rerun-if-changed=native/mpris.c");
@@ -116,6 +120,16 @@ fn main() {
         .arg("-o")
         .arg(&renderer_object);
     run(cc, "C Vulkan renderer compilation");
+
+    let mut text_raster_cc = Command::new("cc");
+    text_raster_cc
+        .args(["-std=c11", "-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .args(pkg_config("--cflags", &["pangocairo"]))
+        .arg("-c")
+        .arg("native/text_raster.c")
+        .arg("-o")
+        .arg(&text_raster_object);
+    run(text_raster_cc, "Pango text adapter compilation");
 
     let mut ffmpeg_compat_cc = Command::new("cc");
     ffmpeg_compat_cc
@@ -178,6 +192,7 @@ fn main() {
     ar.arg("crs")
         .arg(&renderer_archive)
         .arg(&renderer_object)
+        .arg(&text_raster_object)
         .arg(&ffmpeg_compat_object)
         .arg(&platform_object)
         .arg(&input_object)

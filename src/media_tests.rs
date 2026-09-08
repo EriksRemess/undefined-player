@@ -1,5 +1,20 @@
-use super::*;
+use crate::{
+    audio::*,
+    clock::{AUDIO_CLOCK_TOLERANCE, WallClock},
+    ffi,
+    media::Media,
+    metadata::VideoInfo,
+    window::{Sdl, sdl_error},
+    worker::DecodeWorker,
+};
 use std::process::Command;
+use std::{
+    collections::VecDeque,
+    env,
+    path::PathBuf,
+    ptr, thread,
+    time::{Duration, Instant},
+};
 
 // Each SDL test runs in its own process: SDL initialization and environment
 // changes must not race the Rust test runner or the optional desktop tests.

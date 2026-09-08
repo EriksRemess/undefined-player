@@ -53,6 +53,45 @@ cargo build --release --locked
 Vulkan device selection is automatic. On a multi-GPU system,
 `UP_VULKAN_DEVICE` can pass an explicit device selector to FFmpeg.
 
+## Rust and native code
+
+`src/main.rs` handles startup and command-line results. The runtime is split by
+responsibility:
+
+| Modules | Responsibility |
+| --- | --- |
+| `playback.rs`, `clock.rs` | Event loop, seeking, and playback synchronization |
+| `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
+| `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
+| `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |
+| `renderer.rs`, `overlay.rs`, `pixel_font.rs` | Renderer ownership, overlay pixels, and placement |
+| `metadata.rs`, `subtitles.rs`, `presentation.rs` | Media labels, subtitle content, and UI state |
+| `mpris.rs`, `mpris.xml` | MPRIS metadata, playback state, commands, and interface definition |
+
+SDL resize handling and Wayland dragging call the same Rust geometry function
+as playback. Close buttons take precedence over resize edges, then the scrubber,
+then window dragging. Rendering shares the physical control dimensions.
+
+`src/overlay.rs` owns the title and control pixel buffers, text caches, Unicode
+mask scaling, truncation, and drawing rectangles. `src/pixel_font.rs` contains
+the complete printable ASCII font. Canonically decomposable Latin letters use
+the same pixel bodies with supported accents above or below, preserving their
+size and cell spacing. Other characters use shaped masks. Prepared frames borrow
+the Rust buffers for a synchronous renderer call; image revisions avoid repeated
+GPU uploads.
+Detail lines reserve extra space only where accent pixels need it. Oversized
+panels scale uniformly to fit above the playback controls when the window shrinks.
+The renderer borrows its window and takes references to owned video frames.
+
+`native/text_raster.c` adapts GLib normalization/decomposition and Pango/Cairo
+shaping into natural-size masks. Rust owns their lifetime through a wrapper and fits the
+masks into the overlay cells. `native/video_renderer.c` handles FFmpeg/Vulkan
+and libplacebo integration, uploads the prepared overlays, and renders subtitles.
+The SDL and Wayland adapters retain native API translation. The GIO/MPRIS
+adapter handles registration, serialization, and signals; Rust owns its callback
+state. Its private GIO context is dispatched on the owning thread, and callbacks
+are unregistered before their Rust state is freed.
+
 ## Diagnostics and checks
 
 Add `--perf` to print shown/dropped frame rates and average decoder-fill and
@@ -70,8 +109,11 @@ cargo build --release --locked
 git diff --check
 ```
 
-`make check` runs the native renderer tests, Rust tests, strict Clippy checks,
-and desktop-file validation. The renderer tests run on the CPU and need the
+`make check` runs the native integration tests, Rust tests, strict Clippy checks,
+and desktop-file validation. The Rust overlay tests cover printable symbols,
+Unicode accents, mask bounds, title truncation, caching, and control placement.
+Geometry and MPRIS state tests run without a desktop or D-Bus session.
+The text rendering tests run on the CPU and need the
 DejaVu fonts (`fonts-dejavu-core` on Ubuntu, `ttf-dejavu` on Arch Linux).
 The playback regression tests use the `ffmpeg` command (including
 its libx264 encoder) to generate small fixtures and SDL's dummy drivers, so
