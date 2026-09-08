@@ -185,6 +185,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_av_decoder_time_base(decoder: *const UpAvDecoder) -> f64;
+    pub fn up_av_decoder_frame_duration(decoder: *const UpAvDecoder) -> f64;
 }
 unsafe extern "C" {
     pub fn up_av_decoder_uses_vulkan(decoder: *const UpAvDecoder) -> ::std::os::raw::c_int;
@@ -249,6 +250,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn up_av_frame_audio_duration(frame: *const UpAvFrame) -> f64;
+    pub fn up_av_audio_converter_matches(
+        converter: *const UpAvAudioConverter,
+        frame: *const UpAvFrame,
+    ) -> ::std::os::raw::c_int;
+    pub fn up_av_audio_converter_drain_capacity(
+        converter: *mut UpAvAudioConverter,
+    ) -> ::std::os::raw::c_int;
+    pub fn up_av_audio_converter_drain(
+        converter: *mut UpAvAudioConverter,
+        output: *mut f32,
+        output_frames: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
     pub fn up_av_audio_converter_create(
         frame: *const UpAvFrame,
         output_rate: ::std::os::raw::c_int,

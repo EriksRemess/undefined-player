@@ -25,11 +25,16 @@ struct UpAvDecoder {
     int stream_index;
     AVRational time_base;
     int uses_vulkan;
+    double frame_duration;
 };
 
 struct UpAvAudioConverter {
     SwrContext *context;
     AVChannelLayout output_layout;
+    AVChannelLayout input_layout;
+    enum AVSampleFormat input_format;
+    int input_rate;
+    int output_rate;
 };
 
 struct UpAvSubtitle {
@@ -247,6 +252,9 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
     decoder->context = avcodec_alloc_context3(codec);
     decoder->stream_index = stream_index;
     decoder->time_base = stream->time_base;
+    AVRational rate = av_guess_frame_rate(FORMAT(format), stream, NULL);
+    decoder->frame_duration = rate.num > 0 && rate.den > 0
+        ? (double) rate.den / rate.num : 1.0 / 60.0;
     if (!decoder->context) {
         snprintf(decoder_error, sizeof(decoder_error), "out of memory");
         free(decoder);
@@ -305,6 +313,11 @@ int up_av_decoder_stream_index(const UpAvDecoder *decoder)
 double up_av_decoder_time_base(const UpAvDecoder *decoder)
 {
     return av_q2d(decoder->time_base);
+}
+
+double up_av_decoder_frame_duration(const UpAvDecoder *decoder)
+{
+    return decoder->frame_duration;
 }
 
 int up_av_decoder_uses_vulkan(const UpAvDecoder *decoder)
@@ -423,9 +436,18 @@ int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
     AVFormatContext *native_format = FORMAT(format);
     AVStream *stream = stream_at(format, (unsigned int) decoder->stream_index);
     AVFrame *native_frame = FRAME(frame);
-    if (!native_format || !stream || !native_frame || !info)
+    if (!native_format || !stream || !info)
         return 0;
     AVCodecParameters *parameters = stream->codecpar;
+    AVFrame fallback = {
+        .width = parameters->width, .height = parameters->height,
+        .colorspace = parameters->color_space,
+        .color_primaries = parameters->color_primaries,
+        .color_trc = parameters->color_trc,
+        .color_range = parameters->color_range,
+    };
+    if (!native_frame)
+        native_frame = &fallback;
     memset(info, 0, sizeof(*info));
     info->codec = avcodec_get_name(parameters->codec_id);
     info->profile = avcodec_profile_name(parameters->codec_id, parameters->profile);
@@ -515,6 +537,68 @@ int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
     return 1;
 }
 
+double up_av_frame_audio_duration(const UpAvFrame *frame)
+{
+    const AVFrame *native = FRAME(frame);
+    return native->sample_rate > 0
+        ? (double) native->nb_samples / native->sample_rate : 0.0;
+}
+
+int up_av_audio_converter_matches(const UpAvAudioConverter *converter,
+                                   const UpAvFrame *frame)
+{
+    const AVFrame *native = FRAME(frame);
+    return converter->input_rate == native->sample_rate &&
+        converter->input_format == native->format &&
+        av_channel_layout_compare(&converter->input_layout,
+                                   &native->ch_layout) == 0;
+}
+
+int up_av_audio_converter_drain_capacity(UpAvAudioConverter *converter)
+{
+    return swr_get_out_samples(converter->context, 0);
+}
+
+int up_av_audio_converter_drain(UpAvAudioConverter *converter, float *output,
+                                 int output_frames)
+{
+    uint8_t *planes[] = { (uint8_t *) output };
+    return swr_convert(converter->context, planes, output_frames, NULL, 0);
+}
+
+/* Reject changed input until the caller drains and replaces the converter.
+ * swr_convert assumes its input planes match the configured layout. */
+static int prepare_audio_converter(UpAvAudioConverter *converter,
+                                    const AVFrame *frame)
+{
+    if (converter->context)
+        return up_av_audio_converter_matches(converter, (const UpAvFrame *) frame)
+            ? 0 : AVERROR_INPUT_CHANGED;
+
+    SwrContext *context = NULL;
+    AVChannelLayout layout = {0};
+    int result = av_channel_layout_copy(&layout, &frame->ch_layout);
+    if (result >= 0)
+        result = swr_alloc_set_opts2(&context, &converter->output_layout,
+                                     AV_SAMPLE_FMT_FLT, converter->output_rate,
+                                     &frame->ch_layout, frame->format,
+                                     frame->sample_rate, 0, NULL);
+    if (result >= 0)
+        result = swr_init(context);
+    if (result < 0) {
+        swr_free(&context);
+        av_channel_layout_uninit(&layout);
+        return result;
+    }
+    swr_free(&converter->context);
+    av_channel_layout_uninit(&converter->input_layout);
+    converter->context = context;
+    converter->input_layout = layout;
+    converter->input_format = frame->format;
+    converter->input_rate = frame->sample_rate;
+    return 0;
+}
+
 UpAvAudioConverter *up_av_audio_converter_create(const UpAvFrame *frame,
                                                   int output_rate,
                                                   int output_channels,
@@ -527,24 +611,14 @@ UpAvAudioConverter *up_av_audio_converter_create(const UpAvFrame *frame,
         return NULL;
     }
     av_channel_layout_default(&converter->output_layout, output_channels);
-    AVFrame *native = FRAME(frame);
-    int result = swr_alloc_set_opts2(&converter->context,
-                                     &converter->output_layout,
-                                     AV_SAMPLE_FMT_FLT, output_rate,
-                                     &native->ch_layout, native->format,
-                                     native->sample_rate, 0, NULL);
-    if (result >= 0)
-        result = swr_init(converter->context);
-    if (result < 0 || !converter->context) {
-        if (error)
-            *error = result < 0 ? result : AVERROR(ENOMEM);
-        swr_free(&converter->context);
-        av_channel_layout_uninit(&converter->output_layout);
-        free(converter);
+    converter->output_rate = output_rate;
+    int result = prepare_audio_converter(converter, FRAME(frame));
+    if (error)
+        *error = result;
+    if (result < 0) {
+        up_av_audio_converter_free(&converter);
         return NULL;
     }
-    if (error)
-        *error = 0;
     return converter;
 }
 
@@ -554,6 +628,7 @@ void up_av_audio_converter_free(UpAvAudioConverter **converter)
         return;
     swr_free(&(*converter)->context);
     av_channel_layout_uninit(&(*converter)->output_layout);
+    av_channel_layout_uninit(&(*converter)->input_layout);
     free(*converter);
     *converter = NULL;
 }
@@ -561,6 +636,9 @@ void up_av_audio_converter_free(UpAvAudioConverter **converter)
 int up_av_audio_converter_capacity(UpAvAudioConverter *converter,
                                    const UpAvFrame *frame)
 {
+    int result = prepare_audio_converter(converter, FRAME(frame));
+    if (result < 0)
+        return result;
     return swr_get_out_samples(converter->context, FRAME(frame)->nb_samples);
 }
 
@@ -570,6 +648,9 @@ int up_av_audio_converter_convert(UpAvAudioConverter *converter,
 {
     uint8_t *output_planes[] = { (uint8_t *) output };
     AVFrame *native = FRAME(frame);
+    int result = prepare_audio_converter(converter, native);
+    if (result < 0)
+        return result;
     return swr_convert(converter->context, output_planes, output_frames,
                        (const uint8_t **) native->extended_data,
                        native->nb_samples);

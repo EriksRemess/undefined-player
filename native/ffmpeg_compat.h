@@ -99,6 +99,7 @@ const char *up_av_decoder_error(void);
 void up_av_decoder_free(UpAvDecoder **decoder);
 int up_av_decoder_stream_index(const UpAvDecoder *decoder);
 double up_av_decoder_time_base(const UpAvDecoder *decoder);
+double up_av_decoder_frame_duration(const UpAvDecoder *decoder);
 int up_av_decoder_uses_vulkan(const UpAvDecoder *decoder);
 int up_av_decoder_width(const UpAvDecoder *decoder);
 int up_av_decoder_height(const UpAvDecoder *decoder);
@@ -121,6 +122,12 @@ int64_t up_av_frame_duration(const UpAvFrame *frame);
 int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,
                      const UpAvFrame *frame, UpVideoInfo *info);
 
+double up_av_frame_audio_duration(const UpAvFrame *frame);
+int up_av_audio_converter_matches(const UpAvAudioConverter *converter,
+                                   const UpAvFrame *frame);
+int up_av_audio_converter_drain_capacity(UpAvAudioConverter *converter);
+int up_av_audio_converter_drain(UpAvAudioConverter *converter, float *output,
+                                 int output_frames);
 UpAvAudioConverter *up_av_audio_converter_create(const UpAvFrame *frame,
                                                   int output_rate,
                                                   int output_channels,

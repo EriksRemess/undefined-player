@@ -5,7 +5,7 @@ Maintainer: Ēriks Remess <eriks@remess.lv>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,
- rustc (>= 1.85),
+ rustc (>= 1.93.1),
  binutils,
  pkgconf,
  wayland-protocols,
@@ -21,6 +21,8 @@ Build-Depends:
  libswresample-dev (>= 7:8),
  libavutil-dev (>= 7:8),
  desktop-file-utils,
+ ffmpeg <!nocheck>,
+ fonts-dejavu-core <!nocheck>,
 Standards-Version: 4.7.2
 Rules-Requires-Root: no
 Homepage: https://github.com/EriksRemess/undefined-player

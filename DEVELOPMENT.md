@@ -6,7 +6,7 @@ documented in [README.md](README.md).
 
 ## Build requirements
 
-- Rust 1.85 or newer and Cargo (the crate uses Rust 2024 edition)
+- Rust 1.93.1 or newer and Cargo (the crate uses Rust 2024 edition)
 - a C compiler, `ar`, and `pkg-config`
 - `wayland-scanner` and the stable Wayland protocol definitions
 - development files for SDL3, libplacebo, Vulkan, Wayland, Pango, Cairo, and
@@ -70,8 +70,13 @@ cargo build --release --locked
 git diff --check
 ```
 
-`make check` runs the Rust tests, strict Clippy checks, and desktop-file
-validation.
+`make check` runs the native renderer tests, Rust tests, strict Clippy checks,
+and desktop-file validation. The renderer tests run on the CPU and need the
+DejaVu fonts (`fonts-dejavu-core` on Ubuntu, `ttf-dejavu` on Arch Linux).
+The playback regression tests use the `ffmpeg` command (including
+its libx264 encoder) to generate small fixtures and SDL's dummy drivers, so
+they do not require a Wayland session, audio server, or GPU. Install the
+`ffmpeg` package to run them.
 
 ## Local installation
 
@@ -133,5 +138,7 @@ created with `--enable-nonfree`.
 
 Pushes to `main` update the rolling `tip` prerelease. Tags matching `v*` create
 versioned releases. Pull requests do not run the release workflow. The workflow
-builds and checks on Arch Linux, builds and lints the Debian package on Ubuntu
-26.04, creates the binary tarball, and uploads both package formats.
+uses the latest stable Rust toolchain for both build jobs. It builds and
+checks on Arch Linux, builds and lints the Debian package on Ubuntu 26.04,
+creates the binary tarball, and uploads both package formats. User builds
+require Rust 1.93.1 or newer, matching Ubuntu 26.04's packaged compiler.

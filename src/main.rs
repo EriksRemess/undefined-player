@@ -17,6 +17,10 @@ const AUDIO_RATE: i32 = 48_000;
 const AUDIO_CHANNELS: i32 = 2;
 const AUDIO_BYTES_PER_FRAME: i64 = (size_of::<f32>() * AUDIO_CHANNELS as usize) as i64;
 const AUDIO_QUEUE_TARGET_BYTES: i32 = AUDIO_RATE * AUDIO_BYTES_PER_FRAME as i32 * 150 / 1000;
+// Stop demuxing independently of video, including after the last video packet.
+const AUDIO_QUEUE_MAX_BYTES: i32 = AUDIO_RATE * AUDIO_BYTES_PER_FRAME as i32;
+const AUDIO_TIMESTAMP_TOLERANCE: f64 = 0.002;
+const AUDIO_CLOCK_TOLERANCE: f64 = 0.080;
 const VIDEO_QUEUE_TARGET: usize = 16;
 const VIDEO_QUEUE_MAX: usize = 24;
 const VIDEO_PRESENTATION_LEAD: f64 = 0.012;
@@ -568,6 +572,7 @@ struct Decoder {
     context: *mut ffi::UpAvDecoder,
     stream_index: i32,
     time_base: f64,
+    frame_duration: f64,
     uses_vulkan: bool,
 }
 
@@ -624,6 +629,7 @@ impl Decoder {
             context,
             stream_index: unsafe { ffi::up_av_decoder_stream_index(context) },
             time_base: unsafe { ffi::up_av_decoder_time_base(context) },
+            frame_duration: unsafe { ffi::up_av_decoder_frame_duration(context) },
             uses_vulkan: unsafe { ffi::up_av_decoder_uses_vulkan(context) } != 0,
         })
     }
@@ -752,11 +758,21 @@ impl Drop for VideoFrame {
     }
 }
 
+struct AudioChunk {
+    pts: f64,
+    samples: Vec<f32>,
+    offset: usize,
+}
+
 struct AudioOutput {
     stream: *mut ffi::UpAudioStream,
     converter: *mut ffi::UpAvAudioConverter,
     first_pts: Option<f64>,
     submitted_frames: i64,
+    segment_frames: i64,
+    next_input_pts: Option<f64>,
+    next_output_pts: f64,
+    pending: VecDeque<AudioChunk>,
     resumed: bool,
 }
 
@@ -774,6 +790,10 @@ impl AudioOutput {
             converter: ptr::null_mut(),
             first_pts: None,
             submitted_frames: 0,
+            segment_frames: 0,
+            next_input_pts: None,
+            next_output_pts: 0.0,
+            pending: VecDeque::new(),
             resumed: false,
         })
     }
@@ -801,14 +821,37 @@ impl AudioOutput {
         time_base: f64,
         discard_before: Option<f64>,
     ) -> Result<bool> {
-        unsafe { self.initialize_converter(frame)? };
-
         let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
-        let frame_pts = (timestamp != AV_NOPTS_VALUE).then_some(timestamp as f64 * time_base);
+        let frame_pts = (timestamp != AV_NOPTS_VALUE)
+            .then_some(timestamp as f64 * time_base)
+            .filter(|pts| pts.is_finite());
+        let discontinuity = self
+            .next_input_pts
+            .zip(frame_pts)
+            .is_some_and(|(expected, actual)| {
+                (actual - expected).abs() > AUDIO_TIMESTAMP_TOLERANCE
+            });
+        let changed = !self.converter.is_null()
+            && unsafe { ffi::up_av_audio_converter_matches(self.converter, frame) } == 0;
+        if discontinuity || changed {
+            unsafe { self.drain_converter(discard_before)? };
+            unsafe { ffi::up_av_audio_converter_free(&mut self.converter) };
+        }
+        if self.next_input_pts.is_none() || discontinuity {
+            self.next_output_pts = frame_pts.unwrap_or(self.next_output_pts);
+        }
+        let input_pts = frame_pts
+            .or(self.next_input_pts)
+            .unwrap_or(self.next_output_pts);
+        self.next_input_pts = Some(input_pts + unsafe { ffi::up_av_frame_audio_duration(frame) });
+        unsafe { self.initialize_converter(frame)? };
 
         let capacity = unsafe { ffi::up_av_audio_converter_capacity(self.converter, frame) };
         if capacity < 0 {
-            return Err("could not calculate converted audio size".into());
+            return Err(format!(
+                "could not calculate converted audio size: {}",
+                unsafe { ffmpeg_error(capacity) }
+            ));
         }
         let mut samples = vec![0_f32; capacity as usize * AUDIO_CHANNELS as usize];
         let converted = unsafe {
@@ -824,33 +867,119 @@ impl AudioOutput {
                 ffmpeg_error(converted)
             }));
         }
+        samples.truncate(converted as usize * AUDIO_CHANNELS as usize);
+        let retained = self.append_samples(samples, discard_before);
+        unsafe { self.pump()? };
+        Ok(retained)
+    }
+
+    fn append_samples(&mut self, samples: Vec<f32>, discard_before: Option<f64>) -> bool {
+        let frames = samples.len() / AUDIO_CHANNELS as usize;
+        let pts = self.next_output_pts;
+        self.next_output_pts += frames as f64 / AUDIO_RATE as f64;
         let skipped = discard_before
-            .zip(frame_pts)
-            .map_or(0, |(target, pts)| {
-                ((target - pts).max(0.0) * AUDIO_RATE as f64).ceil() as i32
+            .map_or(0, |target| {
+                ((target - pts).max(0.0) * AUDIO_RATE as f64).ceil() as usize
             })
-            .min(converted);
-        let queued = converted - skipped;
-        if self.first_pts.is_none() && queued > 0 {
-            self.first_pts = Some(frame_pts.unwrap_or(0.0) + skipped as f64 / AUDIO_RATE as f64);
+            .min(frames);
+        if skipped == frames {
+            return false;
         }
-        let bytes = queued as usize * AUDIO_BYTES_PER_FRAME as usize;
-        if bytes > 0
-            && unsafe {
+        self.pending.push_back(AudioChunk {
+            pts,
+            samples,
+            offset: skipped * AUDIO_CHANNELS as usize,
+        });
+        true
+    }
+
+    unsafe fn drain_converter(&mut self, discard_before: Option<f64>) -> Result<()> {
+        if self.converter.is_null() {
+            return Ok(());
+        }
+        loop {
+            let capacity = unsafe { ffi::up_av_audio_converter_drain_capacity(self.converter) };
+            if capacity < 0 {
+                return Err(format!("could not size buffered audio: {}", unsafe {
+                    ffmpeg_error(capacity)
+                }));
+            }
+            if capacity == 0 {
+                break;
+            }
+            let mut samples = vec![0_f32; capacity as usize * AUDIO_CHANNELS as usize];
+            let converted = unsafe {
+                ffi::up_av_audio_converter_drain(self.converter, samples.as_mut_ptr(), capacity)
+            };
+            if converted < 0 {
+                return Err(format!("could not drain audio conversion: {}", unsafe {
+                    ffmpeg_error(converted)
+                }));
+            }
+            if converted == 0 {
+                break;
+            }
+            samples.truncate(converted as usize * AUDIO_CHANNELS as usize);
+            self.append_samples(samples, discard_before);
+        }
+        unsafe { self.pump() }
+    }
+
+    unsafe fn pump(&mut self) -> Result<()> {
+        while let Some(chunk) = self.pending.front() {
+            let pts =
+                chunk.pts + (chunk.offset / AUDIO_CHANNELS as usize) as f64 / AUDIO_RATE as f64;
+            let queued = unsafe { self.queued_bytes() };
+            let end = self
+                .first_pts
+                .map(|start| start + self.segment_frames as f64 / AUDIO_RATE as f64);
+            if end.is_none_or(|end| (pts - end).abs() > AUDIO_TIMESTAMP_TOLERANCE) {
+                if queued != 0 {
+                    break;
+                }
+                // Never concatenate separate timestamp ranges in SDL's un-timed
+                // stream. The event loop resumes this segment when it is due.
+                unsafe { self.set_paused(true)? };
+                self.first_pts = Some(pts);
+                self.segment_frames = 0;
+            }
+            let available = (AUDIO_QUEUE_MAX_BYTES - queued).max(0) as usize / size_of::<f32>();
+            let chunk = self.pending.front_mut().unwrap();
+            let count = (chunk.samples.len() - chunk.offset).min(available);
+            if count == 0 {
+                break;
+            }
+            if unsafe {
                 ffi::up_audio_stream_put(
                     self.stream,
-                    samples
-                        .as_ptr()
-                        .add(skipped as usize * AUDIO_CHANNELS as usize)
-                        .cast::<c_void>(),
-                    bytes as i32,
+                    chunk.samples.as_ptr().add(chunk.offset).cast(),
+                    (count * size_of::<f32>()) as i32,
                 )
             } == 0
-        {
-            return Err(format!("could not queue audio: {}", unsafe { sdl_error() }));
+            {
+                return Err(format!("could not queue audio: {}", unsafe { sdl_error() }));
+            }
+            chunk.offset += count;
+            let frames = (count / AUDIO_CHANNELS as usize) as i64;
+            self.submitted_frames += frames;
+            self.segment_frames += frames;
+            if chunk.offset == chunk.samples.len() {
+                self.pending.pop_front();
+            }
         }
-        self.submitted_frames += queued as i64;
-        Ok(queued > 0)
+        Ok(())
+    }
+
+    unsafe fn full(&self) -> bool {
+        !self.pending.is_empty() || unsafe { self.queued_bytes() } >= AUDIO_QUEUE_MAX_BYTES
+    }
+
+    unsafe fn active_clock(&self) -> Option<f64> {
+        if self.resumed && unsafe { self.queued_bytes() } > 0 {
+            unsafe { self.clock() }
+        } else {
+            None
+        }
     }
 
     unsafe fn queued_bytes(&self) -> i32 {
@@ -860,20 +989,13 @@ impl AudioOutput {
     unsafe fn clock(&self) -> Option<f64> {
         let base = self.first_pts?;
         let queued_frames = unsafe { self.queued_bytes() } as i64 / AUDIO_BYTES_PER_FRAME;
-        Some(base + (self.submitted_frames - queued_frames) as f64 / AUDIO_RATE as f64)
+        Some(base + (self.segment_frames - queued_frames) as f64 / AUDIO_RATE as f64)
     }
 
-    unsafe fn resume(&mut self) -> Result<()> {
-        if !self.resumed {
-            if unsafe { ffi::up_audio_stream_resume(self.stream) } == 0 {
-                return Err(format!("could not start audio: {}", unsafe { sdl_error() }));
-            }
-            self.resumed = true;
+    unsafe fn set_paused(&mut self, paused: bool) -> Result<()> {
+        if self.resumed == !paused {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    unsafe fn set_paused(&self, paused: bool) -> Result<()> {
         let ok = if paused {
             unsafe { ffi::up_audio_stream_pause(self.stream) }
         } else {
@@ -884,6 +1006,7 @@ impl AudioOutput {
                 sdl_error()
             }));
         }
+        self.resumed = !paused;
         Ok(())
     }
 
@@ -896,6 +1019,10 @@ impl AudioOutput {
         unsafe { ffi::up_av_audio_converter_free(&mut self.converter) };
         self.first_pts = None;
         self.submitted_frames = 0;
+        self.segment_frames = 0;
+        self.next_input_pts = None;
+        self.next_output_pts = 0.0;
+        self.pending.clear();
         Ok(())
     }
 }
@@ -924,6 +1051,7 @@ struct Media {
     eof: bool,
     drained: bool,
     first_video_pts: Option<f64>,
+    next_video_pts: f64,
     video_seek_target: Option<f64>,
     audio_seek_target: Option<f64>,
     subtitle_seek_target: Option<f64>,
@@ -1092,6 +1220,7 @@ impl Media {
                 eof: false,
                 drained: false,
                 first_video_pts: None,
+                next_video_pts: 0.0,
                 video_seek_target: None,
                 audio_seek_target: None,
                 subtitle_seek_target: None,
@@ -1122,9 +1251,7 @@ impl Media {
             }
             let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
             let pts = if timestamp == AV_NOPTS_VALUE {
-                self.video_queue.back().map_or(0.0, |previous| {
-                    previous.pts + previous.duration.max(1.0 / 60.0)
-                })
+                self.next_video_pts
             } else {
                 timestamp as f64 * self.video.time_base
             };
@@ -1132,8 +1259,10 @@ impl Media {
             let duration = if raw_duration > 0 {
                 raw_duration as f64 * self.video.time_base
             } else {
-                0.0
+                self.video.frame_duration
             };
+            // Decoder timing must survive queue transfers to the render thread.
+            self.next_video_pts = pts + duration;
             if self
                 .video_seek_target
                 .is_some_and(|target| pts + duration.max(1.0 / 120.0) < target)
@@ -1410,10 +1539,16 @@ impl Media {
             }
             unsafe { self.receive_audio()? };
         }
+        if let Some(audio) = self.audio.as_mut() {
+            unsafe { audio.drain_converter(self.audio_seek_target)? };
+        }
         Ok(())
     }
 
     unsafe fn fill_queues(&mut self) -> Result<()> {
+        if let Some(audio) = self.audio.as_mut() {
+            unsafe { audio.pump()? };
+        }
         if self.eof {
             return unsafe { self.drain() };
         }
@@ -1423,7 +1558,8 @@ impl Media {
                 .audio
                 .as_ref()
                 .is_some_and(|audio| unsafe { audio.queued_bytes() } < AUDIO_QUEUE_TARGET_BYTES);
-            if self.video_queue.len() >= VIDEO_QUEUE_MAX
+            if unsafe { self.audio_full() }
+                || self.video_queue.len() >= VIDEO_QUEUE_MAX
                 || (self.video_queue.len() >= VIDEO_QUEUE_TARGET && !audio_needs_data)
             {
                 break;
@@ -1450,23 +1586,26 @@ impl Media {
         Ok(())
     }
 
-    unsafe fn fill_until_video(&mut self) -> Result<()> {
-        while self.video_queue.is_empty() && !self.eof {
+    unsafe fn fill_initial_queues(&mut self) -> Result<()> {
+        while self.video_queue.is_empty() && !self.eof && !unsafe { self.audio_full() } {
             unsafe { self.fill_queues()? };
         }
         Ok(())
     }
 
-    unsafe fn start_audio(&mut self) -> Result<()> {
-        if let Some(audio) = self.audio.as_mut() {
-            unsafe { audio.resume()? };
-        }
-        Ok(())
+    unsafe fn audio_full(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(|audio| unsafe { audio.full() })
     }
 
-    unsafe fn set_paused(&self, paused: bool) -> Result<()> {
-        if let Some(audio) = self.audio.as_ref() {
-            unsafe { audio.set_paused(paused)? };
+    unsafe fn sync_audio(&mut self, playback_time: f64, paused: bool) -> Result<()> {
+        if let Some(audio) = self.audio.as_mut() {
+            unsafe { audio.pump()? };
+            // A delayed track may be buffered well before its first timestamp.
+            // Keep it paused until the video clock reaches that point.
+            let due = audio.first_pts.is_some_and(|pts| pts <= playback_time);
+            unsafe { audio.set_paused(paused || !due)? };
         }
         Ok(())
     }
@@ -1510,6 +1649,7 @@ impl Media {
         self.eof = false;
         self.drained = false;
         let playback_target = requested_target;
+        self.next_video_pts = playback_target;
         self.video_seek_target = Some(playback_target);
         self.audio_seek_target = self.audio.as_ref().map(|_| playback_target);
         self.subtitle_seek_target = (!self.subtitle_tracks.is_empty()).then_some(playback_target);
@@ -1541,30 +1681,22 @@ impl Media {
             .and_then(|audio| unsafe { audio.clock() })
     }
 
-    unsafe fn finish_seek(
-        &self,
-        video_pts: Option<f64>,
-        fallback: f64,
-        paused: bool,
-    ) -> Result<Option<f64>> {
+    unsafe fn finish_seek(&self, video_pts: Option<f64>, fallback: f64) -> Option<f64> {
         let audio_clock = unsafe { self.audio_clock() };
-        let Some(anchor) = completed_seek_anchor(
+        completed_seek_anchor(
             video_pts,
             audio_clock,
             self.audio.is_some(),
             self.eof,
+            self.video_queue.len() >= VIDEO_QUEUE_TARGET || unsafe { self.audio_full() },
             fallback,
-        ) else {
-            return Ok(None);
-        };
-        unsafe { self.set_paused(paused)? };
-        Ok(Some(anchor))
+        )
     }
 
     unsafe fn audio_empty(&self) -> bool {
         self.audio
             .as_ref()
-            .is_none_or(|audio| unsafe { audio.queued_bytes() } == 0)
+            .is_none_or(|audio| audio.pending.is_empty() && unsafe { audio.queued_bytes() } == 0)
     }
 }
 
@@ -1604,7 +1736,7 @@ impl Drop for QueuedVideoFrame {
 }
 
 impl DecodeWorker {
-    fn start(media: Media, measure_performance: bool) -> Self {
+    fn start(media: Media, path: PathBuf, measure_performance: bool) -> Self {
         let media = Arc::new(Mutex::new(media));
         let running = Arc::new(AtomicBool::new(true));
         let fill_nanoseconds = Arc::new(AtomicU64::new(0));
@@ -1620,7 +1752,29 @@ impl DecodeWorker {
                 let started = Instant::now();
                 let result = match thread_media.lock() {
                     Ok(mut media) => {
-                        let result = unsafe { media.fill_queues() };
+                        let mut result = unsafe { media.fill_queues() };
+                        if let Err(error) = &result
+                            && media.video.uses_vulkan
+                            && media.first_video_pts.is_none()
+                        {
+                            // Audio can fill the startup buffer before video is
+                            // decoded. Preserve initial hardware fallback here too.
+                            eprintln!(
+                                "warning: Vulkan decoding failed ({error}); restarting with software decoding"
+                            );
+                            let target = unsafe { media.audio_clock() }.unwrap_or(0.0);
+                            let selected_audio_track = media.selected_audio_track;
+                            result = unsafe { Media::open(&path, None, measure_performance) }
+                                .and_then(|mut replacement| {
+                                    replacement.selected_audio_track = selected_audio_track;
+                                    replacement.next_video_pts = target;
+                                    replacement.video_seek_target = Some(target);
+                                    replacement.audio_seek_target = Some(target);
+                                    replacement.subtitle_seek_target = Some(target);
+                                    *media = replacement;
+                                    unsafe { media.fill_queues() }
+                                });
+                        }
                         while result.is_ok()
                             && thread_outstanding_frames.load(Ordering::Acquire) < VIDEO_QUEUE_MAX
                         {
@@ -1775,6 +1929,14 @@ impl WallClock {
         }
     }
 
+    fn synchronize(&mut self, audio_pts: f64) {
+        // Keep a smooth clock within the device's normal period jitter, but
+        // re-anchor after an underrun or sustained clock drift.
+        if (self.now() - audio_pts).abs() > AUDIO_CLOCK_TOLERANCE {
+            self.seek(audio_pts);
+        }
+    }
+
     fn seek(&mut self, pts: f64) {
         let now = Instant::now();
         self.origin_pts = pts;
@@ -1850,13 +2012,18 @@ fn completed_seek_anchor(
     audio_clock: Option<f64>,
     has_audio: bool,
     eof: bool,
+    buffer_full: bool,
     fallback: f64,
 ) -> Option<f64> {
-    if (video_pts.is_none() || (has_audio && audio_clock.is_none())) && !eof {
-        None
-    } else {
-        Some(audio_clock.or(video_pts).unwrap_or(fallback))
+    if (video_pts.is_none() || (has_audio && audio_clock.is_none())) && !eof && !buffer_full {
+        return None;
     }
+    // A full buffer must be consumed before demuxing can reach the other
+    // stream. Start at the earlier timestamp and schedule late audio separately.
+    Some(match (video_pts, audio_clock) {
+        (Some(video), Some(audio)) => video.min(audio),
+        (video, audio) => audio.or(video).unwrap_or(fallback),
+    })
 }
 
 struct PositionNotice {
@@ -1911,13 +2078,13 @@ fn next_track(current: usize, count: usize) -> usize {
 fn track_status_text(kind: &str, selected: usize, count: usize, label: &TrackLabel) -> CString {
     let mut status = format!("{kind}: {} / {count}", selected + 1);
     if let Some(language) = label.language.as_deref() {
-        status.push_str(" — ");
+        status.push_str(" - ");
         status.push_str(&language.to_uppercase());
         if let Some(title) = label.title.as_deref() {
-            status.push_str(" — ");
+            status.push_str(" - ");
             status.push_str(&title.to_uppercase());
         }
-        status.push_str(" — ");
+        status.push_str(" - ");
         status.push_str(&label.codec);
     }
     CString::new(status).expect("track status has no NUL bytes")
@@ -2036,27 +2203,14 @@ unsafe fn set_playback_paused(
     if *paused == requested {
         return Ok(());
     }
-    let media = decoder.lock()?;
-    unsafe { media.set_paused(requested)? };
+    if requested {
+        let mut media = decoder.lock()?;
+        unsafe { media.sync_audio(clock.now(), true)? };
+    }
+    // Resumption is scheduled by the event loop after any pending seek.
     clock.set_paused(requested);
     *paused = requested;
     Ok(())
-}
-
-unsafe fn finish_seek_blocking(
-    media: &mut Media,
-    clock: &mut WallClock,
-    fallback: f64,
-    paused: bool,
-) -> Result<f64> {
-    loop {
-        let video_pts = media.video_queue.front().map(|frame| frame.pts);
-        if let Some(playback_target) = unsafe { media.finish_seek(video_pts, fallback, paused)? } {
-            clock.seek(playback_target);
-            return Ok(playback_target);
-        }
-        unsafe { media.fill_queues()? };
-    }
 }
 
 unsafe fn seek_by(
@@ -2151,7 +2305,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let renderer = unsafe { Renderer::create(&window)? };
     let mut media = unsafe { Media::open(&path, Some(renderer.device()), perf_log)? };
 
-    if let Err(hardware_error) = unsafe { media.fill_until_video() } {
+    if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
         if !media.video.uses_vulkan {
             return Err(hardware_error);
         }
@@ -2160,13 +2314,21 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         );
         drop(media);
         media = unsafe { Media::open(&path, None, perf_log)? };
-        unsafe { media.fill_until_video()? };
+        unsafe { media.fill_initial_queues()? };
     }
-    if media.video_queue.is_empty() {
+    if media.video_queue.is_empty() && media.eof {
         return Err("the video decoder produced no frames".into());
     }
-    let video_info =
-        unsafe { VideoInfo::inspect(&media, media.video_queue.front().unwrap().frame) };
+    let mut video_info_pending = media.video_queue.is_empty();
+    let mut video_info = unsafe {
+        VideoInfo::inspect(
+            &media,
+            media
+                .video_queue
+                .front()
+                .map_or(ptr::null_mut(), |frame| frame.frame),
+        )
+    };
     let audio_labels = media
         .audio_tracks
         .iter()
@@ -2189,27 +2351,30 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     unsafe { window.set_minimum_size()? };
     let (mut width, mut height) = unsafe { window.pixel_size()? };
     unsafe { renderer.resize(width, height)? };
-    let first_frame = media.video_queue.front().unwrap();
-    unsafe {
-        renderer.display(
-            first_frame.frame,
-            width,
-            height,
-            1.0,
-            &title,
-            RendererOverlays {
-                info: None,
-                details: None,
-                position: None,
-                scrubber: None,
-                subtitle: None,
-            },
-        )?
-    };
-    unsafe { media.start_audio()? };
+    if let Some(first_frame) = media.video_queue.front() {
+        unsafe {
+            renderer.display(
+                first_frame.frame,
+                width,
+                height,
+                1.0,
+                &title,
+                RendererOverlays {
+                    info: None,
+                    details: None,
+                    position: None,
+                    scrubber: None,
+                    subtitle: None,
+                },
+            )?
+        };
+    }
 
-    let clock_origin =
-        unsafe { media.audio_clock() }.unwrap_or(media.first_video_pts.unwrap_or(0.0));
+    let clock_origin = match (media.first_video_pts, unsafe { media.audio_clock() }) {
+        (Some(video), Some(audio)) => video.min(audio),
+        (video, audio) => audio.or(video).unwrap_or(0.0),
+    };
+    unsafe { media.sync_audio(clock_origin, false)? };
     let playback_start = clock_origin;
     let media_duration = media.duration();
     let mpris = unsafe {
@@ -2219,7 +2384,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             media_duration.map_or(0, seconds_to_microseconds),
         )
     };
-    let decoder = DecodeWorker::start(media, perf_log);
+    let decoder = DecodeWorker::start(media, path, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
     let mut video_queue = VecDeque::new();
@@ -2398,7 +2563,6 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             mpris_stopped = false;
                         }
                         Some(Action::CycleAudio) if audio_track_count > 1 => {
-                            pending_seek_anchor = None;
                             let next = next_track(selected_audio_track, audio_track_count);
                             let requested_target = clock.now();
                             let mut media = decoder.lock()?;
@@ -2408,15 +2572,10 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 &mut subtitle_queues,
                                 &mut current_subtitles,
                             );
-                            unsafe { media.select_audio_track(next, requested_target)? };
-                            let playback_target = unsafe {
-                                finish_seek_blocking(
-                                    &mut media,
-                                    &mut clock,
-                                    requested_target,
-                                    paused,
-                                )?
-                            };
+                            let playback_target =
+                                unsafe { media.select_audio_track(next, requested_target)? };
+                            clock.seek(playback_target);
+                            pending_seek_anchor = Some(playback_target);
                             selected_audio_track = next;
                             video_details = video_info.overlay_text(Some((
                                 selected_audio_track,
@@ -2570,8 +2729,7 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             && let Some(media) = decoder.try_lock()?
         {
             let video_pts = video_queue.front().map(|frame| frame.frame.pts);
-            if let Some(playback_target) = unsafe { media.finish_seek(video_pts, target, paused)? }
-            {
+            if let Some(playback_target) = unsafe { media.finish_seek(video_pts, target) } {
                 clock.seek(playback_target);
                 pending_seek_anchor = None;
             }
@@ -2580,7 +2738,31 @@ unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         // SDL/PipeWire consumes audio in period-sized chunks (1024 samples on
         // this machine), so the continuous audio-anchored wall clock is used
         // for video presentation instead of the quantized queue counter.
-        let playback_time = pending_seek_anchor.unwrap_or_else(|| clock.now());
+        let mut playback_time = pending_seek_anchor.unwrap_or_else(|| clock.now());
+        if let Some(mut media) = decoder.try_lock()? {
+            unsafe { media.sync_audio(playback_time, paused || pending_seek_anchor.is_some())? };
+            if !paused
+                && pending_seek_anchor.is_none()
+                && let Some(audio_pts) = media
+                    .audio
+                    .as_ref()
+                    .and_then(|audio| unsafe { audio.active_clock() })
+            {
+                clock.synchronize(audio_pts);
+                playback_time = clock.now();
+            }
+            if video_info_pending
+                && let Some(frame) = video_queue.front().or(current_video.as_ref())
+            {
+                video_info = unsafe { VideoInfo::inspect(&media, frame.frame.frame) };
+                video_details = video_info.overlay_text(
+                    audio_labels
+                        .get(selected_audio_track)
+                        .map(|label| (selected_audio_track, audio_track_count, label)),
+                );
+                video_info_pending = false;
+            }
+        }
         if let Some(mpris) = &mpris {
             let status = if mpris_stopped {
                 ffi::UpMprisStatus_UP_MPRIS_STATUS_STOPPED
@@ -2801,6 +2983,9 @@ fn main() {
 }
 
 #[cfg(test)]
+mod media_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2896,7 +3081,7 @@ mod tests {
         };
         assert_eq!(
             track_status_text("AUDIO", 2, 5, &labeled).to_bytes(),
-            "AUDIO: 3 / 5 — SPA — SURROUND 5.1 — DTS".as_bytes()
+            "AUDIO: 3 / 5 - SPA - SURROUND 5.1 - DTS".as_bytes()
         );
         let unlabeled = TrackLabel {
             codec: "AC3".into(),
@@ -3050,23 +3235,23 @@ mod tests {
     #[test]
     fn seek_completion_waits_for_audio_and_video_and_uses_audio_clock() {
         assert_eq!(
-            completed_seek_anchor(Some(10.0), None, true, false, 9.0),
+            completed_seek_anchor(Some(10.0), None, true, false, false, 9.0),
             None
         );
         assert_eq!(
-            completed_seek_anchor(None, Some(10.0), true, false, 9.0),
+            completed_seek_anchor(None, Some(10.0), true, false, false, 9.0),
             None
         );
         assert_eq!(
-            completed_seek_anchor(Some(10.02), Some(10.0), true, false, 9.0),
+            completed_seek_anchor(Some(10.02), Some(10.0), true, false, false, 9.0),
             Some(10.0)
         );
         assert_eq!(
-            completed_seek_anchor(Some(10.02), None, false, false, 9.0),
+            completed_seek_anchor(Some(10.02), None, false, false, false, 9.0),
             Some(10.02)
         );
         assert_eq!(
-            completed_seek_anchor(None, None, true, true, 9.0),
+            completed_seek_anchor(None, None, true, true, false, 9.0),
             Some(9.0)
         );
     }
@@ -3097,7 +3282,7 @@ mod tests {
             .expect("UP_TEST_MEDIA is set");
         let _sdl = unsafe { Sdl::init() }.expect("SDL initializes");
         let mut media = unsafe { Media::open(&path, None, false) }.expect("test media opens");
-        unsafe { media.fill_until_video() }.expect("initial queues fill");
+        unsafe { media.fill_initial_queues() }.expect("initial queues fill");
         let info = unsafe {
             VideoInfo::inspect(
                 &media,
@@ -3135,7 +3320,7 @@ mod tests {
             "test media has multiple audio tracks"
         );
 
-        unsafe { media.fill_until_video() }.expect("initial queues fill");
+        unsafe { media.fill_initial_queues() }.expect("initial queues fill");
         let target = media.video_queue.front().map_or(0.0, |frame| frame.pts) + 5.0;
         for track in 1..media.audio_tracks.len() {
             unsafe { media.select_audio_track(track, target) }.expect("audio track switches");

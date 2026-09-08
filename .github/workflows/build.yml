@@ -22,10 +22,16 @@ jobs:
       - name: Install Arch Linux build dependencies
         run: >-
           pacman -Syu --noconfirm
-          base-devel rust pkgconf wayland wayland-protocols vulkan-headers
-          sdl3 libplacebo pango cairo glib2 ffmpeg desktop-file-utils
+          base-devel curl pkgconf wayland wayland-protocols vulkan-headers
+          sdl3 libplacebo pango cairo glib2 ffmpeg desktop-file-utils ttf-dejavu
 
       - uses: actions/checkout@v6
+
+      - name: Install latest stable Rust
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Restore build cache
         uses: actions/cache@v5
@@ -34,7 +40,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/registry
             target
-          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
+          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
           restore-keys: |
             cargo-${{ runner.arch }}-${{ github.job }}-
 
@@ -51,9 +57,15 @@ jobs:
       - name: Install Debian packaging tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y devscripts lintian
+          DEBIAN_FRONTEND=noninteractive apt-get install -y devscripts lintian curl ca-certificates
 
       - uses: actions/checkout@v6
+
+      - name: Install latest stable Rust
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Restore build cache
         uses: actions/cache@v5
@@ -62,7 +74,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/registry
             target
-          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
+          key: cargo-${{ runner.arch }}-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', 'native/**') }}
           restore-keys: |
             cargo-${{ runner.arch }}-${{ github.job }}-
 

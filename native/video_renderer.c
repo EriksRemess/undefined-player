@@ -46,6 +46,7 @@ struct UpVideoRenderer {
     int text_subtitle_height;
     int text_subtitle_layout_width;
     uint64_t text_subtitle_serial;
+    bool text_subtitle_visible;
 
     AVBufferRef *hw_device;
     PFN_vkGetInstanceProcAddr get_proc_addr;
@@ -62,6 +63,7 @@ struct UpVideoRenderer {
 #define TEXTURE_WIDTH 1024
 #define TEXTURE_HEIGHT 384
 #define GLYPH_SCALE 2
+#define GLYPH_HEIGHT (7 * GLYPH_SCALE)
 #define INFO_GLYPH_Y 16
 #define CLOSE_GLYPH_X (TEXTURE_WIDTH - 12)
 #define CLOSE_GLYPH_Y 32
@@ -75,26 +77,29 @@ struct UpVideoRenderer {
 
 static void set_error(UpVideoRenderer *renderer, const char *message);
 
-static size_t bounded_length(const char *text, size_t maximum)
+// Normalize combining accents before assigning fixed-width overlay cells.
+static char *normalized_text(const char *text, size_t length)
 {
-    size_t length = 0;
-    while (length < maximum && text[length])
-        length++;
-    return length;
+    char *valid = g_utf8_make_valid(text ? text : "", text ? (gssize) length : 0);
+    char *normalized = g_utf8_normalize(valid, -1, G_NORMALIZE_DEFAULT_COMPOSE);
+    g_free(valid);
+    return normalized;
 }
 
-static int text_pixel_width_length(size_t length)
+static int text_pixel_width_length(const char *text, size_t length)
 {
-    const size_t maximum = TEXTURE_WIDTH / (6 * GLYPH_SCALE);
-    if (length > maximum)
-        length = maximum;
-    return length ? (int) (length * 6 * GLYPH_SCALE - GLYPH_SCALE) : 0;
+    char *normalized = normalized_text(text, length);
+    size_t cells = (size_t) g_utf8_strlen(normalized, -1);
+    g_free(normalized);
+    const size_t maximum = TEXTURE_WIDTH / TITLE_CELL_WIDTH;
+    if (cells > maximum)
+        cells = maximum;
+    return cells ? (int) (cells * TITLE_CELL_WIDTH - GLYPH_SCALE) : 0;
 }
 
 static int text_pixel_width(const char *text)
 {
-    const size_t maximum = TEXTURE_WIDTH / (6 * GLYPH_SCALE);
-    return text_pixel_width_length(bounded_length(text, maximum));
+    return text_pixel_width_length(text, text ? strlen(text) : 0);
 }
 
 static void details_text_metrics(const char *text, int *width, int *height)
@@ -104,13 +109,13 @@ static void details_text_metrics(const char *text, int *width, int *height)
     while (text && *text && lines < DETAILS_MAX_LINES) {
         const char *newline = strchr(text, '\n');
         const size_t length = newline ? (size_t) (newline - text) : strlen(text);
-        *width = fmax(*width, text_pixel_width_length(length));
+        *width = fmax(*width, text_pixel_width_length(text, length));
         lines++;
         if (!newline)
             break;
         text = newline + 1;
     }
-    *height = lines ? (lines - 1) * DETAILS_LINE_ADVANCE + 14 : 0;
+    *height = lines ? (lines - 1) * DETAILS_LINE_ADVANCE + GLYPH_HEIGHT : 0;
 }
 
 static const uint8_t *glyph_rows(char character)
@@ -171,7 +176,7 @@ static const uint8_t *glyph_rows(char character)
     if (character == '(') return left_paren;
     if (character == ')') return right_paren;
     if (character == '&') return ampersand;
-    return blank;
+    return character == ' ' ? blank : question;
 }
 
 static void draw_glyph(uint8_t *pixels, int stride, int x, int y,
@@ -190,21 +195,183 @@ static void draw_glyph(uint8_t *pixels, int stride, int x, int y,
     }
 }
 
+// Fit the actual raster, including hinted/antialiased edge pixels. Area
+// averaging gives every source pixel a contribution when shrinking the mask.
+static void fit_glyph_mask(uint8_t *pixels, int height, int x, int y, int width,
+                            const uint8_t *mask, int mask_width, int mask_height,
+                            int stride)
+{
+    if (width <= 0 || x < 0 || x + width > TEXTURE_WIDTH ||
+        y < 0 || y + GLYPH_HEIGHT > height)
+        return;
+    int left = mask_width, top = mask_height, right = 0, bottom = 0;
+    for (int sy = 0; sy < mask_height; sy++) {
+        for (int sx = 0; sx < mask_width; sx++) {
+            if (!mask[sy * stride + sx])
+                continue;
+            if (sx < left) left = sx;
+            if (sy < top) top = sy;
+            if (sx + 1 > right) right = sx + 1;
+            if (sy + 1 > bottom) bottom = sy + 1;
+        }
+    }
+    if (right <= left || bottom <= top)
+        return;
+
+    const double scale = fmin(1.0, fmin((double) width / (right - left),
+                                      (double) GLYPH_HEIGHT / (bottom - top)));
+    const int fitted_width = fmax(1, floor((right - left) * scale));
+    const int fitted_height = fmax(1, floor((bottom - top) * scale));
+    x += (width - fitted_width) / 2;
+    y += (GLYPH_HEIGHT - fitted_height) / 2;
+    const double step_x = (double) (right - left) / fitted_width;
+    const double step_y = (double) (bottom - top) / fitted_height;
+    for (int dy = 0; dy < fitted_height; dy++) {
+        const double y0 = top + dy * step_y;
+        const double y1 = top + (dy + 1) * step_y;
+        for (int dx = 0; dx < fitted_width; dx++) {
+            const double x0 = left + dx * step_x;
+            const double x1 = left + (dx + 1) * step_x;
+            double alpha = 0.0;
+            for (int sy = (int) floor(y0); sy < bottom && sy < ceil(y1); sy++) {
+                const double coverage_y = fmin(y1, sy + 1) - fmax(y0, sy);
+                for (int sx = (int) floor(x0); sx < right && sx < ceil(x1); sx++) {
+                    const double coverage_x = fmin(x1, sx + 1) - fmax(x0, sx);
+                    alpha += mask[sy * stride + sx] * coverage_x * coverage_y;
+                }
+            }
+            const int value = alpha > 0.0
+                ? fmax(1, lround(alpha / (step_x * step_y))) : 0;
+            uint8_t *destination = &pixels[(y + dy) * TEXTURE_WIDTH + x + dx];
+            *destination = (uint8_t) (value + (*destination * (255 - value) + 127) / 255);
+        }
+    }
+}
+
+static void draw_unicode_run(uint8_t *pixels, int height, int x, int y, int width,
+                              const char *text, size_t length)
+{
+    // Record without a clip or a scale transform: scaling vector text changes
+    // font hinting and can put pixels beyond Pango's measured ink rectangle.
+    cairo_surface_t *recording = cairo_recording_surface_create(CAIRO_CONTENT_ALPHA, NULL);
+    cairo_t *context = cairo_create(recording);
+    cairo_font_options_t *options = cairo_font_options_create();
+    cairo_font_options_set_antialias(options, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(options, CAIRO_HINT_STYLE_FULL);
+    cairo_font_options_set_hint_metrics(options, CAIRO_HINT_METRICS_ON);
+    cairo_set_font_options(context, options);
+    PangoLayout *layout = pango_cairo_create_layout(context);
+    PangoFontDescription *font = pango_font_description_new();
+    pango_font_description_set_family(font, "DejaVu Sans Mono");
+    pango_font_description_set_absolute_size(font, 18 * PANGO_SCALE);
+    pango_layout_set_font_description(layout, font);
+    pango_layout_set_single_paragraph_mode(layout, true);
+    pango_layout_set_text(layout, text, (int) length);
+    cairo_set_source_rgba(context, 1, 1, 1, 1);
+    pango_cairo_show_layout(context, layout);
+
+    double ink_x, ink_y, ink_width, ink_height;
+    cairo_recording_surface_ink_extents(recording, &ink_x, &ink_y, &ink_width, &ink_height);
+    if (ink_width > 0 && ink_height > 0) {
+        // Leave room for rasterization at the integer pixel boundaries.
+        const int left = (int) floor(ink_x) - 2;
+        const int top = (int) floor(ink_y) - 2;
+        const int mask_width = (int) ceil(ink_x + ink_width) - left + 2;
+        const int mask_height = (int) ceil(ink_y + ink_height) - top + 2;
+        cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8, mask_width, mask_height);
+        cairo_t *mask_context = cairo_create(mask);
+        cairo_set_source_surface(mask_context, recording, -left, -top);
+        cairo_paint(mask_context);
+        cairo_surface_flush(mask);
+        if (cairo_surface_status(mask) == CAIRO_STATUS_SUCCESS) {
+            fit_glyph_mask(pixels, height, x, y, width,
+                           cairo_image_surface_get_data(mask), mask_width, mask_height,
+                           cairo_image_surface_get_stride(mask));
+        }
+        cairo_destroy(mask_context);
+        cairo_surface_destroy(mask);
+    }
+    pango_font_description_free(font);
+    g_object_unref(layout);
+    cairo_font_options_destroy(options);
+    cairo_destroy(context);
+    cairo_surface_destroy(recording);
+}
+
+// The caller supplies valid, normalized UTF-8. Keep ASCII in the pixel font
+// and shape consecutive Unicode characters with Pango, as in window titles.
+static int rasterize_text(uint8_t *pixels, int height, int start_x, int y,
+                           const char *text, int maximum_cells)
+{
+    struct unicode_run {
+        const char *text;
+        size_t length;
+        int x;
+        int cells;
+    } unicode_runs[TEXTURE_WIDTH / TITLE_CELL_WIDTH] = {0};
+    const size_t length = strlen(text);
+    size_t offset = 0;
+    int cells = 0;
+    int num_unicode_runs = 0;
+    while (offset < length && cells < maximum_cells) {
+        const char *current = text + offset;
+        gunichar character = g_utf8_get_char_validated(
+            current, (gssize) (length - offset));
+        if (character == (gunichar) -1 || character == (gunichar) -2) {
+            draw_glyph(pixels, TEXTURE_WIDTH, start_x + cells * TITLE_CELL_WIDTH,
+                       y, '?');
+            offset++;
+            cells++;
+            continue;
+        }
+        if (character < 0x80) {
+            draw_glyph(pixels, TEXTURE_WIDTH, start_x + cells * TITLE_CELL_WIDTH,
+                       y, (char) character);
+            offset = (size_t) (g_utf8_next_char(current) - text);
+            cells++;
+            continue;
+        }
+
+        const char *run_start = current;
+        int run_cells = 0;
+        while (offset < length && cells + run_cells < maximum_cells) {
+            current = text + offset;
+            character = g_utf8_get_char_validated(
+                current, (gssize) (length - offset));
+            if (character < 0x80 || character == (gunichar) -1 ||
+                character == (gunichar) -2)
+                break;
+            offset = (size_t) (g_utf8_next_char(current) - text);
+            run_cells++;
+        }
+        unicode_runs[num_unicode_runs++] = (struct unicode_run) {
+            .text = run_start,
+            .length = (size_t) (text + offset - run_start),
+            .x = start_x + cells * TITLE_CELL_WIDTH,
+            .cells = run_cells,
+        };
+        cells += run_cells;
+    }
+    if (!num_unicode_runs)
+        return cells;
+
+    for (int index = 0; index < num_unicode_runs; index++) {
+        const struct unicode_run *run = &unicode_runs[index];
+        draw_unicode_run(pixels, height, run->x, y,
+                          run->cells * TITLE_CELL_WIDTH - GLYPH_SCALE,
+                          run->text, run->length);
+    }
+    return cells;
+}
+
 static int draw_text_line(uint8_t *pixels, int start_x, int y,
                           const char *text, size_t length)
 {
-    int x = start_x;
-    if (!text)
-        return 0;
-
-    for (size_t index = 0;
-         index < length && x + 6 * GLYPH_SCALE <= TEXTURE_WIDTH;
-         index++) {
-        const char character = text[index];
-        draw_glyph(pixels, TEXTURE_WIDTH, x, y, character);
-        x += 6 * GLYPH_SCALE;
-    }
-    return x > start_x ? x - start_x - GLYPH_SCALE : 0;
+    char *normalized = normalized_text(text, length);
+    int cells = rasterize_text(pixels, TEXTURE_HEIGHT, start_x, y, normalized,
+                               (TEXTURE_WIDTH - start_x) / TITLE_CELL_WIDTH);
+    g_free(normalized);
+    return cells ? cells * TITLE_CELL_WIDTH - GLYPH_SCALE : 0;
 }
 
 static int draw_text_at(uint8_t *pixels, int start_x, int y, const char *text)
@@ -240,12 +407,6 @@ static bool update_title_texture(UpVideoRenderer *renderer, const char *title,
                                  int layout_width, int *title_width,
                                  int *title_height)
 {
-    struct unicode_run {
-        const char *text;
-        size_t length;
-        int x;
-        int cells;
-    } unicode_runs[TEXTURE_WIDTH / TITLE_CELL_WIDTH] = {0};
     uint8_t pixels[TEXTURE_WIDTH * TITLE_TEXTURE_HEIGHT] = {0};
     const char *safe_title = title ? title : "";
     *title_width = renderer->title_width;
@@ -265,99 +426,25 @@ static bool update_title_texture(UpVideoRenderer *renderer, const char *title,
     maximum_cells = maximum_cells < texture_cells
         ? maximum_cells : texture_cells;
     maximum_cells = maximum_cells > 0 ? maximum_cells : 1;
-    const glong glyph_count = g_utf8_strlen(safe_title, -1);
+    char *normalized = normalized_text(safe_title, strlen(safe_title));
+    const glong glyph_count = g_utf8_strlen(normalized, -1);
     const bool ellipsized = glyph_count > maximum_cells;
     const int ellipsis_cells = ellipsized
         ? (maximum_cells < 3 ? maximum_cells : 3) : 0;
     const int content_cells = maximum_cells - ellipsis_cells;
-    const size_t length = strlen(safe_title);
-    size_t offset = 0;
-    int cells = 0;
-    int num_unicode_runs = 0;
-    while (offset < length && cells < content_cells) {
-        const char *current = safe_title + offset;
-        gunichar character = g_utf8_get_char_validated(
-            current, (gssize) (length - offset));
-        if (character == (gunichar) -1 || character == (gunichar) -2) {
-            draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
-                       (TITLE_TEXTURE_HEIGHT - 14) / 2, '?');
-            offset++;
-            cells++;
-            continue;
-        }
-        if (character < 0x80) {
-            draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
-                       (TITLE_TEXTURE_HEIGHT - 14) / 2, (char) character);
-            offset = (size_t) (g_utf8_next_char(current) - safe_title);
-            cells++;
-            continue;
-        }
-
-        const char *run_start = current;
-        int run_cells = 0;
-        while (offset < length && cells + run_cells < content_cells) {
-            current = safe_title + offset;
-            character = g_utf8_get_char_validated(
-                current, (gssize) (length - offset));
-            if (character < 0x80 || character == (gunichar) -1 ||
-                character == (gunichar) -2)
-                break;
-            offset = (size_t) (g_utf8_next_char(current) - safe_title);
-            run_cells++;
-        }
-        unicode_runs[num_unicode_runs++] = (struct unicode_run) {
-            .text = run_start,
-            .length = (size_t) (safe_title + offset - run_start),
-            .x = cells * TITLE_CELL_WIDTH,
-            .cells = run_cells,
-        };
-        cells += run_cells;
-    }
+    int cells = rasterize_text(pixels, TITLE_TEXTURE_HEIGHT, 0,
+                                (TITLE_TEXTURE_HEIGHT - GLYPH_HEIGHT) / 2,
+                                normalized, content_cells);
+    g_free(normalized);
     for (int index = 0; index < ellipsis_cells; index++) {
         draw_glyph(pixels, TEXTURE_WIDTH, cells * TITLE_CELL_WIDTH,
-                   (TITLE_TEXTURE_HEIGHT - 14) / 2, '.');
+                   (TITLE_TEXTURE_HEIGHT - GLYPH_HEIGHT) / 2, '.');
         cells++;
     }
 
-    cairo_surface_t *surface = cairo_image_surface_create_for_data(
-        pixels, CAIRO_FORMAT_A8, TEXTURE_WIDTH, TITLE_TEXTURE_HEIGHT,
-        TEXTURE_WIDTH);
-    cairo_surface_mark_dirty(surface);
-    cairo_t *context = cairo_create(surface);
-    cairo_font_options_t *font_options = cairo_font_options_create();
-    cairo_font_options_set_antialias(font_options, CAIRO_ANTIALIAS_GRAY);
-    cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_FULL);
-    cairo_font_options_set_hint_metrics(font_options, CAIRO_HINT_METRICS_ON);
-    cairo_set_font_options(context, font_options);
-    PangoLayout *layout = pango_cairo_create_layout(context);
-    PangoFontDescription *font = pango_font_description_new();
-    pango_font_description_set_family(font, "DejaVu Sans Mono");
-    pango_font_description_set_absolute_size(font, 11 * PANGO_SCALE);
-    pango_layout_set_font_description(layout, font);
-    pango_layout_set_single_paragraph_mode(layout, true);
-    cairo_set_source_rgba(context, 1.0, 1.0, 1.0, 1.0);
-    for (int index = 0; index < num_unicode_runs; index++) {
-        const struct unicode_run *run = &unicode_runs[index];
-        char *run_text = g_strndup(run->text, run->length);
-        const int run_width = run->cells * TITLE_CELL_WIDTH;
-        pango_layout_set_text(layout, run_text, -1);
-        pango_layout_set_width(layout, run_width * PANGO_SCALE);
-        pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
-        PangoRectangle logical_extents;
-        pango_layout_get_pixel_extents(layout, NULL, &logical_extents);
-        cairo_save(context);
-        cairo_translate(context, run->x,
-                        ((TITLE_TEXTURE_HEIGHT - logical_extents.height) * 0.5) -
-                        logical_extents.y);
-        pango_cairo_show_layout(context, layout);
-        cairo_restore(context);
-        g_free(run_text);
-    }
-    cairo_surface_flush(surface);
-
     bool success = true;
-    const unsigned char *glyphs = cairo_image_surface_get_data(surface);
-    const int glyph_stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *glyphs = pixels;
+    const int glyph_stride = TEXTURE_WIDTH;
     bool has_glyphs = false;
     for (int y = 0; y < TITLE_TEXTURE_HEIGHT && !has_glyphs; y++) {
         for (int x = 0; x < TEXTURE_WIDTH; x++) {
@@ -367,9 +454,11 @@ static bool update_title_texture(UpVideoRenderer *renderer, const char *title,
             }
         }
     }
-    if (success && !has_glyphs) {
-        set_error(renderer, "Pango produced an empty title texture");
-        success = false;
+    if (!has_glyphs) {
+        // A filename consisting of invisible Unicode characters is still a
+        // valid media path. Show a replacement glyph instead of failing playback.
+        draw_glyph(pixels, TEXTURE_WIDTH, 0,
+                   (TITLE_TEXTURE_HEIGHT - GLYPH_HEIGHT) / 2, '?');
     }
     if (success && (!renderer->title_texture ||
                     renderer->title_height != TITLE_TEXTURE_HEIGHT)) {
@@ -405,11 +494,6 @@ static bool update_title_texture(UpVideoRenderer *renderer, const char *title,
                  safe_title);
     }
 
-    pango_font_description_free(font);
-    g_object_unref(layout);
-    cairo_font_options_destroy(font_options);
-    cairo_destroy(context);
-    cairo_surface_destroy(surface);
     return success;
 }
 
@@ -496,8 +580,7 @@ static bool update_text_subtitle_texture(UpVideoRenderer *renderer,
 {
     if (!text || !*text || layout_width <= 0)
         return true;
-    if (renderer->text_subtitle_texture &&
-        renderer->text_subtitle_serial == serial &&
+    if (renderer->text_subtitle_serial == serial &&
         renderer->text_subtitle_layout_width == layout_width)
         return true;
 
@@ -557,13 +640,11 @@ static bool update_text_subtitle_texture(UpVideoRenderer *renderer,
             }
         }
     }
-    if (!has_glyphs) {
-        set_error(renderer, "Pango produced an empty subtitle glyph mask");
-        success = false;
-    }
-    if (!renderer->text_subtitle_texture ||
+    // Invisible cues are valid. Keep the old allocation for reuse, but hide
+    // both its glyphs and background until a visible cue replaces it.
+    if (has_glyphs && (!renderer->text_subtitle_texture ||
         renderer->text_subtitle_width != text_width ||
-        renderer->text_subtitle_height != text_height) {
+        renderer->text_subtitle_height != text_height)) {
         pl_tex_destroy(renderer->vulkan->gpu,
                        &renderer->text_subtitle_texture);
         pl_fmt format = pl_find_fmt(renderer->vulkan->gpu, PL_FMT_UNORM, 1,
@@ -579,7 +660,7 @@ static bool update_text_subtitle_texture(UpVideoRenderer *renderer,
         renderer->text_subtitle_width = text_width;
         renderer->text_subtitle_height = text_height;
     }
-    if (success && !pl_tex_upload(
+    if (success && has_glyphs && !pl_tex_upload(
             renderer->vulkan->gpu,
             pl_tex_transfer_params(
                 .tex = renderer->text_subtitle_texture,
@@ -591,6 +672,7 @@ static bool update_text_subtitle_texture(UpVideoRenderer *renderer,
     if (success) {
         renderer->text_subtitle_serial = serial;
         renderer->text_subtitle_layout_width = layout_width;
+        renderer->text_subtitle_visible = has_glyphs;
     }
 
     g_object_unref(render_layout);
@@ -927,6 +1009,18 @@ void *up_video_renderer_device(UpVideoRenderer *renderer)
     return renderer->hw_device;
 }
 
+static pl_rect2df fitted_video_rect(const struct pl_frame *image,
+                                     AVRational sample_aspect, int width, int height)
+{
+    pl_rect2df rect = { .x1 = width, .y1 = height };
+    double aspect = pl_rect2df_aspect(&image->crop);
+    if (sample_aspect.num > 0 && sample_aspect.den > 0)
+        aspect *= (double) sample_aspect.num / sample_aspect.den;
+    if (isfinite(aspect) && aspect > 0.0)
+        pl_rect2df_aspect_set_rot(&rect, aspect, image->rotation, 0.0f);
+    return rect;
+}
+
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               int width, int height, float top_bar_alpha,
                               const char *title, const char *info,
@@ -994,28 +1088,9 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     }
 
     pl_frame_from_swapchain(&target, &swap_frame);
-    double sample_aspect = 1.0;
-    if (frame->sample_aspect_ratio.num > 0 &&
-        frame->sample_aspect_ratio.den > 0) {
-        sample_aspect = (double) frame->sample_aspect_ratio.num /
-                        frame->sample_aspect_ratio.den;
-    }
-    double video_aspect = frame->height > 0
-        ? ((double) frame->width * sample_aspect) / frame->height
-        : (double) width / height;
-    double window_aspect = (double) width / height;
-    float x0 = 0.0f, y0 = 0.0f, x1 = (float) width, y1 = (float) height;
-    if (video_aspect > window_aspect) {
-        float fitted_height = (float) (width / video_aspect);
-        y0 = ((float) height - fitted_height) * 0.5f;
-        y1 = y0 + fitted_height;
-    } else {
-        float fitted_width = (float) (height * video_aspect);
-        x0 = ((float) width - fitted_width) * 0.5f;
-        x1 = x0 + fitted_width;
-    }
-    target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = y0,
-                                        .x1 = x1, .y1 = y1 };
+    target.crop = fitted_video_rect(&image, frame->sample_aspect_ratio, width, height);
+    const float x0 = target.crop.x0, y0 = target.crop.y0;
+    const float x1 = target.crop.x1, y1 = target.crop.y1;
 
     if (subtitle_text && *subtitle_text) {
         int layout_width = (int) (x1 - x0) - 80;
@@ -1113,12 +1188,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
 
     info_alpha = fminf(fmaxf(info_alpha, 0.0f), 1.0f);
     if (info && info_width > 0 && info_alpha > 0.001f) {
-        const float info_y = fmaxf(height - INFO_TEXT_INSET - 14.0f, 0.0f);
+        const float info_y = fmaxf(height - INFO_TEXT_INSET - GLYPH_HEIGHT, 0.0f);
 
         parts[num_overlays] = (struct pl_overlay_part) {
-            .src = {0, 16, info_width, 30},
+            .src = {0, INFO_GLYPH_Y, info_width, INFO_GLYPH_Y + GLYPH_HEIGHT},
             .dst = {INFO_TEXT_INSET, info_y,
-                    INFO_TEXT_INSET + info_width, info_y + 14},
+                    INFO_TEXT_INSET + info_width, info_y + GLYPH_HEIGHT},
             .color = {1.0f, 1.0f, 1.0f, info_alpha},
         };
         overlays[num_overlays] = (struct pl_overlay) {
@@ -1136,15 +1211,15 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     position_alpha = fminf(fmaxf(position_alpha, 0.0f), 1.0f);
     if (position && position_width > 0 && position_alpha > 0.001f) {
         const float position_y = fmaxf(
-            height - INFO_TEXT_INSET - 14.0f, 0.0f);
+            height - INFO_TEXT_INSET - GLYPH_HEIGHT, 0.0f);
         const float position_x = fmaxf(
             width - INFO_TEXT_INSET - position_width, INFO_TEXT_INSET);
 
         parts[num_overlays] = (struct pl_overlay_part) {
             .src = {0, POSITION_GLYPH_Y,
-                    position_width, POSITION_GLYPH_Y + 14},
+                    position_width, POSITION_GLYPH_Y + GLYPH_HEIGHT},
             .dst = {position_x, position_y,
-                    position_x + position_width, position_y + 14},
+                    position_x + position_width, position_y + GLYPH_HEIGHT},
             .color = {1.0f, 1.0f, 1.0f, position_alpha},
         };
         overlays[num_overlays] = (struct pl_overlay) {
@@ -1219,7 +1294,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         num_overlays++;
     }
 
-    if (subtitle_text && *subtitle_text && renderer->text_subtitle_texture) {
+    if (subtitle_text && *subtitle_text && renderer->text_subtitle_texture &&
+        renderer->text_subtitle_visible) {
         const float text_width = renderer->text_subtitle_width;
         const float text_height = renderer->text_subtitle_height;
         const float bottom = fmaxf(y0 + text_height + 8.0f, y1 - 70.0f);

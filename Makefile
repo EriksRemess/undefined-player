@@ -8,17 +8,26 @@ ARCH ?= $(shell uname -m)
 TARBALL_NAME := $(BINARY)-$(VERSION)-linux-$(ARCH)
 TARBALL_BINARY ?= target/release/$(BINARY)
 
-.PHONY: all build check deb tarball install uninstall clean
+.PHONY: all build check check-native deb tarball install uninstall clean
 
 all: build
 
 build:
 	$(CARGO) build --release
 
-check:
+check: check-native
 	$(CARGO) test
 	$(CARGO) clippy --all-targets -- -D warnings
 	desktop-file-validate $(DESKTOP_FILE)
+
+check-native:
+	mkdir -p target/tests
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
+		$(shell pkg-config --cflags libplacebo sdl3 pangocairo) \
+		$(if $(FFMPEG_DIR),-I"$(FFMPEG_DIR)",$(shell pkg-config --cflags libavutil)) \
+		native/video_renderer_tests.c -o target/tests/video-renderer \
+		$(shell pkg-config --libs libplacebo sdl3 pangocairo) -lm -Wl,--gc-sections
+	target/tests/video-renderer
 
 deb:
 	dpkg-buildpackage --build=binary --no-sign

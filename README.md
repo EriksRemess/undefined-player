@@ -80,7 +80,8 @@ The bottom timeline appears with the controls; click it or drag its handle to
 seek. Timeline, keyboard, and MPRIS seeking target the requested position;
 FFmpeg resolves its nearest usable preceding keyframe. Decoding continues in
 the background so the window remains responsive, and audio and video resume
-together once both are ready.
+together once buffered data is ready. Audio tracks that begin later stay silent
+until their starting timestamp.
 
 ## Scope
 

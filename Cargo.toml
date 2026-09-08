@@ -2,7 +2,7 @@
 name = "undefined-player"
 version = "0.1.6"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.93.1"
 build = "build.rs"
 authors = ["Ēriks Remess <eriks@remess.lv>"]
 description = "Minimal Vulkan-accelerated Wayland video player"
