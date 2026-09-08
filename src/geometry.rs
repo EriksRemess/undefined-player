@@ -1,9 +1,45 @@
 //! One definition of the player controls for rendering, SDL resize hit tests,
-//! Wayland window dragging, and the playback event handler.
+//! Wayland window dragging, and the playback event handler. Also owns the
+//! integer-scaling policy for small video frames.
 pub(crate) const TOP_BAR_HEIGHT: f32 = 42.0;
 pub(crate) const SCRUBBER_HIT_HEIGHT: f32 = 42.0;
 pub(crate) const SCRUBBER_MARGIN: f32 = 14.0;
 const RESIZE_BORDER: f64 = 10.0;
+
+// Return zero to retain normal aspect fitting. Limit automatic integer scaling
+// to square-pixel SD sources, including portrait video, and never crop to fit.
+#[unsafe(no_mangle)]
+pub extern "C" fn up_video_integer_scale(
+    source_width: f64,
+    source_height: f64,
+    sar_num: i32,
+    sar_den: i32,
+    rotation: u32,
+    width: i32,
+    height: i32,
+) -> u32 {
+    if !source_width.is_finite()
+        || !source_height.is_finite()
+        || source_width < 1.0
+        || source_height < 1.0
+        || source_width.fract() != 0.0
+        || source_height.fract() != 0.0
+        || source_width.max(source_height) > 640.0
+        || source_width.min(source_height) > 480.0
+        || sar_num <= 0
+        || sar_num != sar_den
+        || width <= 0
+        || height <= 0
+    {
+        return 0;
+    }
+    let (sw, sh) = if rotation.is_multiple_of(2) {
+        (source_width as u32, source_height as u32)
+    } else {
+        (source_height as u32, source_width as u32)
+    };
+    (width as u32 / sw).min(height as u32 / sh)
+}
 
 // Keep these discriminants in sync with native/input_geometry.h.
 #[repr(u32)]
@@ -110,6 +146,53 @@ pub extern "C" fn up_input_hit_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_videos_use_the_largest_integer_scale_that_fits() {
+        for (width, height, expected) in [
+            (1280, 720, 2),
+            (1920, 1080, 4),
+            (3840, 2160, 8),
+            (497, 497, 2),
+            (495, 495, 1),
+            (248, 248, 1),
+            (247, 248, 0),
+        ] {
+            assert_eq!(
+                up_video_integer_scale(248.0, 248.0, 1, 1, 0, width, height),
+                expected
+            );
+        }
+        assert_eq!(up_video_integer_scale(640.0, 480.0, 1, 1, 0, 1920, 1080), 2);
+        assert_eq!(up_video_integer_scale(480.0, 640.0, 1, 1, 0, 1920, 1080), 1);
+        for rotation in 0..4 {
+            let expected = if rotation % 2 == 0 { 4 } else { 2 };
+            assert_eq!(
+                up_video_integer_scale(320.0, 180.0, 1, 1, rotation, 1280, 720),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn other_sources_retain_normal_scaling() {
+        for (sw, sh, num, den) in [
+            (1280.0, 720.0, 1, 1),
+            (720.0, 480.0, 1, 1),
+            (640.0, 481.0, 1, 1),
+            (320.0, 240.0, 4, 3),
+            (248.0, 248.0, 0, 1),
+            (248.0, 248.0, 1, 0),
+            (248.5, 248.0, 1, 1),
+            (0.0, 248.0, 1, 1),
+            (f64::NAN, 248.0, 1, 1),
+            (248.0, f64::INFINITY, 1, 1),
+        ] {
+            assert_eq!(up_video_integer_scale(sw, sh, num, den, 0, 1920, 1080), 0);
+        }
+        assert_eq!(up_video_integer_scale(248.0, 248.0, 1, 1, 0, 0, 720), 0);
+        assert_eq!(up_video_integer_scale(248.0, 248.0, 1, 1, 0, 1280, -1), 0);
+    }
 
     #[test]
     fn native_and_rust_hit_regions_agree_at_all_scales() {

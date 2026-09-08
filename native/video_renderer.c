@@ -557,8 +557,23 @@ void *up_video_renderer_device(UpVideoRenderer *renderer)
 }
 
 static pl_rect2df fitted_video_rect(const struct pl_frame *image,
-                                     AVRational sample_aspect, int width, int height)
+                                     AVRational sample_aspect, int width, int height,
+                                     uint32_t integer_scale)
 {
+    if (integer_scale) {
+        double sw = fabs(image->crop.x1 - image->crop.x0);
+        double sh = fabs(image->crop.y1 - image->crop.y0);
+        if (image->rotation % 2) {
+            double temporary = sw;
+            sw = sh;
+            sh = temporary;
+        }
+        const double dw = sw * integer_scale, dh = sh * integer_scale;
+        // Whole-pixel origins avoid sampling between pixels in odd-sized windows.
+        const double x = floor((width - dw) * 0.5);
+        const double y = floor((height - dh) * 0.5);
+        return (pl_rect2df) {x, y, x + dw, y + dh};
+    }
     pl_rect2df rect = { .x1 = width, .y1 = height };
     double aspect = pl_rect2df_aspect(&image->crop);
     if (sample_aspect.num > 0 && sample_aspect.den > 0)
@@ -644,7 +659,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     }
 
     pl_frame_from_swapchain(&target, &swap_frame);
-    target.crop = fitted_video_rect(&image, frame->sample_aspect_ratio, width, height);
+    const uint32_t integer_scale = up_video_integer_scale(
+        fabs(image.crop.x1 - image.crop.x0), fabs(image.crop.y1 - image.crop.y0),
+        frame->sample_aspect_ratio.num, frame->sample_aspect_ratio.den,
+        image.rotation, width, height);
+    target.crop = fitted_video_rect(&image, frame->sample_aspect_ratio, width, height,
+                                    integer_scale);
     const float x0 = target.crop.x0, y0 = target.crop.y0;
     const float x1 = target.crop.x1, y1 = target.crop.y1;
 
@@ -730,7 +750,9 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     // Spend the available GPU headroom on a sharper reconstruction for small
     // sources. Hardware-decoded Vulkan frames stay on-device throughout
     // scaling; software-decoded frames are uploaded here by libplacebo.
-    if (frame->width <= 1280 && frame->height <= 720)
+    if (integer_scale)
+        params.upscaler = &pl_filter_nearest;
+    else if (frame->width <= 1280 && frame->height <= 720)
         params.upscaler = &pl_filter_ewa_lanczossharp;
     // Dynamic HDR peak detection scans the full frame and eventually contends
     // with 8K60 AV1 decoding on this GPU. Keep it for lower resolutions, but

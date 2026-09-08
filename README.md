@@ -92,8 +92,11 @@ decoding fails, playback restarts with FFmpeg's software decoder and uploads
 frames for Vulkan presentation.
 HDR metadata is retained from FFmpeg through libplacebo, which supplies the
 matching colorspace hint to the Vulkan swapchain for an HDR-enabled compositor.
-Sources at 720p and below automatically use libplacebo's GPU EWA Lanczos-sharp
-upscaler; larger sources use the normal Lanczos path.
+Small square-pixel videos (up to 640×480, or 480×640 in portrait) use the largest
+integer scale that fits, with nearest-neighbour filtering and centered black
+borders. If the video needs shrinking, normal aspect-preserving scaling applies.
+Other sources at 720p and below use libplacebo's GPU EWA Lanczos-sharp upscaler;
+larger sources use the normal Lanczos path.
 
 The current platform scope is:
 

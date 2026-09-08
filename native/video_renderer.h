@@ -5,6 +5,11 @@
 
 typedef struct UpVideoRenderer UpVideoRenderer;
 
+// Rust chooses when small sources use integer scaling; zero means normal fit.
+uint32_t up_video_integer_scale(double source_width, double source_height,
+                                int sar_num, int sar_den, uint32_t rotation,
+                                int width, int height);
+
 // Borrowed A8 images and player-owned geometry, valid for one display call.
 typedef struct UpOverlayImage {
     const uint8_t *pixels;
