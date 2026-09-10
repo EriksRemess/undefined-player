@@ -52,6 +52,86 @@ static void integer_scaled_video(void)
     }
 }
 
+static void deinterlacing(void)
+{
+    const struct pl_fmt_t format = {.num_components = 1};
+    struct pl_tex_t texture = {.params = {.w = 720, .h = 480, .format = &format}};
+    struct pl_frame image = {
+        .num_planes = 1,
+        .planes = {{.texture = &texture, .components = 1}},
+    };
+    struct pl_frame prev = image, next = image;
+    struct pl_render_params params = pl_render_default_params;
+    for (int field = 1; field <= 2; field++) {
+        configure_deinterlace(&image, &params, field);
+        assert(image.field == (field == 1 ? PL_FIELD_TOP : PL_FIELD_BOTTOM));
+        assert(image.first_field == image.field);
+        assert(params.deinterlace_params->algo == PL_DEINTERLACE_BOB);
+    }
+    image.prev = &prev;
+    image.next = &next;
+    configure_deinterlace(&image, &params, 1);
+    assert(params.deinterlace_params->algo == PL_DEINTERLACE_YADIF);
+    configure_deinterlace(&image, &params, 0);
+    assert(image.field == PL_FIELD_NONE && !params.deinterlace_params);
+    AVFrame frame = {.width = 720, .height = 480, .format = AV_PIX_FMT_YUV420P};
+    AVFrame reference = frame;
+    assert(compatible_reference(&frame, &reference));
+    reference.width = 640;
+    assert(!compatible_reference(&frame, &reference));
+    reference = frame;
+    reference.format = AV_PIX_FMT_YUV420P10LE;
+    assert(!compatible_reference(&frame, &reference));
+    assert(!compatible_reference(&frame, NULL));
+}
+
+static void deinterlacing_reference_layout_changes(void)
+{
+    const struct pl_fmt_t format = {.num_components = 1};
+    const struct pl_fmt_t other_format = {.num_components = 2};
+    struct pl_tex_t luma = {.params = {.w = 720, .h = 480, .format = &format}};
+    struct pl_tex_t chroma = {.params = {.w = 360, .h = 240, .format = &format}};
+    const struct pl_frame source = {
+        .num_planes = 3,
+        .planes = {
+            {.texture = &luma, .components = 1, .component_mapping = {0}},
+            {.texture = &chroma, .components = 1, .component_mapping = {1}},
+            {.texture = &chroma, .components = 1, .component_mapping = {2}},
+        },
+    };
+    // Exercise either neighbor. Matching visible dimensions are insufficient
+    // when a hardware decoder changes allocation size or plane layout.
+    for (int side = 0; side < 2; side++) {
+        for (int change = 0; change < 9; change++) {
+            struct pl_frame bad = source, image = source;
+            struct pl_tex_t changed = chroma;
+            bad.planes[1].texture = &changed;
+            switch (change) {
+            case 0: changed.params.w += 16; break;
+            case 1: changed.params.h += 16; break;
+            case 2: changed.params.format = &other_format; break;
+            case 3: bad.num_planes = 2; break;
+            case 4: bad.planes[1].component_mapping[0] = 2; break;
+            case 5: bad.repr.bits.bit_shift = 6; break;
+            case 6: bad.planes[1].flipped = true; break;
+            case 7: bad.planes[1].shift_x = 0.5f; break;
+            case 8: bad.planes[1].texture = NULL; break;
+            }
+            image.prev = side == 0 ? &bad : &source;
+            image.next = side == 1 ? &bad : &source;
+            struct pl_render_params params = pl_render_default_params;
+            configure_deinterlace(&image, &params, 1);
+            assert(params.deinterlace_params->algo == PL_DEINTERLACE_BOB);
+            assert(side == 0 ? !image.prev && image.next == &source :
+                              !image.next && image.prev == &source);
+            // A subsequent compatible pair must restore temporal filtering.
+            image.prev = image.next = &source;
+            configure_deinterlace(&image, &params, 1);
+            assert(params.deinterlace_params->algo == PL_DEINTERLACE_YADIF);
+        }
+    }
+}
+
 int main(void)
 {
     struct pl_frame cropped = {.crop = {.x1 = 720, .y1 = 480}};
@@ -66,9 +146,11 @@ int main(void)
     cropped.crop = (pl_rect2df) {.x1 = 1920,.y1 = 1080};
     apply_video_crop(&cropped,1920,1080,&crop);
     assert(cropped.crop.y0 == 0 && cropped.crop.y1 == 1080);
+    deinterlacing();
+    deinterlacing_reference_layout_changes();
     invisible_subtitles();
     rotated_video();
     integer_scaled_video();
-    puts("Native renderer: invisible subtitles, rotation, and integer scaling passed");
+    puts("Native renderer: invisible subtitles, rotation, integer scaling, and deinterlacing passed");
     return 0;
 }

@@ -54,6 +54,10 @@ fn command_line_rejects_missing_files_and_unknown_options() {
 #[test]
 fn requested_keys_map_to_requested_actions() {
     assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_D),
+        Some(Action::CycleDeinterlace)
+    );
+    assert_eq!(
         action_for_key(ffi::UpKey_UP_KEY_C),
         Some(Action::ToggleCrop)
     );

@@ -43,6 +43,21 @@ struct UpAvSubtitle {
 
 static _Thread_local char decoder_error[256];
 
+int up_av_frame_field(const UpAvFrame *pointer)
+{
+    const AVFrame *frame = (const AVFrame *) pointer;
+    if (!(frame->flags & AV_FRAME_FLAG_INTERLACED))
+        return 0;
+    return frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST ? 1 : 2;
+}
+
+void up_av_frame_dimensions(const UpAvFrame *pointer, int *width, int *height)
+{
+    const AVFrame *frame = (const AVFrame *) pointer;
+    *width = frame->width;
+    *height = frame->height;
+}
+
 UpAvFrame *up_av_frame_clone(const UpAvFrame *frame)
 {
     return (UpAvFrame *) av_frame_clone((const AVFrame *) frame);

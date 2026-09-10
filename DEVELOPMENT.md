@@ -91,6 +91,17 @@ The FFmpeg adapter exposes
 8–16-bit luma planes and downloads hardware frames only for these samples; the
 worker finishes before the renderer destroys its Vulkan device.
 
+`src/deinterlace.rs` owns Auto/On/Off selection and temporal adjacency checks.
+Playback retains one preceding frame and borrows the next queued frame for GPU
+YADIF filtering. Every seek clears the previous frame; timestamp gaps and changes
+in dimensions or pixel format exclude references. Missing references use bob
+filtering. Mapped references must also match the actual GPU plane dimensions,
+formats, component layout, and sample encoding; incompatible references use the
+same fallback. The renderer maps references into separate texture sets, unmaps them
+after each render, and reports deinterlacing failures. Presentation keeps the
+source frame cadence, rendering its first field. Progressive frames bypass the
+filter in Auto mode; On defaults unmarked frames to top-field-first.
+
 `native/text_raster.c` adapts GLib normalization/decomposition and Pango/Cairo
 shaping into natural-size masks. Rust owns their lifetime through a wrapper and fits the
 masks into the overlay cells. `native/video_renderer.c` handles FFmpeg/Vulkan

@@ -31,6 +31,7 @@ struct UpVideoRenderer {
     pl_swapchain swapchain;
     pl_renderer renderer;
     pl_tex textures[4];
+    pl_tex reference_textures[2][4];
     pl_tex solid_texture;
     pl_tex overlay_textures[2];
     uint64_t overlay_serials[2];
@@ -598,7 +599,57 @@ static void apply_video_crop(struct pl_frame *image, int width, int height,
         image->crop = rect;
 }
 
+static bool compatible_reference(const AVFrame *frame, const AVFrame *reference)
+{
+    return reference && frame->width == reference->width &&
+           frame->height == reference->height && frame->format == reference->format;
+}
+
+static bool compatible_mapped_reference(const struct pl_frame *image,
+                                        const struct pl_frame *reference)
+{
+    // Vulkan's AVFrame format and visible dimensions do not describe its
+    // allocation size or underlying plane format. Check the mapped textures
+    // before passing references to libplacebo, including for the bob fallback.
+    if (!reference || image->num_planes <= 0 ||
+        image->num_planes != reference->num_planes ||
+        !pl_bit_encoding_equal(&image->repr.bits, &reference->repr.bits))
+        return false;
+    for (int i = 0; i < image->num_planes; i++) {
+        const struct pl_plane *plane = &image->planes[i];
+        const struct pl_plane *ref = &reference->planes[i];
+        if (!plane->texture || !ref->texture ||
+            plane->texture->params.w != ref->texture->params.w ||
+            plane->texture->params.h != ref->texture->params.h ||
+            plane->texture->params.format != ref->texture->params.format ||
+            plane->components != ref->components || plane->flipped != ref->flipped ||
+            plane->shift_x != ref->shift_x || plane->shift_y != ref->shift_y)
+            return false;
+        for (int c = 0; c < plane->components; c++) {
+            if (plane->component_mapping[c] != ref->component_mapping[c])
+                return false;
+        }
+    }
+    return true;
+}
+
+static void configure_deinterlace(struct pl_frame *image,
+                                  struct pl_render_params *params, int field)
+{
+    static const struct pl_deinterlace_params temporal = {.algo = PL_DEINTERLACE_YADIF};
+    static const struct pl_deinterlace_params spatial = {.algo = PL_DEINTERLACE_BOB};
+    image->field = image->first_field = field == 1 ? PL_FIELD_TOP :
+                                       field == 2 ? PL_FIELD_BOTTOM : PL_FIELD_NONE;
+    if (image->field == PL_FIELD_NONE || !compatible_mapped_reference(image, image->prev))
+        image->prev = NULL;
+    if (image->field == PL_FIELD_NONE || !compatible_mapped_reference(image, image->next))
+        image->next = NULL;
+    params->deinterlace_params = image->field == PL_FIELD_NONE ? NULL :
+                                image->prev && image->next ? &temporal : &spatial;
+}
+
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
+                              void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
                               const UpVideoCrop *crop,
                               const char *subtitle_text,
@@ -609,6 +660,9 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     AVFrame *frame = frame_pointer;
     struct pl_swapchain_frame swap_frame = {0};
     struct pl_frame image = {0};
+    struct pl_frame references[2] = {0};
+    AVFrame *reference_frames[2] = {previous_pointer, next_pointer};
+    bool mapped_references[2] = {false};
     struct pl_frame target = {0};
     struct pl_render_params params = pl_render_default_params;
     struct pl_color_space hint = {0};
@@ -645,6 +699,24 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         return -1;
     }
 
+    // Each reference has its own upload textures: mapping a software frame
+    // must never overwrite the current frame or the other temporal reference.
+    if (field) {
+        for (int i = 0; i < 2; i++) {
+            if (!compatible_reference(frame, reference_frames[i]))
+                continue;
+            if (!pl_map_avframe_ex(renderer->vulkan->gpu, &references[i],
+                                   pl_avframe_params(.frame = reference_frames[i],
+                                       .tex = renderer->reference_textures[i]))) {
+                set_error(renderer, "libplacebo could not map a deinterlacing reference");
+                goto out;
+            }
+            mapped_references[i] = true;
+        }
+        image.prev = mapped_references[0] ? &references[0] : NULL;
+        image.next = mapped_references[1] ? &references[1] : NULL;
+    }
+    configure_deinterlace(&image, &params, field);
     apply_video_crop(&image, frame->width, frame->height, crop);
     if (subtitle_pixels && subtitle_width > 0 && subtitle_height > 0) {
         if (!update_subtitle_texture(renderer, subtitle_pixels, subtitle_width,
@@ -782,6 +854,10 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     }
     struct pl_render_errors render_errors =
         pl_renderer_get_errors(renderer->renderer);
+    if (render_errors.errors & PL_RENDER_ERR_DEINTERLACING) {
+        set_error(renderer, "libplacebo deinterlacing failed");
+        goto out;
+    }
     if (render_errors.errors & (PL_RENDER_ERR_BLENDING | PL_RENDER_ERR_OVERLAY)) {
         snprintf(renderer->error, sizeof(renderer->error),
                  "libplacebo overlay rendering failed (errors=0x%x)",
@@ -796,6 +872,10 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     ret = 0;
 
 out:
+    for (int i = 0; i < 2; i++) {
+        if (mapped_references[i])
+            pl_unmap_avframe(renderer->vulkan->gpu, &references[i]);
+    }
     pl_unmap_avframe(renderer->vulkan->gpu, &image);
     return ret;
 }
@@ -822,6 +902,10 @@ void up_video_renderer_destroy(UpVideoRenderer *renderer)
     if (renderer->vulkan) {
         for (size_t i = 0; i < 4; i++)
             pl_tex_destroy(renderer->vulkan->gpu, &renderer->textures[i]);
+        for (size_t r = 0; r < 2; r++) {
+            for (size_t i = 0; i < 4; i++)
+                pl_tex_destroy(renderer->vulkan->gpu, &renderer->reference_textures[r][i]);
+        }
         pl_tex_destroy(renderer->vulkan->gpu, &renderer->solid_texture);
         for (size_t i = 0; i < 2; i++)
             pl_tex_destroy(renderer->vulkan->gpu, &renderer->overlay_textures[i]);

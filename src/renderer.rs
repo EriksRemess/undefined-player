@@ -9,7 +9,14 @@ pub(crate) struct Renderer<'window> {
     context: *mut ffi::UpVideoRenderer,
     overlays: overlay::Overlays,
     autocrop: crate::autocrop::AutoCrop,
+    deinterlace: crate::deinterlace::Mode,
     _window: &'window Window,
+}
+
+pub(crate) struct VideoFrames<'a> {
+    pub(crate) current: &'a VideoFrame,
+    pub(crate) previous: Option<&'a VideoFrame>,
+    pub(crate) next: Option<&'a VideoFrame>,
 }
 
 pub(crate) struct RendererOverlays<'a> {
@@ -18,6 +25,31 @@ pub(crate) struct RendererOverlays<'a> {
     pub(crate) position: Option<(&'a CStr, f32)>,
     pub(crate) scrubber: Option<(f32, f32)>,
     pub(crate) subtitle: Option<&'a SubtitleCue>,
+}
+
+fn processing_details(details: &str, deinterlace: &str, crop: Option<&ffi::UpVideoCrop>) -> String {
+    let mut text = String::new();
+    for line in details.lines() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+        if line.starts_with("RESOLUTION:")
+            && let Some(crop) = crop
+            && (crop.right - crop.left < crop.width || crop.bottom - crop.top < crop.height)
+        {
+            text.push_str(&format!(
+                " ({}x{} cropped)",
+                crop.right - crop.left,
+                crop.bottom - crop.top
+            ));
+        }
+        if line.starts_with("DECODE:") {
+            text.push_str("\nDEINTERLACE: ");
+            text.push_str(deinterlace);
+        }
+    }
+    text
 }
 
 impl<'window> Renderer<'window> {
@@ -37,12 +69,17 @@ impl<'window> Renderer<'window> {
             context: renderer,
             overlays: overlay::Overlays::default(),
             autocrop: crate::autocrop::AutoCrop::default(),
+            deinterlace: crate::deinterlace::Mode::default(),
             _window: window,
         })
     }
 
     pub(crate) unsafe fn device(&self) -> *mut c_void {
         unsafe { ffi::up_video_renderer_device(self.context) }
+    }
+
+    pub(crate) fn cycle_deinterlace(&mut self) -> &'static str {
+        self.deinterlace.cycle()
     }
 
     pub(crate) fn toggle_autocrop(&mut self) -> bool {
@@ -59,18 +96,38 @@ impl<'window> Renderer<'window> {
 
     pub(crate) fn display(
         &mut self,
-        frame: &VideoFrame,
+        frames: VideoFrames<'_>,
         width: i32,
         height: i32,
         top_bar_alpha: f32,
         title: &CStr,
         overlays: RendererOverlays<'_>,
     ) -> Result<()> {
+        let frame = frames.current;
+        let field = self.deinterlace.frame_field(frame);
+        // Use the same current-frame crop for the info panel and rendering.
+        // An asynchronous result for a previous source size must not be shown.
+        let crop = self
+            .autocrop
+            .crop()
+            .filter(|crop| (crop.width, crop.height) == frame.dimensions());
+        let previous = frames
+            .previous
+            .filter(|prev| field != 0 && crate::deinterlace::adjacent(prev, frame));
+        let next = frames
+            .next
+            .filter(|next| field != 0 && crate::deinterlace::adjacent(frame, next));
         let info = overlays
             .info
             .map_or(c"", |(text, _)| text)
             .to_string_lossy();
-        let details = overlays.details.unwrap_or(c"").to_string_lossy();
+        let details = overlays.details.map_or_else(String::new, |details| {
+            processing_details(
+                &details.to_string_lossy(),
+                self.deinterlace.status(field != 0),
+                crop.as_ref(),
+            )
+        });
         let position = overlays
             .position
             .map_or(c"", |(text, _)| text)
@@ -117,11 +174,13 @@ impl<'window> Renderer<'window> {
                 },
                 None => (ptr::null(), ptr::null(), 0, 0, 0),
             };
-        let crop = self.autocrop.crop();
         if unsafe {
             ffi::up_video_renderer_display(
                 self.context,
                 frame.as_ptr().cast(),
+                previous.map_or(ptr::null_mut(), |frame| frame.as_ptr().cast()),
+                next.map_or(ptr::null_mut(), |frame| frame.as_ptr().cast()),
+                field,
                 width,
                 height,
                 &overlay,

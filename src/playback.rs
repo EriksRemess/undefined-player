@@ -6,7 +6,7 @@ use crate::presentation::timeline_text;
 use crate::presentation::{
     PositionNotice, PresentationStats, TopBar, next_track, subtitle_status_text, track_status_text,
 };
-use crate::renderer::{Renderer, RendererOverlays};
+use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
 use crate::subtitles::SubtitleCue;
 use crate::window::{Action, Sdl, WaylandInput, Window, action_for_key};
 use crate::worker::DecodeWorker;
@@ -148,7 +148,11 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     renderer.resize(width, height)?;
     if let Some(first_frame) = media.video_queue.front() {
         renderer.display(
-            first_frame,
+            VideoFrames {
+                current: first_frame,
+                previous: None,
+                next: media.video_queue.get(1),
+            },
             width,
             height,
             1.0,
@@ -178,6 +182,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let decoder = DecodeWorker::start(media, path, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
+    let mut previous_video = None;
     let mut video_queue = VecDeque::new();
     let mut subtitle_queue = VecDeque::new();
     let mut subtitle_queues = (0..subtitle_track_count)
@@ -285,6 +290,12 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         continue;
                     }
                     match action_for_key(event.key) {
+                        Some(Action::CycleDeinterlace) => {
+                            let status = renderer.cycle_deinterlace();
+                            eprintln!("{status}");
+                            position_notice.show_text(CString::new(status).unwrap());
+                            redraw = true;
+                        }
                         Some(Action::ToggleCrop) => {
                             let enabled = renderer.toggle_autocrop();
                             position_notice.show_text(
@@ -301,6 +312,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         Some(Action::SeekBackward) => {
                             let mut media = decoder.lock()?;
                             renderer.reset_autocrop();
+                            previous_video = None;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -328,6 +340,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         Some(Action::SeekForward) => {
                             let mut media = decoder.lock()?;
                             renderer.reset_autocrop();
+                            previous_video = None;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -372,6 +385,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             let requested_target = clock.now();
                             let mut media = decoder.lock()?;
                             renderer.reset_autocrop();
+                            previous_video = None;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -464,6 +478,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     MprisCommand::Seek(offset_us) => {
                         let mut media = decoder.lock()?;
                         renderer.reset_autocrop();
+                        previous_video = None;
                         decoder.clear_frames(&mut video_queue, &mut current_video);
                         decoder.clear_subtitles(
                             &mut subtitle_queue,
@@ -500,6 +515,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         if let (Some(position), Some(duration)) = (pending_scrub_target.take(), media_duration) {
             let mut media = decoder.lock()?;
             renderer.reset_autocrop();
+            previous_video = None;
             decoder.clear_frames(&mut video_queue, &mut current_video);
             decoder.clear_subtitles(
                 &mut subtitle_queue,
@@ -608,7 +624,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 .front()
                 .is_some_and(|frame| frame.frame.pts <= playback_time)
             {
-                current_video = video_queue.pop_front();
+                previous_video = std::mem::replace(&mut current_video, video_queue.pop_front());
                 due_frames = 1;
                 redraw = true;
 
@@ -622,7 +638,8 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         .front()
                         .is_some_and(|frame| frame.frame.pts <= playback_time)
                     {
-                        current_video = video_queue.pop_front();
+                        previous_video =
+                            std::mem::replace(&mut current_video, video_queue.pop_front());
                         due_frames += 1;
                     }
                 }
@@ -634,7 +651,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     .front()
                     .is_some_and(|frame| frame.frame.pts <= playback_time + VIDEO_PRESENTATION_LEAD)
             {
-                current_video = video_queue.pop_front();
+                previous_video = std::mem::replace(&mut current_video, video_queue.pop_front());
                 due_frames = 1;
                 redraw = true;
             }
@@ -644,7 +661,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             }
         }
         if current_video.is_none() && !video_queue.is_empty() {
-            current_video = video_queue.pop_front();
+            previous_video = std::mem::replace(&mut current_video, video_queue.pop_front());
             redraw = true;
             new_frame_pending = true;
         }
@@ -685,7 +702,11 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             });
             let display_started = Instant::now();
             renderer.display(
-                frame,
+                VideoFrames {
+                    current: frame,
+                    previous: previous_video.as_ref().map(|queued| &queued.frame),
+                    next: video_queue.front().map(|queued| &queued.frame),
+                },
                 width,
                 height,
                 top_bar.alpha,
@@ -738,7 +759,8 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             && media.eof
             && media.video_queue.is_empty()
             && video_queue.is_empty()
-            && decoder.pending_frames() == usize::from(current_video.is_some())
+            && decoder.pending_frames()
+                == usize::from(current_video.is_some()) + usize::from(previous_video.is_some())
             && unsafe { media.audio_empty() }
             && current_video.as_ref().is_none_or(|frame| {
                 playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)

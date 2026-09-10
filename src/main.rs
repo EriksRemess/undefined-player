@@ -9,6 +9,7 @@ mod autocrop;
 mod cli;
 mod clock;
 mod decoder;
+mod deinterlace;
 #[allow(warnings, clippy::all)]
 mod ffi;
 mod geometry;

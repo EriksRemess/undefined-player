@@ -59,7 +59,9 @@ The player starts playing immediately. The focused video window accepts:
 
 - `F` — toggle fullscreen
 - `C` — toggle automatic cropping of encoded black borders
-- `I` — toggle video/color details, FPS / shown / dropped frames, and playback
+- `D` — cycle deinterlacing: Auto (default), On, Off
+- `I` — toggle video/color details, deinterlacing status, cropped resolution,
+  FPS / shown / dropped frames, and playback
   position
 - `A` — switch to the next audio track
 - `Left` / `Right` — seek backward or forward 10 seconds
@@ -90,6 +92,13 @@ background worker and preserves the video's pixel aspect ratio. It ignores
 black frames and very dark scenes, so allow a few visible frames for detection.
 When paused, it scans the current frame. Borders required by the window's own
 aspect ratio can remain after encoded bars are removed.
+
+Deinterlacing starts in Auto mode and follows each decoded frame's interlacing
+flag and field order. Press `D` to force it On for incorrectly flagged files,
+again to turn it Off, and again to return to Auto. On assumes top-field-first
+when the frame has no interlacing flag. Changes also apply while paused.
+Filtering runs on the GPU at the source frame rate (not doubled field rate).
+Auto uses decoder metadata; it does not scan the picture for combing.
 
 ## Scope
 

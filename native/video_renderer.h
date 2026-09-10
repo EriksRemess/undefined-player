@@ -36,6 +36,7 @@ typedef struct UpOverlayFrame {
 UpVideoRenderer *up_video_renderer_create(void *window);
 void *up_video_renderer_device(UpVideoRenderer *renderer);
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
+                              void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
                               const UpVideoCrop *crop,
                               const char *subtitle_text,

@@ -49,6 +49,10 @@ fn delayed_audio_switch_makes_progress() {
     child("delayed-audio");
 }
 #[test]
+fn decoded_frames_preserve_interlacing_and_field_order() {
+    child("interlacing");
+}
+#[test]
 fn raw_video_timestamps_survive_queue_transfers() {
     child("raw-video");
 }
@@ -137,6 +141,39 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "interlacing" => {
+            for (name, filter, flags, expected) in [
+                ("progressive", "null", "0", 0),
+                ("top", "interlace=scan=tff", "+ildct+ilme", 1),
+                ("bottom", "interlace=scan=bff", "+ildct+ilme", 2),
+            ] {
+                let path = fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc2=size=64x64:rate=50:duration=0.4",
+                        "-vf",
+                        filter,
+                        "-c:v",
+                        "mpeg2video",
+                        "-flags",
+                        flags,
+                    ],
+                    &format!("{name}.mkv"),
+                );
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                assert!(!media.video_queue.is_empty());
+                for frame in &media.video_queue {
+                    assert_eq!(
+                        unsafe { ffi::up_av_frame_field(frame.as_ptr()) },
+                        expected,
+                        "{name}"
+                    );
+                }
+            }
+        }
         "audio-gaps" => {
             for extra_gap in [0, 3600] {
                 // Shift the last two seconds of a three-second source instead

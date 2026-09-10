@@ -98,6 +98,12 @@ pub(crate) struct VideoFrame {
 }
 
 impl VideoFrame {
+    pub(crate) fn dimensions(&self) -> (i32, i32) {
+        let (mut width, mut height) = (0, 0);
+        unsafe { ffi::up_av_frame_dimensions(self.frame, &mut width, &mut height) };
+        (width, height)
+    }
+
     pub(crate) fn clone_reference(&self) -> Option<Self> {
         let frame = unsafe { ffi::up_av_frame_clone(self.frame) };
         (!frame.is_null()).then(|| unsafe { Self::from_raw(frame, self.pts, self.duration) })

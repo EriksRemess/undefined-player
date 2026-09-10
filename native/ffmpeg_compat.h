@@ -116,6 +116,9 @@ int64_t up_av_packet_pts(const UpAvPacket *packet);
 int64_t up_av_packet_duration(const UpAvPacket *packet);
 
 void up_av_frame_free(UpAvFrame **frame);
+// 0 = progressive, 1 = top field first, 2 = bottom field first.
+int up_av_frame_field(const UpAvFrame *frame);
+void up_av_frame_dimensions(const UpAvFrame *frame, int *width, int *height);
 UpAvFrame *up_av_frame_clone(const UpAvFrame *frame);
 typedef struct UpLumaView {
     UpAvFrame *frame;

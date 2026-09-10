@@ -11,6 +11,7 @@ pub(crate) enum Action {
     SeekForward,
     ToggleFullscreen,
     ToggleCrop,
+    CycleDeinterlace,
     ToggleInfo,
     TogglePause,
     ToggleSubtitles,
@@ -18,6 +19,7 @@ pub(crate) enum Action {
 
 pub(crate) fn action_for_key(key: u32) -> Option<Action> {
     match key {
+        ffi::UpKey_UP_KEY_D => Some(Action::CycleDeinterlace),
         ffi::UpKey_UP_KEY_C => Some(Action::ToggleCrop),
         ffi::UpKey_UP_KEY_A => Some(Action::CycleAudio),
         ffi::UpKey_UP_KEY_Q => Some(Action::Quit),
