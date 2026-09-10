@@ -116,6 +116,14 @@ int64_t up_av_packet_pts(const UpAvPacket *packet);
 int64_t up_av_packet_duration(const UpAvPacket *packet);
 
 void up_av_frame_free(UpAvFrame **frame);
+UpAvFrame *up_av_frame_clone(const UpAvFrame *frame);
+typedef struct UpLumaView {
+    UpAvFrame *frame;
+    const uint8_t *data;
+    int width, height, stride, step, depth, shift, big_endian, full_range;
+} UpLumaView;
+int up_av_frame_luma(const UpAvFrame *frame, UpLumaView *view);
+void up_av_frame_luma_free(UpLumaView *view);
 int up_av_frame_is_vulkan(const UpAvFrame *frame);
 int64_t up_av_frame_timestamp(const UpAvFrame *frame);
 int64_t up_av_frame_duration(const UpAvFrame *frame);

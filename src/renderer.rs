@@ -8,6 +8,7 @@ use std::ptr;
 pub(crate) struct Renderer<'window> {
     context: *mut ffi::UpVideoRenderer,
     overlays: overlay::Overlays,
+    autocrop: crate::autocrop::AutoCrop,
     _window: &'window Window,
 }
 
@@ -35,12 +36,25 @@ impl<'window> Renderer<'window> {
         Ok(Self {
             context: renderer,
             overlays: overlay::Overlays::default(),
+            autocrop: crate::autocrop::AutoCrop::default(),
             _window: window,
         })
     }
 
     pub(crate) unsafe fn device(&self) -> *mut c_void {
         unsafe { ffi::up_video_renderer_device(self.context) }
+    }
+
+    pub(crate) fn toggle_autocrop(&mut self) -> bool {
+        self.autocrop.toggle()
+    }
+
+    pub(crate) fn reset_autocrop(&mut self) {
+        self.autocrop.reset();
+    }
+
+    pub(crate) fn update_autocrop(&mut self, frame: &VideoFrame, paused: bool) -> bool {
+        self.autocrop.update(frame, paused)
     }
 
     pub(crate) fn display(
@@ -103,6 +117,7 @@ impl<'window> Renderer<'window> {
                 },
                 None => (ptr::null(), ptr::null(), 0, 0, 0),
             };
+        let crop = self.autocrop.crop();
         if unsafe {
             ffi::up_video_renderer_display(
                 self.context,
@@ -110,6 +125,7 @@ impl<'window> Renderer<'window> {
                 width,
                 height,
                 &overlay,
+                crop.as_ref().map_or(ptr::null(), |crop| crop),
                 subtitle_text,
                 subtitle_pixels,
                 subtitle_width,
@@ -141,6 +157,8 @@ impl<'window> Renderer<'window> {
 
 impl Drop for Renderer<'_> {
     fn drop(&mut self) {
+        // Finish outstanding GPU readbacks before destroying the Vulkan device.
+        self.autocrop.shutdown();
         unsafe { ffi::up_video_renderer_destroy(self.context) };
     }
 }

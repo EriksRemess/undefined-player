@@ -43,6 +43,66 @@ struct UpAvSubtitle {
 
 static _Thread_local char decoder_error[256];
 
+UpAvFrame *up_av_frame_clone(const UpAvFrame *frame)
+{
+    return (UpAvFrame *) av_frame_clone((const AVFrame *) frame);
+}
+
+// Expose the luma plane without conversion. Hardware readback is called only
+// by the opt-in crop worker; the presentation thread keeps its original frame.
+int up_av_frame_luma(const UpAvFrame *pointer, UpLumaView *view)
+{
+    const AVFrame *source = (const AVFrame *) pointer;
+    *view = (UpLumaView) {0};
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(source->format);
+    if (!desc)
+        return 0;
+    AVFrame *frame = NULL;
+    if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        frame = av_frame_alloc();
+        if (!frame || av_hwframe_transfer_data(frame, source, 0) < 0)
+            goto fail;
+        desc = av_pix_fmt_desc_get(frame->format);
+    } else {
+        frame = av_frame_clone(source);
+    }
+    if (!frame || !desc || !desc->nb_components ||
+        (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL |
+                       AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_HWACCEL)))
+        goto fail;
+    const AVComponentDescriptor *luma = &desc->comp[0];
+    if (frame->width <= 0 || frame->height <= 0 ||
+        frame->width > 32768 || frame->height > 32768 ||
+        luma->depth < 8 || luma->depth > 16 || luma->shift < 0 ||
+        luma->depth + luma->shift > 16 || luma->step < 1 || luma->step > 8 ||
+        luma->offset < 0 || !frame->data[luma->plane])
+        goto fail;
+    const int bytes = (luma->depth + luma->shift + 7) / 8;
+    const int64_t row_size = (int64_t) (frame->width - 1) * luma->step + luma->offset + bytes;
+    if (llabs((int64_t) frame->linesize[luma->plane]) < row_size)
+        goto fail;
+    *view = (UpLumaView) {
+        .frame = (UpAvFrame *) frame,
+        .data = frame->data[luma->plane] + luma->offset,
+        .width = frame->width, .height = frame->height,
+        .stride = frame->linesize[luma->plane], .step = luma->step,
+        .depth = luma->depth, .shift = luma->shift,
+        .big_endian = !!(desc->flags & AV_PIX_FMT_FLAG_BE),
+        .full_range = source->color_range == AVCOL_RANGE_JPEG,
+    };
+    return 1;
+fail:
+    av_frame_free(&frame);
+    return 0;
+}
+
+void up_av_frame_luma_free(UpLumaView *view)
+{
+    AVFrame *frame = (AVFrame *) view->frame;
+    av_frame_free(&frame);
+    *view = (UpLumaView) {0};
+}
+
 #define FORMAT(value) ((AVFormatContext *) (value))
 #define PACKET(value) ((AVPacket *) (value))
 #define FRAME(value) ((AVFrame *) (value))

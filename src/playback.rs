@@ -285,9 +285,22 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         continue;
                     }
                     match action_for_key(event.key) {
+                        Some(Action::ToggleCrop) => {
+                            let enabled = renderer.toggle_autocrop();
+                            position_notice.show_text(
+                                CString::new(if enabled {
+                                    "AUTOCROP: ON"
+                                } else {
+                                    "AUTOCROP: OFF"
+                                })
+                                .unwrap(),
+                            );
+                            redraw = true;
+                        }
                         Some(Action::Quit) => running = false,
                         Some(Action::SeekBackward) => {
                             let mut media = decoder.lock()?;
+                            renderer.reset_autocrop();
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -314,6 +327,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         }
                         Some(Action::SeekForward) => {
                             let mut media = decoder.lock()?;
+                            renderer.reset_autocrop();
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -357,6 +371,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             let next = next_track(selected_audio_track, audio_track_count);
                             let requested_target = clock.now();
                             let mut media = decoder.lock()?;
+                            renderer.reset_autocrop();
                             decoder.clear_frames(&mut video_queue, &mut current_video);
                             decoder.clear_subtitles(
                                 &mut subtitle_queue,
@@ -448,6 +463,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     }
                     MprisCommand::Seek(offset_us) => {
                         let mut media = decoder.lock()?;
+                        renderer.reset_autocrop();
                         decoder.clear_frames(&mut video_queue, &mut current_video);
                         decoder.clear_subtitles(
                             &mut subtitle_queue,
@@ -483,6 +499,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         }
         if let (Some(position), Some(duration)) = (pending_scrub_target.take(), media_duration) {
             let mut media = decoder.lock()?;
+            renderer.reset_autocrop();
             decoder.clear_frames(&mut video_queue, &mut current_video);
             decoder.clear_subtitles(
                 &mut subtitle_queue,
@@ -639,6 +656,9 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             redraw = true;
         }
 
+        if let Some(frame) = current_video.as_ref().map(|queued| &queued.frame) {
+            redraw |= renderer.update_autocrop(frame, paused);
+        }
         if redraw && let Some(frame) = current_video.as_ref().map(|queued| &queued.frame) {
             let stats_info = info_visible.then(|| stats.text(video_info.frame_rate));
             let controls_visible = top_bar.alpha > 0.001;

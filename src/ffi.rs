@@ -339,6 +339,7 @@ pub const UpKey_UP_KEY_I: UpKey = 6;
 pub const UpKey_UP_KEY_SPACE: UpKey = 7;
 pub const UpKey_UP_KEY_S: UpKey = 8;
 pub const UpKey_UP_KEY_A: UpKey = 9;
+pub const UpKey_UP_KEY_C: UpKey = 10;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -452,6 +453,7 @@ unsafe extern "C" {
         width: ::std::os::raw::c_int,
         height: ::std::os::raw::c_int,
         overlay: *const UpOverlayFrame,
+        crop: *const UpVideoCrop,
         subtitle_text: *const ::std::os::raw::c_char,
         subtitle_pixels: *const u8,
         subtitle_width: ::std::os::raw::c_int,
@@ -589,4 +591,34 @@ pub struct UpOverlayFrame {
     pub title: UpOverlayImage,
     pub parts: *const UpOverlayPart,
     pub count: usize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct UpLumaView {
+    pub frame: *mut UpAvFrame,
+    pub data: *const u8,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub step: i32,
+    pub depth: i32,
+    pub shift: i32,
+    pub big_endian: i32,
+    pub full_range: i32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpVideoCrop {
+    pub width: i32,
+    pub height: i32,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+unsafe extern "C" {
+    pub fn up_av_frame_clone(frame: *const UpAvFrame) -> *mut UpAvFrame;
+    pub fn up_av_frame_luma(frame: *const UpAvFrame, view: *mut UpLumaView) -> i32;
+    pub fn up_av_frame_luma_free(view: *mut UpLumaView);
 }

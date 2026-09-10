@@ -54,6 +54,18 @@ static void integer_scaled_video(void)
 
 int main(void)
 {
+    struct pl_frame cropped = {.crop = {.x1 = 720, .y1 = 480}};
+    const UpVideoCrop crop = {720,480,0,112,720,372};
+    apply_video_crop(&cropped,720,480,&crop);
+    assert(cropped.crop.y0 == 112 && cropped.crop.y1 == 372);
+    pl_rect2df rect = fitted_video_rect(&cropped,(AVRational){8,9},1920,1080,0);
+    assert(fabs(pl_rect2df_aspect(&rect) - 640.0 / 260) < 0.00001);
+    cropped.rotation = 1;
+    rect = fitted_video_rect(&cropped,(AVRational){8,9},1920,1080,0);
+    assert(fabs(pl_rect2df_aspect(&rect) - 260.0 / 640) < 0.00001);
+    cropped.crop = (pl_rect2df) {.x1 = 1920,.y1 = 1080};
+    apply_video_crop(&cropped,1920,1080,&crop);
+    assert(cropped.crop.y0 == 0 && cropped.crop.y1 == 1080);
     invisible_subtitles();
     rotated_video();
     integer_scaled_video();

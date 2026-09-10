@@ -583,8 +583,24 @@ static pl_rect2df fitted_video_rect(const struct pl_frame *image,
     return rect;
 }
 
+static void apply_video_crop(struct pl_frame *image, int width, int height,
+                              const UpVideoCrop *crop)
+{
+    if (!crop || crop->width != width || crop->height != height ||
+        crop->left < 0 || crop->top < 0 || crop->right > width || crop->bottom > height ||
+        crop->left >= crop->right || crop->top >= crop->bottom)
+        return;
+    pl_rect2df rect = {
+        fmaxf(image->crop.x0, crop->left), fmaxf(image->crop.y0, crop->top),
+        fminf(image->crop.x1, crop->right), fminf(image->crop.y1, crop->bottom),
+    };
+    if (rect.x0 < rect.x1 && rect.y0 < rect.y1)
+        image->crop = rect;
+}
+
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               int width, int height, const UpOverlayFrame *overlay,
+                              const UpVideoCrop *crop,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
@@ -629,6 +645,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         return -1;
     }
 
+    apply_video_crop(&image, frame->width, frame->height, crop);
     if (subtitle_pixels && subtitle_width > 0 && subtitle_height > 0) {
         if (!update_subtitle_texture(renderer, subtitle_pixels, subtitle_width,
                                      subtitle_height, subtitle_serial))

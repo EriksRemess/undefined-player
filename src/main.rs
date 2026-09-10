@@ -5,6 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 mod audio;
+mod autocrop;
 mod cli;
 mod clock;
 mod decoder;

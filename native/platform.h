@@ -31,6 +31,7 @@ enum UpKey {
     UP_KEY_SPACE,
     UP_KEY_S,
     UP_KEY_A,
+    UP_KEY_C,
 };
 
 typedef struct UpEvent {

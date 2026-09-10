@@ -58,6 +58,7 @@ undefined-player ~/Videos/example.mp4
 The player starts playing immediately. The focused video window accepts:
 
 - `F` — toggle fullscreen
+- `C` — toggle automatic cropping of encoded black borders
 - `I` — toggle video/color details, FPS / shown / dropped frames, and playback
   position
 - `A` — switch to the next audio track
@@ -82,6 +83,13 @@ FFmpeg resolves its nearest usable preceding keyframe. Decoding continues in
 the background so the window remains responsive, and audio and video resume
 together once buffered data is ready. Audio tracks that begin later stay silent
 until their starting timestamp.
+
+Autocrop starts disabled. Press `C` to detect stable black borders in the video;
+press it again to restore the complete frame. Detection samples frames in a
+background worker and preserves the video's pixel aspect ratio. It ignores
+black frames and very dark scenes, so allow a few visible frames for detection.
+When paused, it scans the current frame. Borders required by the window's own
+aspect ratio can remain after encoded bars are removed.
 
 ## Scope
 

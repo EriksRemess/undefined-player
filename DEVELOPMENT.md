@@ -65,6 +65,7 @@ responsibility:
 | `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |
 | `renderer.rs`, `overlay.rs`, `pixel_font.rs` | Renderer ownership, overlay pixels, and placement |
+| `autocrop.rs` | Background luma sampling and stable black-border detection |
 | `metadata.rs`, `subtitles.rs`, `presentation.rs` | Media labels, subtitle content, and UI state |
 | `mpris.rs`, `mpris.xml` | MPRIS metadata, playback state, commands, and interface definition |
 
@@ -82,6 +83,13 @@ GPU uploads.
 Detail lines reserve extra space only where accent pixels need it. Oversized
 panels scale uniformly to fit above the playback controls when the window shrinks.
 The renderer borrows its window and takes references to owned video frames.
+`src/autocrop.rs` samples owned frame references on a bounded background worker
+when enabled. It checks luma edges, stabilizes crop bounds, and rejects stale
+results after toggles, every explicit seek, or timeline discontinuities. Its
+area and brightness checks allow narrow pictures while rejecting small highlights.
+The FFmpeg adapter exposes
+8–16-bit luma planes and downloads hardware frames only for these samples; the
+worker finishes before the renderer destroys its Vulkan device.
 
 `native/text_raster.c` adapts GLib normalization/decomposition and Pango/Cairo
 shaping into natural-size masks. Rust owns their lifetime through a wrapper and fits the

@@ -5,6 +5,11 @@
 
 typedef struct UpVideoRenderer UpVideoRenderer;
 
+typedef struct UpVideoCrop {
+    int width, height;
+    int left, top, right, bottom;
+} UpVideoCrop;
+
 // Rust chooses when small sources use integer scaling; zero means normal fit.
 uint32_t up_video_integer_scale(double source_width, double source_height,
                                 int sar_num, int sar_den, uint32_t rotation,
@@ -32,6 +37,7 @@ UpVideoRenderer *up_video_renderer_create(void *window);
 void *up_video_renderer_device(UpVideoRenderer *renderer);
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               int width, int height, const UpOverlayFrame *overlay,
+                              const UpVideoCrop *crop,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
