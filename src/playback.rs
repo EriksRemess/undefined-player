@@ -290,9 +290,16 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         continue;
                     }
                     match action_for_key(event.key) {
+                        Some(Action::ToggleZoom) => {
+                            let enabled = renderer.toggle_zoom();
+                            let status = if enabled { "ZOOM: FILL" } else { "ZOOM: FIT" };
+                            eprintln!("{}", status.to_ascii_lowercase());
+                            position_notice.show_text(CString::new(status).unwrap());
+                            redraw = true;
+                        }
                         Some(Action::CycleDeinterlace) => {
                             let status = renderer.cycle_deinterlace();
-                            eprintln!("{status}");
+                            eprintln!("{}", status.to_ascii_lowercase());
                             position_notice.show_text(CString::new(status).unwrap());
                             redraw = true;
                         }

@@ -132,6 +132,31 @@ static void deinterlacing_reference_layout_changes(void)
     }
 }
 
+static void bitmap_subtitles_survive_crop_and_fill(void)
+{
+    // Captions can occupy any part of the original canvas, including bars.
+    const pl_rect2df crops[] = {
+        {0, 0, 720, 480},       // original picture
+        {0, 108, 720, 376},     // C: remove encoded letterboxing
+        {92, 108, 628, 376},    // C + Z: trim the remaining picture horizontally
+        {0, 60, 720, 420},      // Z: trim a 4:3 picture vertically
+        {180, 0, 540, 480},     // pillarboxed picture
+    };
+    for (size_t c = 0; c < sizeof(crops) / sizeof(crops[0]); c++) {
+        for (int rotation = 0; rotation < 4; rotation++) {
+            const struct pl_frame image = {.crop = crops[c], .rotation = rotation};
+            const pl_rect2df rect = bitmap_subtitle_rect(&image, 720, 480);
+            assert(rect.x0 >= image.crop.x0 && rect.y0 >= image.crop.y0);
+            assert(rect.x1 <= image.crop.x1 && rect.y1 <= image.crop.y1);
+            assert(fabs(pl_rect2df_aspect(&rect) - 1.5) < 0.00001);
+            assert(fabs(rect.x0 + rect.x1 - image.crop.x0 - image.crop.x1) < 0.001);
+            assert(fabs(rect.y0 + rect.y1 - image.crop.y0 - image.crop.y1) < 0.001);
+            if (c == 0)
+                assert(rect.x0 == 0 && rect.y0 == 0 && rect.x1 == 720 && rect.y1 == 480);
+        }
+    }
+}
+
 int main(void)
 {
     struct pl_frame cropped = {.crop = {.x1 = 720, .y1 = 480}};
@@ -149,8 +174,9 @@ int main(void)
     deinterlacing();
     deinterlacing_reference_layout_changes();
     invisible_subtitles();
+    bitmap_subtitles_survive_crop_and_fill();
     rotated_video();
     integer_scaled_video();
-    puts("Native renderer: invisible subtitles, rotation, integer scaling, and deinterlacing passed");
+    puts("Native renderer: subtitles, crop/fill, rotation, integer scaling, and deinterlacing passed");
     return 0;
 }

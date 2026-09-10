@@ -24,6 +24,7 @@ mod renderer;
 mod subtitles;
 mod window;
 mod worker;
+mod zoom;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
 

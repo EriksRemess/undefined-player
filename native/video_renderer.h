@@ -14,6 +14,9 @@ typedef struct UpVideoCrop {
 uint32_t up_video_integer_scale(double source_width, double source_height,
                                 int sar_num, int sar_den, uint32_t rotation,
                                 int width, int height);
+// Rust trims the source rectangle to fill the viewport while preserving SAR.
+void up_video_fill_crop(float rect[4], int sar_num, int sar_den, uint32_t rotation,
+                        int width, int height);
 
 // Borrowed A8 images and player-owned geometry, valid for one display call.
 typedef struct UpOverlayImage {
@@ -38,7 +41,7 @@ void *up_video_renderer_device(UpVideoRenderer *renderer);
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
-                              const UpVideoCrop *crop,
+                              const UpVideoCrop *crop, int fill,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,

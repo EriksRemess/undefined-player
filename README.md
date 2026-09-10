@@ -59,6 +59,7 @@ The player starts playing immediately. The focused video window accepts:
 
 - `F` — toggle fullscreen
 - `C` — toggle automatic cropping of encoded black borders
+- `Z` — toggle zoom to fill the window, using autocrop first
 - `D` — cycle deinterlacing: Auto (default), On, Off
 - `I` — toggle video/color details, deinterlacing status, cropped resolution,
   FPS / shown / dropped frames, and playback
@@ -92,6 +93,17 @@ background worker and preserves the video's pixel aspect ratio. It ignores
 black frames and very dark scenes, so allow a few visible frames for detection.
 When paused, it scans the current frame. Borders required by the window's own
 aspect ratio can remain after encoded bars are removed.
+
+Zoom fills the current window (or the screen in fullscreen) without stretching.
+It first enables autocrop, then trims the center of the remaining picture to the
+window's aspect ratio. Wider pictures lose content at the sides; narrower pictures
+lose content at the top and bottom. Integer scaling is bypassed while filling.
+Press `Z` again to restore normal fitting and your previous autocrop setting.
+`C` can override cropping during zoom; leaving zoom still restores the earlier
+setting. The `I` panel shows `ZOOM: FILL`, `FIT`, or `FILL (DETECTING)` while
+waiting for a reliable border sample. Dark scenes retain the last detected crop;
+if border sampling is unsupported, zoom uses the full frame. Both controls work
+while paused.
 
 Deinterlacing starts in Auto mode and follows each decoded frame's interlacing
 flag and field order. Press `D` to force it On for incorrectly flagged files,

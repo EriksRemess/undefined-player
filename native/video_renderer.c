@@ -599,6 +599,17 @@ static void apply_video_crop(struct pl_frame *image, int width, int height,
         image->crop = rect;
 }
 
+static pl_rect2df bitmap_subtitle_rect(const struct pl_frame *image,
+                                      int width, int height)
+{
+    // Keep the entire authored subtitle canvas within the visible source crop.
+    // Both use source coordinates, so SAR and rotation are applied together by
+    // libplacebo without stretching the captions or cutting off their edges.
+    pl_rect2df rect = image->crop;
+    pl_rect2df_aspect_set(&rect, (float) width / height, 0.0f);
+    return rect;
+}
+
 static bool compatible_reference(const AVFrame *frame, const AVFrame *reference)
 {
     return reference && frame->width == reference->width &&
@@ -651,7 +662,7 @@ static void configure_deinterlace(struct pl_frame *image,
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
-                              const UpVideoCrop *crop,
+                              const UpVideoCrop *crop, int fill,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
@@ -718,13 +729,39 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     }
     configure_deinterlace(&image, &params, field);
     apply_video_crop(&image, frame->width, frame->height, crop);
+    pl_color_space_from_avframe(&hint, frame);
+    pl_swapchain_colorspace_hint(renderer->swapchain, &hint);
+    if (!pl_swapchain_start_frame(renderer->swapchain, &swap_frame)) {
+        set_error(renderer, "could not acquire a Vulkan swapchain image");
+        goto out;
+    }
+
+    pl_frame_from_swapchain(&target, &swap_frame);
+    if (fill) {
+        float rect[4] = {image.crop.x0, image.crop.y0, image.crop.x1, image.crop.y1};
+        up_video_fill_crop(rect, frame->sample_aspect_ratio.num, frame->sample_aspect_ratio.den,
+                           image.rotation, width, height);
+        image.crop = (pl_rect2df) {rect[0], rect[1], rect[2], rect[3]};
+    }
+    const uint32_t integer_scale = fill ? 0 : up_video_integer_scale(
+        fabs(image.crop.x1 - image.crop.x0), fabs(image.crop.y1 - image.crop.y0),
+        frame->sample_aspect_ratio.num, frame->sample_aspect_ratio.den,
+        image.rotation, width, height);
+    target.crop = fill ? (pl_rect2df) {0, 0, width, height} :
+                        fitted_video_rect(&image, frame->sample_aspect_ratio, width, height,
+                                           integer_scale);
+    const float x0 = target.crop.x0, y0 = target.crop.y0;
+    const float x1 = target.crop.x1, y1 = target.crop.y1;
+
+    // Place bitmap subtitles only after both autocrop and fill have selected
+    // the final visible source rectangle. Captions may lie in encoded bars.
     if (subtitle_pixels && subtitle_width > 0 && subtitle_height > 0) {
         if (!update_subtitle_texture(renderer, subtitle_pixels, subtitle_width,
                                      subtitle_height, subtitle_serial))
             goto out;
         bitmap_part = (struct pl_overlay_part) {
             .src = {0, 0, subtitle_width, subtitle_height},
-            .dst = {0, 0, frame->width, frame->height},
+            .dst = bitmap_subtitle_rect(&image, frame->width, frame->height),
         };
         bitmap_overlay = (struct pl_overlay) {
             .tex = renderer->subtitle_texture,
@@ -739,23 +776,6 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         image.overlays = &bitmap_overlay;
         image.num_overlays = 1;
     }
-
-    pl_color_space_from_avframe(&hint, frame);
-    pl_swapchain_colorspace_hint(renderer->swapchain, &hint);
-    if (!pl_swapchain_start_frame(renderer->swapchain, &swap_frame)) {
-        set_error(renderer, "could not acquire a Vulkan swapchain image");
-        goto out;
-    }
-
-    pl_frame_from_swapchain(&target, &swap_frame);
-    const uint32_t integer_scale = up_video_integer_scale(
-        fabs(image.crop.x1 - image.crop.x0), fabs(image.crop.y1 - image.crop.y0),
-        frame->sample_aspect_ratio.num, frame->sample_aspect_ratio.den,
-        image.rotation, width, height);
-    target.crop = fitted_video_rect(&image, frame->sample_aspect_ratio, width, height,
-                                    integer_scale);
-    const float x0 = target.crop.x0, y0 = target.crop.y0;
-    const float x1 = target.crop.x1, y1 = target.crop.y1;
 
     if (subtitle_text && *subtitle_text) {
         int layout_width = (int) (x1 - x0) - 80;

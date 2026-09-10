@@ -10,6 +10,7 @@ pub(crate) struct Renderer<'window> {
     overlays: overlay::Overlays,
     autocrop: crate::autocrop::AutoCrop,
     deinterlace: crate::deinterlace::Mode,
+    zoom: crate::zoom::Zoom,
     _window: &'window Window,
 }
 
@@ -27,7 +28,12 @@ pub(crate) struct RendererOverlays<'a> {
     pub(crate) subtitle: Option<&'a SubtitleCue>,
 }
 
-fn processing_details(details: &str, deinterlace: &str, crop: Option<&ffi::UpVideoCrop>) -> String {
+fn processing_details(
+    details: &str,
+    deinterlace: &str,
+    zoom: &str,
+    crop: Option<&ffi::UpVideoCrop>,
+) -> String {
     let mut text = String::new();
     for line in details.lines() {
         if !text.is_empty() {
@@ -47,6 +53,8 @@ fn processing_details(details: &str, deinterlace: &str, crop: Option<&ffi::UpVid
         if line.starts_with("DECODE:") {
             text.push_str("\nDEINTERLACE: ");
             text.push_str(deinterlace);
+            text.push_str("\nZOOM: ");
+            text.push_str(zoom);
         }
     }
     text
@@ -70,6 +78,7 @@ impl<'window> Renderer<'window> {
             overlays: overlay::Overlays::default(),
             autocrop: crate::autocrop::AutoCrop::default(),
             deinterlace: crate::deinterlace::Mode::default(),
+            zoom: crate::zoom::Zoom::default(),
             _window: window,
         })
     }
@@ -86,12 +95,22 @@ impl<'window> Renderer<'window> {
         self.autocrop.toggle()
     }
 
+    pub(crate) fn toggle_zoom(&mut self) -> bool {
+        let crop = self.zoom.toggle(self.autocrop.enabled());
+        if crop != self.autocrop.enabled() {
+            self.autocrop.toggle();
+        }
+        self.zoom.enabled()
+    }
+
     pub(crate) fn reset_autocrop(&mut self) {
         self.autocrop.reset();
     }
 
     pub(crate) fn update_autocrop(&mut self, frame: &VideoFrame, paused: bool) -> bool {
-        self.autocrop.update(frame, paused)
+        let unavailable = self.autocrop.unavailable();
+        let changed = self.autocrop.update(frame, paused);
+        changed || unavailable != self.autocrop.unavailable()
     }
 
     pub(crate) fn display(
@@ -111,6 +130,11 @@ impl<'window> Renderer<'window> {
             .autocrop
             .crop()
             .filter(|crop| (crop.width, crop.height) == frame.dimensions());
+        let fill = self.zoom.fill(
+            self.autocrop.enabled(),
+            crop.is_some(),
+            self.autocrop.unavailable(),
+        );
         let previous = frames
             .previous
             .filter(|prev| field != 0 && crate::deinterlace::adjacent(prev, frame));
@@ -125,6 +149,7 @@ impl<'window> Renderer<'window> {
             processing_details(
                 &details.to_string_lossy(),
                 self.deinterlace.status(field != 0),
+                self.zoom.status(fill),
                 crop.as_ref(),
             )
         });
@@ -185,6 +210,7 @@ impl<'window> Renderer<'window> {
                 height,
                 &overlay,
                 crop.as_ref().map_or(ptr::null(), |crop| crop),
+                i32::from(fill),
                 subtitle_text,
                 subtitle_pixels,
                 subtitle_width,

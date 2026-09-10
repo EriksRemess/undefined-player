@@ -91,6 +91,16 @@ The FFmpeg adapter exposes
 8–16-bit luma planes and downloads hardware frames only for these samples; the
 worker finishes before the renderer destroys its Vulkan device.
 
+`src/zoom.rs` owns the fill mode, saved autocrop preference, and centered source
+crop geometry. Fill runs after autocrop and accounts for sample aspect ratio and
+rotation. The native adapter keeps the target at the viewport bounds, preserving
+subtitle and control placement. Zoom waits for a usable crop, with full-frame
+fallback when sampling is unavailable or manually disabled, and bypasses integer
+scaling until normal fitting is restored.
+Bitmap subtitles fit their complete authored canvas inside the final visible
+source crop, after both C and Z. This preserves captions in removed bars while
+retaining their proportions and following the video's SAR and rotation.
+
 `src/deinterlace.rs` owns Auto/On/Off selection and temporal adjacency checks.
 Playback retains one preceding frame and borrows the next queued frame for GPU
 YADIF filtering. Every seek clears the previous frame; timestamp gaps and changes

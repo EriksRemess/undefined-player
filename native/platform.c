@@ -11,6 +11,8 @@
 static enum UpKey translate_key(SDL_Keycode key)
 {
     switch (key) {
+    case SDLK_Z:
+        return UP_KEY_Z;
     case SDLK_D:
         return UP_KEY_D;
     case SDLK_C:

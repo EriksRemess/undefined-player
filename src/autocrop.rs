@@ -232,6 +232,14 @@ pub(crate) struct AutoCrop {
     worker: Option<Worker>,
 }
 impl AutoCrop {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn unavailable(&self) -> bool {
+        self.unavailable
+    }
+
     pub(crate) fn toggle(&mut self) -> bool {
         if !self.enabled && self.worker.is_none() {
             match Worker::start() {

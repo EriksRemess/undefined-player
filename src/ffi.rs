@@ -341,6 +341,7 @@ pub const UpKey_UP_KEY_S: UpKey = 8;
 pub const UpKey_UP_KEY_A: UpKey = 9;
 pub const UpKey_UP_KEY_C: UpKey = 10;
 pub const UpKey_UP_KEY_D: UpKey = 11;
+pub const UpKey_UP_KEY_Z: UpKey = 12;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -458,6 +459,7 @@ unsafe extern "C" {
         height: ::std::os::raw::c_int,
         overlay: *const UpOverlayFrame,
         crop: *const UpVideoCrop,
+        fill: ::std::os::raw::c_int,
         subtitle_text: *const ::std::os::raw::c_char,
         subtitle_pixels: *const u8,
         subtitle_width: ::std::os::raw::c_int,
