@@ -19,6 +19,7 @@ Build-Depends:
  libavformat-dev (>= 7:8),
  libavcodec-dev (>= 7:8),
  libswresample-dev (>= 7:8),
+ libswscale-dev (>= 7:8),
  libavutil-dev (>= 7:8),
  desktop-file-utils,
  ffmpeg <!nocheck>,

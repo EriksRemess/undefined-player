@@ -47,6 +47,12 @@ static GVariant *value_variant(const UpMprisValue *value)
                               g_variant_new_object_path(value->track_id));
         g_variant_builder_add(&metadata, "{sv}", "xesam:title",
                               g_variant_new_string(value->title));
+        if (value->artist)
+            g_variant_builder_add(&metadata, "{sv}", "xesam:artist",
+                                  g_variant_new_strv(&value->artist, 1));
+        if (value->art_uri)
+            g_variant_builder_add(&metadata, "{sv}", "mpris:artUrl",
+                                  g_variant_new_string(value->art_uri));
         if (value->uri)
             g_variant_builder_add(&metadata, "{sv}", "xesam:url",
                                   g_variant_new_string(value->uri));
@@ -226,6 +232,14 @@ void up_mpris_seeked(UpMpris *mpris, int64_t position_us)
         mpris->connection, NULL, MPRIS_OBJECT_PATH,
         "org.mpris.MediaPlayer2.Player", "Seeked",
         g_variant_new("(x)", position_us), NULL);
+}
+
+void up_mpris_navigation_changed(UpMpris *mpris, bool previous, bool next)
+{
+    if (!up_mpris_active(mpris))
+        return;
+    emit_player_property(mpris, "CanGoPrevious", g_variant_new_boolean(previous));
+    emit_player_property(mpris, "CanGoNext", g_variant_new_boolean(next));
 }
 
 void up_mpris_destroy(UpMpris *mpris)

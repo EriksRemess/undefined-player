@@ -11,6 +11,47 @@ use std::{
 
 static EXTERNAL_MEDIA_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn relative_seeks_follow_pending_positions_and_clamp_each_command() {
+    use crate::playback::queue_relative_seek;
+    let mut pending = Some(3.2); // A chapter jump queued earlier in this batch.
+    queue_relative_seek(&mut pending, 0.0, 10.0, Some(30.0));
+    assert_eq!(pending, Some(13.2));
+    queue_relative_seek(&mut pending, 0.0, -10.0, Some(30.0));
+    assert!((pending.unwrap() - 3.2).abs() < 1e-9);
+    queue_relative_seek(&mut pending, 0.0, -10.0, Some(30.0));
+    assert_eq!(pending, Some(0.0));
+    queue_relative_seek(&mut pending, 0.0, 10.0, Some(30.0));
+    assert_eq!(pending, Some(10.0));
+    pending = Some(28.0);
+    queue_relative_seek(&mut pending, 0.0, 10.0, Some(30.0));
+    queue_relative_seek(&mut pending, 0.0, -10.0, Some(30.0));
+    assert_eq!(pending, Some(19.95));
+    pending = None;
+    queue_relative_seek(&mut pending, 40.0, 10.0, None);
+    assert_eq!(pending, Some(50.0));
+}
+
+#[test]
+fn chapter_heading_expires_and_hover_takes_precedence() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let mut heading = ChapterHeading::default();
+    assert_eq!(heading.index(), None);
+    heading.show(2, now);
+    assert!(!heading.update(now + Duration::from_secs(2)));
+    assert_eq!(heading.index(), Some(2));
+    heading.hovered = Some(5);
+    assert_eq!(heading.index(), Some(5));
+    assert!(heading.update(now + Duration::from_secs(3)));
+    assert_eq!(heading.index(), Some(5));
+    heading.hovered = None;
+    assert_eq!(heading.index(), None);
+    heading.hovered = Some(5);
+    heading.show(1, now);
+    assert_eq!(heading.index(), Some(1));
+}
+
 fn cli(arguments: &[&str]) -> Result<CliAction> {
     parse_cli(arguments.iter().map(OsString::from))
 }
@@ -53,6 +94,14 @@ fn command_line_rejects_missing_files_and_unknown_options() {
 
 #[test]
 fn requested_keys_map_to_requested_actions() {
+    assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_COMMA),
+        Some(Action::PreviousChapter)
+    );
+    assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_PERIOD),
+        Some(Action::NextChapter)
+    );
     assert_eq!(
         action_for_key(ffi::UpKey_UP_KEY_Z),
         Some(Action::ToggleZoom)

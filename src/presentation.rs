@@ -111,6 +111,34 @@ pub(crate) struct TopBar {
     pub(crate) alpha: f32,
 }
 
+#[derive(Default)]
+pub(crate) struct ChapterHeading {
+    pub(crate) hovered: Option<usize>,
+    jump: Option<(usize, Instant)>,
+}
+
+impl ChapterHeading {
+    pub(crate) fn show(&mut self, index: usize, now: Instant) {
+        self.hovered = None;
+        self.jump = Some((index, now));
+    }
+
+    pub(crate) fn update(&mut self, now: Instant) -> bool {
+        if self
+            .jump
+            .is_some_and(|(_, shown)| now.duration_since(shown) >= Duration::from_secs(3))
+        {
+            self.jump = None;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn index(&self) -> Option<usize> {
+        self.hovered.or(self.jump.map(|(index, _)| index))
+    }
+}
+
 impl TopBar {
     pub(crate) fn new() -> Self {
         let now = Instant::now();

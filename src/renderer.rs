@@ -23,8 +23,10 @@ pub(crate) struct VideoFrames<'a> {
 pub(crate) struct RendererOverlays<'a> {
     pub(crate) info: Option<(&'a CStr, f32)>,
     pub(crate) details: Option<&'a CStr>,
+    pub(crate) metadata: Option<&'a CStr>,
     pub(crate) position: Option<(&'a CStr, f32)>,
     pub(crate) scrubber: Option<(f32, f32)>,
+    pub(crate) chapter_markers: &'a [f32],
     pub(crate) subtitle: Option<&'a SubtitleCue>,
 }
 
@@ -162,6 +164,7 @@ impl<'window> Renderer<'window> {
                 title: &title.to_string_lossy(),
                 info: &info,
                 details: &details,
+                metadata: &overlays.metadata.map_or(c"", |text| text).to_string_lossy(),
                 position: &position,
             },
             overlay::Visibility {
@@ -169,6 +172,7 @@ impl<'window> Renderer<'window> {
                 info: overlays.info.map_or(0.0, |(_, alpha)| alpha),
                 position: overlays.position.map_or(0.0, |(_, alpha)| alpha),
                 scrubber: overlays.scrubber,
+                chapter_markers: overlays.chapter_markers,
             },
             width,
             height,

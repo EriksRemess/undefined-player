@@ -12,7 +12,7 @@ documented in [README.md](README.md).
 - development files for SDL3, libplacebo, Vulkan, Wayland, Pango, Cairo, and
   GIO
 - FFmpeg 8 or newer development files for `libavformat`, `libavcodec`,
-  `libswresample`, and `libavutil`; Vulkan Video support is needed for hardware
+  `libswresample`, `libswscale`, and `libavutil`; Vulkan Video support is needed for hardware
   decoding
 
 On Ubuntu 26.04, install the packaged build dependencies with:
@@ -21,7 +21,7 @@ On Ubuntu 26.04, install the packaged build dependencies with:
 sudo apt install build-essential binutils pkg-config \
   wayland-protocols libwayland-dev libvulkan-dev libsdl3-dev libplacebo-dev \
   libpango1.0-dev libcairo2-dev libglib2.0-dev libavformat-dev \
-  libavcodec-dev libswresample-dev libavutil-dev
+  libavcodec-dev libswresample-dev libswscale-dev libavutil-dev
 ```
 
 On Arch Linux, install the build dependencies and AMD Vulkan driver with:
@@ -61,6 +61,8 @@ responsibility:
 | Modules | Responsibility |
 | --- | --- |
 | `playback.rs`, `clock.rs` | Event loop, seeking, and playback synchronization |
+| `chapters.rs` | Chapter timestamps, timeline markers, and previous/next navigation |
+| `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
 | `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |

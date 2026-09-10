@@ -18,6 +18,7 @@ enum UpEventType {
     UP_EVENT_MOUSE_BUTTON_DOWN,
     UP_EVENT_MOUSE_BUTTON_UP,
     UP_EVENT_KEY_DOWN,
+    UP_EVENT_MOUSE_LEAVE,
 };
 
 enum UpKey {
@@ -34,6 +35,8 @@ enum UpKey {
     UP_KEY_C,
     UP_KEY_D,
     UP_KEY_Z,
+    UP_KEY_COMMA,
+    UP_KEY_PERIOD,
 };
 
 typedef struct UpEvent {

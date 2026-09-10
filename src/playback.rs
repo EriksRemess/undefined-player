@@ -4,7 +4,8 @@ use crate::metadata::{VideoInfo, display_title, media_title};
 use crate::mpris::{Mpris, MprisCommand, PlaybackStatus, seconds_to_microseconds};
 use crate::presentation::timeline_text;
 use crate::presentation::{
-    PositionNotice, PresentationStats, TopBar, next_track, subtitle_status_text, track_status_text,
+    ChapterHeading, PositionNotice, PresentationStats, TopBar, next_track, subtitle_status_text,
+    track_status_text,
 };
 use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
 use crate::subtitles::SubtitleCue;
@@ -45,23 +46,14 @@ pub(crate) unsafe fn set_playback_paused(
     Ok(())
 }
 
-pub(crate) unsafe fn seek_by(
-    media: &mut Media,
-    clock: &mut WallClock,
-    notice: &mut PositionNotice,
+pub(crate) fn queue_relative_seek(
+    pending: &mut Option<f64>,
+    current: f64,
     offset: f64,
-    playback_start: f64,
     duration: Option<f64>,
-) -> Result<f64> {
-    let maximum = duration.map_or(f64::MAX, |duration| {
-        playback_start + (duration - 0.05).max(0.0)
-    });
-    let target = (clock.now() + offset).clamp(playback_start, maximum);
-    let target = unsafe { media.seek(target)? };
-    clock.seek(target);
-    let position = target - playback_start;
-    notice.show(position, duration);
-    Ok(position)
+) {
+    let maximum = duration.map_or(f64::MAX, |duration| (duration - 0.05).max(0.0));
+    *pending = Some((pending.unwrap_or(current) + offset).clamp(0.0, maximum));
 }
 
 pub(crate) unsafe fn seek_to(
@@ -70,16 +62,17 @@ pub(crate) unsafe fn seek_to(
     notice: &mut PositionNotice,
     position: f64,
     playback_start: f64,
-    duration: f64,
+    duration: Option<f64>,
 ) -> Result<f64> {
-    let position = position.clamp(0.0, (duration - 0.05).max(0.0));
+    let maximum = duration.map_or(f64::MAX, |duration| (duration - 0.05).max(0.0));
+    let position = position.clamp(0.0, maximum);
     let target = playback_start + position;
     // Timeline seeks can require decoding a long GOP. Leave that work to the
     // decode worker so the window continues dispatching compositor events.
     let target = unsafe { media.seek(target)? };
     clock.seek(target);
     let position = target - playback_start;
-    notice.show(position, Some(duration));
+    notice.show(position, duration);
     Ok(position)
 }
 
@@ -160,8 +153,10 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             RendererOverlays {
                 info: None,
                 details: None,
+                metadata: None,
                 position: None,
                 scrubber: None,
+                chapter_markers: &[],
                 subtitle: None,
             },
         )?;
@@ -174,11 +169,27 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     unsafe { media.sync_audio(clock_origin, false)? };
     let playback_start = clock_origin;
     let media_duration = media.duration();
+    let mut chapters =
+        unsafe { crate::chapters::Chapters::inspect(media.format, playback_start, media_duration) };
+    let chapter_markers = chapters.markers(media_duration);
+    let media_metadata = unsafe { crate::metadata::MediaMetadata::inspect(media.format) };
+    let artwork = unsafe { crate::artwork::Artwork::extract(media.format) };
+    let mpris_title = media_metadata
+        .title()
+        .map(|title| CString::new(title).expect("title has no NUL bytes"));
     let mpris = Mpris::create(
-        &metadata_title,
+        mpris_title.as_deref().unwrap_or(&metadata_title),
+        media_metadata.artist(),
         &path,
         media_duration.map_or(0, seconds_to_microseconds),
+        artwork.as_ref().map(|artwork| artwork.path.as_path()),
     );
+    if let Some(mpris) = &mpris {
+        mpris.navigation(
+            chapters.target(0.0, false).is_some(),
+            chapters.target(0.0, true).is_some(),
+        );
+    }
     let decoder = DecodeWorker::start(media, path, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
@@ -201,10 +212,11 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mut redraw = true;
     let mut new_frame_pending = true;
     let mut top_bar = TopBar::new();
+    let mut chapter_heading = ChapterHeading::default();
     let mut position_notice = PositionNotice::new();
     let mut scrubbing = false;
     let mut scrub_preview = None;
-    let mut pending_scrub_target = None;
+    let mut pending_position = None;
     let mut pending_seek_anchor = None;
     let mut stats = PresentationStats::new();
     let mut last_info_refresh = Instant::now();
@@ -224,6 +236,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 ffi::UpEventType_UP_EVENT_WINDOW_RESIZED => {
                     (width, height) = window.pixel_size()?;
                     renderer.resize(width, height)?;
+                    chapter_heading.hovered = None;
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_WINDOW_EXPOSED => redraw = true,
@@ -233,15 +246,22 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 }
                 ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_LOST => {
                     top_bar.set_focused(false);
+                    chapter_heading.hovered = None;
                     if scrubbing {
-                        pending_scrub_target = scrub_preview.take();
+                        pending_position = scrub_preview.take();
                     }
                     scrubbing = false;
                     unsafe { ffi::up_platform_capture_mouse(0) };
                     redraw = true;
                 }
+                ffi::UpEventType_UP_EVENT_MOUSE_LEAVE => {
+                    chapter_heading.hovered = None;
+                    redraw = true;
+                }
                 ffi::UpEventType_UP_EVENT_MOUSE_MOTION => {
                     top_bar.mouse_activity();
+                    chapter_heading.hovered =
+                        window.chapter_hover(event.x, event.y, &chapter_markers);
                     if scrubbing
                         && let Some(target) =
                             window.scrubber_target(event.x, event.y, media_duration)
@@ -274,10 +294,10 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         if let Some(target) =
                             window.scrubber_target(event.x, event.y, media_duration)
                         {
-                            pending_scrub_target = Some(target);
+                            pending_position = Some(target);
                             position_notice.show(target, media_duration);
                         } else {
-                            pending_scrub_target = scrub_preview;
+                            pending_position = scrub_preview;
                         }
                         scrubbing = false;
                         scrub_preview = None;
@@ -316,61 +336,39 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                             redraw = true;
                         }
                         Some(Action::Quit) => running = false,
-                        Some(Action::SeekBackward) => {
-                            let mut media = decoder.lock()?;
-                            renderer.reset_autocrop();
-                            previous_video = None;
-                            decoder.clear_frames(&mut video_queue, &mut current_video);
-                            decoder.clear_subtitles(
-                                &mut subtitle_queue,
-                                &mut subtitle_queues,
-                                &mut current_subtitles,
-                            );
-                            let position = unsafe {
-                                seek_by(
-                                    &mut media,
-                                    &mut clock,
-                                    &mut position_notice,
-                                    -SEEK_SECONDS,
-                                    playback_start,
-                                    media_duration,
-                                )?
-                            };
-                            if let Some(mpris) = &mpris {
-                                mpris.seeked(seconds_to_microseconds(position));
+                        Some(action @ (Action::PreviousChapter | Action::NextChapter)) => {
+                            let position = pending_position.unwrap_or_else(|| {
+                                chapters.playback_position(
+                                    pending_seek_anchor.unwrap_or_else(|| clock.now())
+                                        - playback_start,
+                                )
+                            });
+                            if let Some(target) =
+                                chapters.target(position, action == Action::NextChapter)
+                            {
+                                pending_position = Some(target);
+                                if let Some(index) = chapters.current(target) {
+                                    chapter_heading.show(index, Instant::now());
+                                }
+                                mpris_stopped = false;
+                                top_bar.mouse_activity();
                             }
-                            mpris_stopped = false;
-                            pending_seek_anchor = Some(playback_start + position);
-                            redraw = true;
-                            new_frame_pending = true;
                         }
-                        Some(Action::SeekForward) => {
-                            let mut media = decoder.lock()?;
-                            renderer.reset_autocrop();
-                            previous_video = None;
-                            decoder.clear_frames(&mut video_queue, &mut current_video);
-                            decoder.clear_subtitles(
-                                &mut subtitle_queue,
-                                &mut subtitle_queues,
-                                &mut current_subtitles,
+                        Some(action @ (Action::SeekBackward | Action::SeekForward)) => {
+                            let current = chapters.playback_position(
+                                pending_seek_anchor.unwrap_or_else(|| clock.now()) - playback_start,
                             );
-                            let position = unsafe {
-                                seek_by(
-                                    &mut media,
-                                    &mut clock,
-                                    &mut position_notice,
-                                    SEEK_SECONDS,
-                                    playback_start,
-                                    media_duration,
-                                )?
-                            };
-                            if let Some(mpris) = &mpris {
-                                mpris.seeked(seconds_to_microseconds(position));
-                            }
+                            queue_relative_seek(
+                                &mut pending_position,
+                                current,
+                                if action == Action::SeekForward {
+                                    SEEK_SECONDS
+                                } else {
+                                    -SEEK_SECONDS
+                                },
+                                media_duration,
+                            );
                             mpris_stopped = false;
-                            pending_seek_anchor = Some(playback_start + position);
-                            redraw = true;
-                            new_frame_pending = true;
                         }
                         Some(Action::ToggleFullscreen) => {
                             toggle_fullscreen(&window, &mut fullscreen)?;
@@ -403,6 +401,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                                 unsafe { media.select_audio_track(next, requested_target)? };
                             clock.seek(playback_target);
                             pending_seek_anchor = Some(playback_target);
+                            chapters.seeked(playback_target - playback_start);
                             selected_audio_track = next;
                             video_details = video_info.overlay_text(Some((
                                 selected_audio_track,
@@ -460,6 +459,23 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             while let Some(command) = mpris.take_command() {
                 match command {
                     MprisCommand::Quit => running = false,
+                    command @ (MprisCommand::NextChapter | MprisCommand::PreviousChapter) => {
+                        let position = pending_position.unwrap_or_else(|| {
+                            chapters.playback_position(
+                                pending_seek_anchor.unwrap_or_else(|| clock.now()) - playback_start,
+                            )
+                        });
+                        if let Some(target) =
+                            chapters.target(position, command == MprisCommand::NextChapter)
+                        {
+                            pending_position = Some(target);
+                            if let Some(index) = chapters.current(target) {
+                                chapter_heading.show(index, Instant::now());
+                            }
+                            mpris_stopped = false;
+                            top_bar.mouse_activity();
+                        }
+                    }
                     MprisCommand::Play => {
                         unsafe { set_playback_paused(&decoder, &mut clock, &mut paused, false)? };
                         mpris_stopped = false;
@@ -479,38 +495,24 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         unsafe { set_playback_paused(&decoder, &mut clock, &mut paused, true)? };
                         mpris_stopped = true;
                         if media_duration.is_some() {
-                            pending_scrub_target = Some(0.0);
+                            pending_position = Some(0.0);
                         }
                     }
                     MprisCommand::Seek(offset_us) => {
-                        let mut media = decoder.lock()?;
-                        renderer.reset_autocrop();
-                        previous_video = None;
-                        decoder.clear_frames(&mut video_queue, &mut current_video);
-                        decoder.clear_subtitles(
-                            &mut subtitle_queue,
-                            &mut subtitle_queues,
-                            &mut current_subtitles,
+                        let current = chapters.playback_position(
+                            pending_seek_anchor.unwrap_or_else(|| clock.now()) - playback_start,
                         );
-                        let position = unsafe {
-                            seek_by(
-                                &mut media,
-                                &mut clock,
-                                &mut position_notice,
-                                offset_us as f64 / 1_000_000.0,
-                                playback_start,
-                                media_duration,
-                            )?
-                        };
-                        mpris.seeked(seconds_to_microseconds(position));
+                        queue_relative_seek(
+                            &mut pending_position,
+                            current,
+                            offset_us as f64 / 1_000_000.0,
+                            media_duration,
+                        );
                         mpris_stopped = false;
-                        pending_seek_anchor = Some(playback_start + position);
-                        redraw = true;
-                        new_frame_pending = true;
                     }
                     MprisCommand::SetPosition(position_us) => {
                         if media_duration.is_some() {
-                            pending_scrub_target = Some(position_us.max(0) as f64 / 1_000_000.0);
+                            pending_position = Some(position_us.max(0) as f64 / 1_000_000.0);
                         }
                     }
                 }
@@ -519,7 +521,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         if !running {
             break;
         }
-        if let (Some(position), Some(duration)) = (pending_scrub_target.take(), media_duration) {
+        if let Some(position) = pending_position.take() {
             let mut media = decoder.lock()?;
             renderer.reset_autocrop();
             previous_video = None;
@@ -536,13 +538,14 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                     &mut position_notice,
                     position,
                     playback_start,
-                    duration,
+                    media_duration,
                 )?
             };
             if let Some(mpris) = &mpris {
                 mpris.seeked(seconds_to_microseconds(position));
             }
             pending_seek_anchor = Some(playback_start + position);
+            chapters.seeked(position);
             redraw = true;
             new_frame_pending = true;
         }
@@ -602,6 +605,11 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             } else {
                 PlaybackStatus::Playing
             };
+            let chapter_position = chapters.playback_position(playback_time - playback_start);
+            mpris.navigation(
+                chapters.target(chapter_position, false).is_some(),
+                chapters.target(chapter_position, true).is_some(),
+            );
             mpris.update(
                 status,
                 seconds_to_microseconds(playback_time - playback_start),
@@ -673,6 +681,11 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             new_frame_pending = true;
         }
 
+        let heading_expired = chapter_heading.update(Instant::now());
+        if chapter_heading.index().is_some() || heading_expired {
+            top_bar.mouse_activity();
+        }
+        redraw |= heading_expired;
         redraw |= top_bar.update();
         redraw |= position_notice.update();
         if info_visible && last_info_refresh.elapsed() >= Duration::from_millis(100) {
@@ -707,6 +720,17 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 let progress = (position / duration).clamp(0.0, 1.0);
                 (progress as f32, top_bar.alpha)
             });
+            let current_metadata = info_visible.then(|| {
+                media_metadata.overlay_text(
+                    chapters
+                        .current(chapters.playback_position(playback_time - playback_start))
+                        .and_then(|index| chapters.label(index)),
+                )
+            });
+            let heading = chapter_heading
+                .index()
+                .and_then(|index| chapters.label(index))
+                .unwrap_or(&title);
             let display_started = Instant::now();
             renderer.display(
                 VideoFrames {
@@ -717,12 +741,14 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                 width,
                 height,
                 top_bar.alpha,
-                &title,
+                heading,
                 RendererOverlays {
                     info: stats_info.as_deref().map(|text| (text, 1.0)),
                     details: info_visible.then_some(video_details.as_c_str()),
+                    metadata: current_metadata.as_deref(),
                     position: position.map(|text| (text, position_alpha)),
                     scrubber,
+                    chapter_markers: &chapter_markers,
                     subtitle: subtitles_visible
                         .then(|| current_subtitles[selected_subtitle_track].as_ref())
                         .flatten(),

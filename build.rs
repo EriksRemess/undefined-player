@@ -2,7 +2,13 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const FFMPEG_PACKAGES: &[&str] = &["libavformat", "libavcodec", "libswresample", "libavutil"];
+const FFMPEG_PACKAGES: &[&str] = &[
+    "libavformat",
+    "libavcodec",
+    "libswresample",
+    "libswscale",
+    "libavutil",
+];
 
 fn run(mut command: Command, description: &str) {
     let status = command.status().unwrap_or_else(|error| {
@@ -224,10 +230,16 @@ fn main() {
     }
 
     if let Some(ffmpeg_dir) = ffmpeg_dir {
-        for library in ["avformat", "avcodec", "swresample", "avutil"] {
+        for library in ["avformat", "avcodec", "swresample", "swscale", "avutil"] {
             println!("cargo:rustc-link-lib=dylib={library}");
         }
-        for directory in ["libavformat", "libavcodec", "libswresample", "libavutil"] {
+        for directory in [
+            "libavformat",
+            "libavcodec",
+            "libswresample",
+            "libswscale",
+            "libavutil",
+        ] {
             let path = ffmpeg_dir.join(directory);
             println!("cargo:rustc-link-search=native={}", path.display());
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());

@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 
 const WIDTH: usize = 1024;
-const HEIGHT: usize = 608;
+const HEIGHT: usize = 704;
 const SCALE: usize = 2;
 const BASE_HEIGHT: usize = 7 * SCALE;
 // Accents occupy their own rows so the 5x7 letter bodies never shrink.
@@ -21,8 +21,8 @@ const POSITION_Y: usize = 80;
 const DETAILS_Y: usize = 112;
 // Maximum advance, for adjacent lines with accents below and above.
 const LINE_ADVANCE: usize = GLYPH_HEIGHT + 2;
-const BASE_LINE_ADVANCE: usize = BASE_HEIGHT + 4;
 const MAX_LINES: usize = 16;
+const METADATA_Y: usize = 608;
 const INSET: f32 = 32.0;
 
 struct PixelGlyph {
@@ -337,14 +337,16 @@ pub struct Content<'a> {
     pub title: &'a str,
     pub info: &'a str,
     pub details: &'a str,
+    pub metadata: &'a str,
     pub position: &'a str,
 }
 
-pub struct Visibility {
+pub struct Visibility<'a> {
     pub top_bar: f32,
     pub info: f32,
     pub position: f32,
     pub scrubber: Option<(f32, f32)>,
+    pub chapter_markers: &'a [f32],
 }
 
 pub struct Overlays {
@@ -352,6 +354,10 @@ pub struct Overlays {
     text: Image,
     title_key: Option<(String, usize)>,
     text_key: Option<(String, String, String)>,
+    chapter_key: Option<(Vec<f32>, i32)>,
+    metadata_key: Option<(String, usize)>,
+    metadata_width: usize,
+    metadata_height: usize,
     title_width: usize,
     info_width: usize,
     details_width: usize,
@@ -366,6 +372,10 @@ impl Default for Overlays {
             text: Image::new(HEIGHT),
             title_key: None,
             text_key: None,
+            chapter_key: None,
+            metadata_key: None,
+            metadata_width: 0,
+            metadata_height: 0,
             title_width: 0,
             info_width: 0,
             details_width: 0,
@@ -411,14 +421,14 @@ impl Overlays {
             })
         {
             self.text.clear();
+            self.chapter_key = None;
+            self.metadata_key = None;
             self.info_width = self.text.text(0, INFO_Y, content.info)?;
             self.position_width = self.text.text(0, POSITION_Y, content.position)?;
             self.text.glyph(CLOSE_X, CLOSE_Y, b'X');
             self.details_width = 0;
             self.details_height = 0;
             let mut line_image = Image::new(GLYPH_HEIGHT);
-            let mut origin = 0;
-            let mut previous_bottom = 0;
             // split_terminator preserves empty interior lines, without creating
             // an extra line for the final newline (matching the visible panel).
             for (line, text) in content
@@ -430,28 +440,13 @@ impl Overlays {
                 line_image.clear();
                 let line_width = line_image.text(0, 0, text)?;
                 self.details_width = self.details_width.max(line_width);
-                // Keep a full letter body even for blank/punctuation-only
-                // lines. Extra spacing depends on the actual accent pixels.
-                let rows = || line_image.pixels.as_chunks::<WIDTH>().0.iter();
-                let top = rows()
-                    .position(|row| row[..line_width].iter().any(|p| *p != 0))
-                    .unwrap_or(ACCENT_PAD)
-                    .min(ACCENT_PAD);
-                let bottom = rows()
-                    .rposition(|row| row[..line_width].iter().any(|p| *p != 0))
-                    .map_or(ACCENT_PAD + BASE_HEIGHT, |row| row + 1)
-                    .max(ACCENT_PAD + BASE_HEIGHT);
-                if line > 0 {
-                    origin = (origin + BASE_LINE_ADVANCE).max(previous_bottom + 2 - top);
-                }
-                debug_assert!(origin <= line * LINE_ADVANCE);
-                for row in top..bottom {
+                let origin = line * LINE_ADVANCE;
+                for row in 0..GLYPH_HEIGHT {
                     let source = row * WIDTH;
                     let destination = (DETAILS_Y + origin + row) * WIDTH;
                     self.text.pixels[destination..destination + line_width]
                         .copy_from_slice(&line_image.pixels[source..source + line_width]);
                 }
-                previous_bottom = origin + bottom;
                 self.details_height = origin + GLYPH_HEIGHT;
             }
             self.text.serial += 1;
@@ -464,14 +459,111 @@ impl Overlays {
         Ok(())
     }
 
+    fn update_metadata(&mut self, label: &str, width: i32) -> Result<()> {
+        let available = width.saturating_sub((2.0 * INSET) as i32).max(1) as usize;
+        if self
+            .metadata_key
+            .as_ref()
+            .is_some_and(|(old, old_width)| old == label && *old_width == available)
+        {
+            return Ok(());
+        }
+        self.metadata_width = 0;
+        self.metadata_height = 0;
+        // The text update has already cleared this region for an empty label.
+        if label.is_empty() && self.metadata_key.is_none() {
+            return Ok(());
+        }
+        self.text.pixels[METADATA_Y * WIDTH..].fill(0);
+        let mut widths = Vec::new();
+        for (line, text) in label.lines().take(3).enumerate() {
+            let y = METADATA_Y + line * LINE_ADVANCE;
+            let maximum = ((available + SCALE) / CELL).clamp(1, WIDTH / CELL);
+            let text = normalized(text)?;
+            let ellipsis = if text.chars().count() > maximum {
+                maximum.min(3)
+            } else {
+                0
+            };
+            let mut cells = self.text.rasterize(0, y, &text, maximum - ellipsis)?;
+            for _ in 0..ellipsis {
+                self.text.glyph(cells * CELL, y, b'.');
+                cells += 1;
+            }
+            let width = pixel_width(cells);
+            self.metadata_width = self.metadata_width.max(width);
+            self.metadata_height = line * LINE_ADVANCE + GLYPH_HEIGHT;
+            widths.push(width);
+        }
+        for (line, width) in widths.into_iter().enumerate() {
+            for y in
+                METADATA_Y + line * LINE_ADVANCE..METADATA_Y + line * LINE_ADVANCE + GLYPH_HEIGHT
+            {
+                let row = &mut self.text.pixels[y * WIDTH..(y + 1) * WIDTH];
+                let offset = self.metadata_width - width;
+                row.copy_within(0..width, offset);
+                row[..offset].fill(0);
+            }
+        }
+        self.text.serial += 1;
+        self.metadata_key = Some((label.into(), available));
+        Ok(())
+    }
+
+    // All dots share one strip in the unused first twelve rows of the text
+    // atlas. Chapter count therefore does not consume native overlay slots.
+    fn update_chapters(&mut self, markers: &[f32], width: i32) {
+        if markers.is_empty() && self.chapter_key.is_none() {
+            return;
+        }
+        if self
+            .chapter_key
+            .as_ref()
+            .is_some_and(|(old, old_width)| old == markers && *old_width == width)
+        {
+            return;
+        }
+        self.text.pixels[..WIDTH * 12].fill(0);
+        let span = (width as f32 - 2.0 * SCRUBBER_MARGIN).max(0.0);
+        let pixel_width = (span + 12.0) / WIDTH as f32;
+        for &marker in markers
+            .iter()
+            .filter(|marker| marker.is_finite() && (0.0..=1.0).contains(*marker))
+        {
+            let center = 6.0 + marker * span;
+            let left = ((center - 6.0) / pixel_width).max(0.0) as usize;
+            let right = (((center + 6.0) / pixel_width).ceil() as usize).min(WIDTH);
+            for y in 0..12 {
+                for x in left..right {
+                    let pixel_x = (x as f32 + 0.5) * pixel_width;
+                    // The timeline supplies the middle rows. Painting them
+                    // twice would brighten the translucent unplayed section.
+                    if (4..8).contains(&y) && (6.0..span + 6.0).contains(&pixel_x) {
+                        continue;
+                    }
+                    let dx = pixel_x - center;
+                    let dy = y as f32 + 0.5 - 6.0;
+                    let coverage = (5.5 - dx.hypot(dy)).clamp(0.0, 1.0);
+                    let pixel = &mut self.text.pixels[y * WIDTH + x];
+                    *pixel = (*pixel).max((coverage * 255.0).round() as u8);
+                }
+            }
+        }
+        self.text.serial += 1;
+        self.chapter_key = Some((markers.to_vec(), width));
+    }
+
     pub fn prepare(
         &mut self,
         content: Content<'_>,
-        visibility: Visibility,
+        visibility: Visibility<'_>,
         width: i32,
         height: i32,
     ) -> Result<Prepared<'_>> {
+        let chapter = content.metadata;
         self.update(content, width)?;
+        self.update_metadata(chapter, width)?;
+        self.update_chapters(visibility.chapter_markers, width);
         let (width, height) = (width as f32, height as f32);
         self.parts.clear();
         let parts = &mut self.parts;
@@ -517,9 +609,24 @@ impl Overlays {
             );
         }
         let bottom = (height - INSET - (ACCENT_PAD + BASE_HEIGHT) as f32).max(0.0);
+        let metadata_top = INSET - ACCENT_PAD as f32;
+        let metadata_scale = if self.metadata_height > 0 {
+            1.0_f32
+                .min(((bottom - metadata_top - 12.0).max(0.0) * 0.5) / self.metadata_height as f32)
+        } else {
+            1.0
+        };
+        let metadata_width = self.metadata_width as f32 * metadata_scale;
+        let metadata_height = self.metadata_height as f32 * metadata_scale;
         if self.details_width > 0 && self.details_height > 0 {
             let (dw, dh) = (self.details_width as f32, self.details_height as f32);
-            let top = INSET - ACCENT_PAD as f32;
+            let mut top = INSET - ACCENT_PAD as f32;
+            if self.metadata_width > 0
+                && INSET + dw.min((width - 2.0 * INSET).max(0.0)) + 16.0
+                    > width - INSET - metadata_width
+            {
+                top = metadata_top + metadata_height + 8.0;
+            }
             let available_width = (width - 2.0 * INSET).max(0.0);
             let available_height = (bottom - 4.0 - top).max(0.0);
             let scale = 1.0_f32.min(available_width / dw).min(available_height / dh);
@@ -531,6 +638,25 @@ impl Overlays {
                     white(1.0),
                 );
             }
+        }
+        if self.metadata_width > 0 && metadata_scale > 0.0 {
+            let x = (width - INSET - metadata_width).max(INSET);
+            add(
+                1,
+                [
+                    0.0,
+                    METADATA_Y as f32,
+                    self.metadata_width as f32,
+                    (METADATA_Y + self.metadata_height) as f32,
+                ],
+                [
+                    x,
+                    metadata_top,
+                    x + metadata_width,
+                    metadata_top + metadata_height,
+                ],
+                white(1.0),
+            );
         }
         let info_alpha = visibility.info.clamp(0.0, 1.0);
         if self.info_width > 0 && info_alpha > 0.001 {
@@ -577,6 +703,21 @@ impl Overlays {
                         solid,
                         [left, y - 2.0, x, y + 2.0],
                         [0.25, 0.70, 1.0, alpha],
+                    );
+                }
+                if !visibility.chapter_markers.is_empty() {
+                    let split = (x - left + 6.0) / (right - left + 12.0) * WIDTH as f32;
+                    add(
+                        1,
+                        [0.0, 0.0, split, 12.0],
+                        [left - 6.0, y - 6.0, x, y + 6.0],
+                        [0.25, 0.70, 1.0, alpha],
+                    );
+                    add(
+                        1,
+                        [split, 0.0, WIDTH as f32, 12.0],
+                        [x, y - 6.0, right + 6.0, y + 6.0],
+                        white(0.35 * alpha),
                     );
                 }
                 add(0, solid, [x - 3.0, y - 6.0, x + 3.0, y + 6.0], white(alpha));

@@ -19,6 +19,8 @@ pub(crate) enum MprisCommand {
     Stop,
     Seek(i64),
     SetPosition(i64),
+    NextChapter,
+    PreviousChapter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +41,10 @@ impl PlaybackStatus {
 
 struct State {
     title: CString,
+    artist: Option<CString>,
+    art_uri: Option<CString>,
+    can_previous: bool,
+    can_next: bool,
     uri: Option<CString>,
     duration_us: i64,
     position_us: i64,
@@ -46,7 +52,7 @@ struct State {
     commands: VecDeque<MprisCommand>,
 }
 impl State {
-    fn new(title: &CStr, path: &Path, duration_us: i64) -> Self {
+    fn new(title: &CStr, artist: Option<&str>, path: &Path, duration_us: i64) -> Self {
         Self {
             title: if title.is_empty() {
                 c"Unknown media"
@@ -54,6 +60,12 @@ impl State {
                 title
             }
             .into(),
+            artist: artist
+                .filter(|artist| !artist.is_empty())
+                .map(|artist| CString::new(artist).expect("artist has no NUL bytes")),
+            art_uri: None,
+            can_previous: false,
+            can_next: false,
             uri: file_uri(path),
             duration_us: duration_us.max(0),
             position_us: 0,
@@ -69,6 +81,8 @@ impl State {
             (false, b"Pause") => MprisCommand::Pause,
             (false, b"PlayPause") => MprisCommand::PlayPause,
             (false, b"Stop") => MprisCommand::Stop,
+            (false, b"Next") => MprisCommand::NextChapter,
+            (false, b"Previous") => MprisCommand::PreviousChapter,
             (false, b"Seek") => MprisCommand::Seek(value),
             (false, b"SetPosition") if track_id == Some(TRACK_ID) => {
                 MprisCommand::SetPosition(value)
@@ -89,8 +103,16 @@ impl State {
                 value.integer = 1;
             }
             (true, b"Fullscreen" | b"CanSetFullscreen" | b"CanRaise" | b"HasTrackList")
-            | (false, b"Shuffle" | b"CanGoNext" | b"CanGoPrevious") => {
+            | (false, b"Shuffle") => {
                 value.kind = ffi::UP_MPRIS_VALUE_BOOL;
+            }
+            (false, b"CanGoNext" | b"CanGoPrevious") => {
+                value.kind = ffi::UP_MPRIS_VALUE_BOOL;
+                value.integer = i64::from(if name == b"CanGoNext" {
+                    self.can_next
+                } else {
+                    self.can_previous
+                });
             }
             (true, b"Identity") => {
                 value.kind = ffi::UP_MPRIS_VALUE_STRING;
@@ -123,12 +145,26 @@ impl State {
                 value.kind = ffi::UP_MPRIS_VALUE_METADATA;
                 value.track_id = TRACK_ID.as_ptr();
                 value.title = self.title.as_ptr();
+                value.artist = self
+                    .artist
+                    .as_ref()
+                    .map_or(ptr::null(), |artist| artist.as_ptr());
+                value.art_uri = self
+                    .art_uri
+                    .as_ref()
+                    .map_or(ptr::null(), |uri| uri.as_ptr());
                 value.uri = self.uri.as_ref().map_or(ptr::null(), |uri| uri.as_ptr());
                 value.duration_us = self.duration_us;
             }
             _ => return None,
         }
         Some(value)
+    }
+
+    fn navigation(&mut self, previous: bool, next: bool) -> bool {
+        let changed = (self.can_previous, self.can_next) != (previous, next);
+        (self.can_previous, self.can_next) = (previous, next);
+        changed
     }
 
     fn update(&mut self, status: PlaybackStatus, position_us: i64) -> bool {
@@ -200,8 +236,16 @@ pub(crate) struct Mpris {
     state: Box<RefCell<State>>,
 }
 impl Mpris {
-    pub(crate) fn create(title: &CStr, path: &Path, duration_us: i64) -> Option<Self> {
-        let state = Box::new(RefCell::new(State::new(title, path, duration_us)));
+    pub(crate) fn create(
+        title: &CStr,
+        artist: Option<&str>,
+        path: &Path,
+        duration_us: i64,
+        artwork: Option<&Path>,
+    ) -> Option<Self> {
+        let mut initial = State::new(title, artist, path, duration_us);
+        initial.art_uri = artwork.and_then(file_uri);
+        let state = Box::new(RefCell::new(initial));
         let callbacks = ffi::UpMprisCallbacks {
             data: (&*state as *const RefCell<State>).cast_mut().cast(),
             command: command_callback,
@@ -227,6 +271,13 @@ impl Mpris {
             return None;
         }
         Some(mpris)
+    }
+
+    pub(crate) fn navigation(&self, previous: bool, next: bool) {
+        let changed = self.state.borrow_mut().navigation(previous, next);
+        if changed {
+            unsafe { ffi::up_mpris_navigation_changed(self.native.as_ptr(), previous, next) };
+        }
     }
 
     pub(crate) fn dispatch(&self) {
@@ -267,10 +318,15 @@ mod tests {
     use super::*;
     #[test]
     fn commands_are_bounded_ordered_and_track_scoped() {
-        let mut state = State::new(c"Video", Path::new("/tmp/video.mkv"), 100);
+        let mut state = State::new(c"Video", None, Path::new("/tmp/video.mkv"), 100);
         state.command(false, b"SetPosition", Some(c"/wrong/track"), 20);
         state.command(false, b"Next", None, 0);
         state.command(false, b"Previous", None, 0);
+        assert_eq!(state.commands.pop_front(), Some(MprisCommand::NextChapter));
+        assert_eq!(
+            state.commands.pop_front(),
+            Some(MprisCommand::PreviousChapter)
+        );
         assert!(state.commands.is_empty());
         for value in 0..32 {
             state.command(false, b"Seek", None, value);
@@ -288,7 +344,7 @@ mod tests {
     }
     #[test]
     fn properties_follow_state_without_advertising_a_playlist() {
-        let mut state = State::new(c"Video", Path::new("/tmp/video.mkv"), -1);
+        let mut state = State::new(c"Video", None, Path::new("/tmp/video.mkv"), -1);
         assert!(!state.update(PlaybackStatus::Playing, -1));
         assert_eq!(state.position_us, 0);
         assert!(state.update(PlaybackStatus::Paused, 100));
@@ -299,6 +355,36 @@ mod tests {
         assert_eq!(state.property(false, b"CanGoNext").unwrap().integer, 0);
         assert_eq!(state.property(false, b"CanGoPrevious").unwrap().integer, 0);
         assert_eq!(state.property(false, b"Metadata").unwrap().duration_us, 0);
+    }
+    #[test]
+    fn desktop_metadata_and_chapter_capabilities_are_exposed() {
+        let mut state = State::new(
+            c"Seven Samurai",
+            Some("Akira Kurosawa"),
+            Path::new("/tmp/movie.mp4"),
+            100,
+        );
+        state.art_uri = file_uri(Path::new("/tmp/cover image.jpg"));
+        let metadata = state.property(false, b"Metadata").unwrap();
+        assert_eq!(unsafe { CStr::from_ptr(metadata.title) }, c"Seven Samurai");
+        assert_eq!(
+            unsafe { CStr::from_ptr(metadata.artist) },
+            c"Akira Kurosawa"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(metadata.art_uri) },
+            c"file:///tmp/cover%20image.jpg"
+        );
+        assert!(state.navigation(false, true));
+        assert!(!state.navigation(false, true));
+        assert_eq!(state.property(false, b"CanGoNext").unwrap().integer, 1);
+        assert_eq!(state.property(false, b"CanGoPrevious").unwrap().integer, 0);
+        assert!(state.navigation(true, false));
+        assert_eq!(state.property(false, b"CanGoNext").unwrap().integer, 0);
+        assert_eq!(state.property(false, b"CanGoPrevious").unwrap().integer, 1);
+        let empty = State::new(c"Filename", None, Path::new("/tmp/movie.mp4"), 0);
+        let metadata = empty.property(false, b"Metadata").unwrap();
+        assert!(metadata.artist.is_null() && metadata.art_uri.is_null());
     }
     #[test]
     fn metadata_uris_preserve_special_and_non_utf8_filenames() {

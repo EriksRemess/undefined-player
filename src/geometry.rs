@@ -119,6 +119,27 @@ impl WindowGeometry {
         }
     }
 
+    pub(crate) fn chapter_hover(self, x: f64, y: f64, markers: &[f32]) -> Option<usize> {
+        if self.hit(x, y) == HitRegion::Outside {
+            return None;
+        }
+        let (x, y) = (x / self.scale_x, y / self.scale_y);
+        let width = self.width / self.scale_x;
+        let height = self.height / self.scale_y;
+        if (y - (height - 18.0)).abs() > 8.0 {
+            return None;
+        }
+        let left = f64::from(SCRUBBER_MARGIN);
+        let span = (width - 2.0 * left).max(0.0);
+        markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| (index, (x - (left + f64::from(*marker) * span)).abs()))
+            .filter(|(_, distance)| *distance <= 8.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
+    }
+
     pub(crate) fn scrubber_target(self, x: f64, y: f64, duration: f64) -> Option<f64> {
         if !duration.is_finite() || duration <= 0.0 || self.hit(x, y) != HitRegion::Scrubber {
             return None;
@@ -146,6 +167,32 @@ pub extern "C" fn up_input_hit_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chapter_hover_uses_physical_dot_positions_at_all_scales() {
+        for (width, height) in [(1280, 720), (1707, 960), (2560, 1440)] {
+            let geometry = WindowGeometry::new(1280, 720, width, height).unwrap();
+            let scale_x = 1280.0 / f64::from(width);
+            let scale_y = 720.0 / f64::from(height);
+            let markers = [0.0, 0.25, 0.5, 1.0];
+            for (index, marker) in markers.iter().enumerate() {
+                let x = 14.0 + f64::from(*marker) * f64::from(width - 28);
+                let y = f64::from(height - 18);
+                assert_eq!(
+                    geometry.chapter_hover(x * scale_x, y * scale_y, &markers),
+                    Some(index)
+                );
+                assert_eq!(
+                    geometry.chapter_hover(x * scale_x, (y - 12.0) * scale_y, &markers),
+                    None
+                );
+            }
+            assert_eq!(geometry.chapter_hover(400.0, 300.0, &markers), None);
+            assert_eq!(geometry.chapter_hover(f64::NAN, 1.0, &markers), None);
+        }
+        let geometry = WindowGeometry::new(320, 180, 320, 180).unwrap();
+        assert_eq!(geometry.chapter_hover(161.0, 162.0, &[0.5, 0.52]), Some(0));
+    }
 
     #[test]
     fn small_videos_use_the_largest_integer_scale_that_fits() {

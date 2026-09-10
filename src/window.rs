@@ -9,6 +9,8 @@ pub(crate) enum Action {
     Quit,
     SeekBackward,
     SeekForward,
+    PreviousChapter,
+    NextChapter,
     ToggleFullscreen,
     ToggleCrop,
     CycleDeinterlace,
@@ -20,6 +22,8 @@ pub(crate) enum Action {
 
 pub(crate) fn action_for_key(key: u32) -> Option<Action> {
     match key {
+        ffi::UpKey_UP_KEY_COMMA => Some(Action::PreviousChapter),
+        ffi::UpKey_UP_KEY_PERIOD => Some(Action::NextChapter),
         ffi::UpKey_UP_KEY_Z => Some(Action::ToggleZoom),
         ffi::UpKey_UP_KEY_D => Some(Action::CycleDeinterlace),
         ffi::UpKey_UP_KEY_C => Some(Action::ToggleCrop),
@@ -187,6 +191,21 @@ impl Window {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn chapter_hover(&self, x: f32, y: f32, markers: &[f32]) -> Option<usize> {
+        let (mut width, mut height, mut pixel_width, mut pixel_height) = (0, 0, 0, 0);
+        if unsafe { ffi::up_window_size(self.0, &mut width, &mut height) } == 0
+            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
+                == 0
+        {
+            return None;
+        }
+        geometry::WindowGeometry::new(width, height, pixel_width, pixel_height)?.chapter_hover(
+            f64::from(x),
+            f64::from(y),
+            markers,
+        )
     }
 }
 

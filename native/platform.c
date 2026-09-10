@@ -11,6 +11,10 @@
 static enum UpKey translate_key(SDL_Keycode key)
 {
     switch (key) {
+    case SDLK_COMMA:
+        return UP_KEY_COMMA;
+    case SDLK_PERIOD:
+        return UP_KEY_PERIOD;
     case SDLK_Z:
         return UP_KEY_Z;
     case SDLK_D:
@@ -111,6 +115,9 @@ int up_platform_poll_event(UpEvent *event)
         event->type = UP_EVENT_MOUSE_MOTION;
         event->x = native.motion.x;
         event->y = native.motion.y;
+        break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        event->type = UP_EVENT_MOUSE_LEAVE;
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:

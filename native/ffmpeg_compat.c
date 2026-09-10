@@ -8,6 +8,7 @@
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 
 #if LIBAVFORMAT_VERSION_MAJOR < 62 || LIBAVCODEC_VERSION_MAJOR < 62 || \
     LIBAVUTIL_VERSION_MAJOR < 60
@@ -140,6 +141,118 @@ static enum AVMediaType media_type(enum UpMediaType type)
     }
 }
 
+size_t up_av_stream_attached_picture(const UpAvFormat *format,
+                                    unsigned int index, const uint8_t **data)
+{
+    const AVStream *stream = stream_at(format, index);
+    *data = NULL;
+    if (!stream || !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC) ||
+        !stream->attached_pic.data || stream->attached_pic.size <= 0)
+        return 0;
+    *data = stream->attached_pic.data;
+    return (size_t) stream->attached_pic.size;
+}
+
+uint8_t *up_av_artwork_png(const UpAvFormat *format, unsigned int index,
+                         size_t *png_size)
+{
+    *png_size = 0;
+    const AVStream *stream = stream_at(format, index);
+    if (!stream || !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC))
+        return NULL;
+    const AVCodec *decoder_codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    const AVCodec *encoder_codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+    if (!decoder_codec || !encoder_codec)
+        return NULL;
+    AVCodecContext *decoder = avcodec_alloc_context3(decoder_codec);
+    AVCodecContext *encoder = avcodec_alloc_context3(encoder_codec);
+    AVFrame *source = av_frame_alloc(), *canvas = av_frame_alloc();
+    AVFrame *scaled = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+    struct SwsContext *scale = NULL;
+    uint8_t *result = NULL;
+    if (!decoder || !encoder || !source || !canvas || !scaled || !packet ||
+        avcodec_parameters_to_context(decoder, stream->codecpar) < 0)
+        goto out;
+    decoder->thread_count = 1;
+    decoder->max_pixels = 16 * 1024 * 1024;
+    if (avcodec_open2(decoder, decoder_codec, NULL) < 0 ||
+        avcodec_send_packet(decoder, &stream->attached_pic) < 0 ||
+        avcodec_receive_frame(decoder, source) < 0 || source->width <= 0 || source->height <= 0)
+        goto out;
+    double aspect = (double) source->width / source->height;
+    if (source->sample_aspect_ratio.num > 0 && source->sample_aspect_ratio.den > 0)
+        aspect *= av_q2d(source->sample_aspect_ratio);
+    const int width = aspect >= 1.0 ? 512 : FFMAX(1, (int) lrint(512 * aspect));
+    const int height = aspect <= 1.0 ? 512 : FFMAX(1, (int) lrint(512 / aspect));
+    canvas->format = AV_PIX_FMT_RGBA;
+    canvas->width = canvas->height = 512;
+    if (av_frame_get_buffer(canvas, 0) < 0)
+        goto out;
+    memset(canvas->data[0], 0, (size_t) canvas->linesize[0] * 512);
+    scaled->format = AV_PIX_FMT_RGBA;
+    scaled->width = width;
+    scaled->height = height;
+    if (av_frame_get_buffer(scaled, 0) < 0)
+        goto out;
+    enum AVPixelFormat pixel_format = source->format;
+    // YUVJ formats are deprecated aliases for full-range YUV. Normalize the
+    // format while retaining the range explicitly for the scaler.
+    switch (pixel_format) {
+    case AV_PIX_FMT_YUVJ420P: pixel_format = AV_PIX_FMT_YUV420P; break;
+    case AV_PIX_FMT_YUVJ422P: pixel_format = AV_PIX_FMT_YUV422P; break;
+    case AV_PIX_FMT_YUVJ444P: pixel_format = AV_PIX_FMT_YUV444P; break;
+    case AV_PIX_FMT_YUVJ440P: pixel_format = AV_PIX_FMT_YUV440P; break;
+    case AV_PIX_FMT_YUVJ411P: pixel_format = AV_PIX_FMT_YUV411P; break;
+    default: break;
+    }
+    const int full_range = source->color_range == AVCOL_RANGE_JPEG ||
+                           pixel_format != source->format;
+    scale = sws_getContext(source->width, source->height, pixel_format,
+                          width, height, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
+    if (!scale)
+        goto out;
+    const int *coefficients = sws_getCoefficients(source->colorspace);
+    if (sws_setColorspaceDetails(scale, coefficients, full_range,
+                                 coefficients, 1, 0, 1 << 16, 1 << 16) < 0)
+        goto out;
+    if (sws_scale(scale, (const uint8_t *const *) source->data, source->linesize,
+                  0, source->height, scaled->data, scaled->linesize) != height)
+        goto out;
+    // Keep scaler row padding separate from the visible transparent canvas.
+    for (int row = 0; row < height; row++)
+        memcpy(canvas->data[0] + (row + (512 - height) / 2) * canvas->linesize[0] +
+               ((512 - width) / 2) * 4,
+               scaled->data[0] + row * scaled->linesize[0], (size_t) width * 4);
+    encoder->width = encoder->height = 512;
+    encoder->pix_fmt = AV_PIX_FMT_RGBA;
+    encoder->time_base = (AVRational) {1, 1};
+    encoder->thread_count = 1;
+    if (avcodec_open2(encoder, encoder_codec, NULL) < 0 ||
+        avcodec_send_frame(encoder, canvas) < 0 ||
+        avcodec_receive_packet(encoder, packet) < 0 || packet->size <= 0)
+        goto out;
+    result = malloc((size_t) packet->size);
+    if (result) {
+        memcpy(result, packet->data, (size_t) packet->size);
+        *png_size = (size_t) packet->size;
+    }
+out:
+    sws_freeContext(scale);
+    av_packet_free(&packet);
+    av_frame_free(&canvas);
+    av_frame_free(&source);
+    av_frame_free(&scaled);
+    avcodec_free_context(&encoder);
+    avcodec_free_context(&decoder);
+    return result;
+}
+
+void up_av_artwork_free(uint8_t *data)
+{
+    free(data);
+}
+
 static enum UpMediaType up_media_type(enum AVMediaType type)
 {
     switch (type) {
@@ -203,7 +316,14 @@ int up_av_error_is_eof(int code)
 int up_av_format_open(UpAvFormat **format, const char *path)
 {
     AVFormatContext *native = NULL;
+    /* MP4 cover art has no media timescale, but the MOV demuxer warns when
+     * assigning its fallback. Use the same startup log policy as stream
+     * discovery below; keep errors visible and restore playback logging. */
+    int log_level = av_log_get_level();
+    if (log_level > AV_LOG_ERROR)
+        av_log_set_level(AV_LOG_ERROR);
     int result = avformat_open_input(&native, path, NULL, NULL);
+    av_log_set_level(log_level);
     *format = (UpAvFormat *) native;
     return result;
 }
@@ -278,6 +398,38 @@ double up_av_format_duration(const UpAvFormat *format)
     const int64_t duration = format ? FORMAT(format)->duration : AV_NOPTS_VALUE;
     return duration != AV_NOPTS_VALUE && duration > 0
         ? (double) duration / AV_TIME_BASE : NAN;
+}
+
+unsigned int up_av_chapter_count(const UpAvFormat *format)
+{
+    return format ? FORMAT(format)->nb_chapters : 0;
+}
+
+const char *up_av_format_metadata(const UpAvFormat *format, const char *key)
+{
+    const AVDictionaryEntry *entry = format && key
+        ? av_dict_get(FORMAT(format)->metadata, key, NULL, 0) : NULL;
+    return entry ? entry->value : NULL;
+}
+
+double up_av_chapter_start(const UpAvFormat *format, unsigned int index)
+{
+    if (index >= up_av_chapter_count(format))
+        return NAN;
+    const AVChapter *chapter = FORMAT(format)->chapters[index];
+    if (!chapter || chapter->start == AV_NOPTS_VALUE ||
+        chapter->time_base.num <= 0 || chapter->time_base.den <= 0)
+        return NAN;
+    return (double) chapter->start * av_q2d(chapter->time_base);
+}
+
+const char *up_av_chapter_title(const UpAvFormat *format, unsigned int index)
+{
+    if (index >= up_av_chapter_count(format) || !FORMAT(format)->chapters[index])
+        return NULL;
+    const AVDictionaryEntry *title = av_dict_get(
+        FORMAT(format)->chapters[index]->metadata, "title", NULL, 0);
+    return title ? title->value : NULL;
 }
 
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet)

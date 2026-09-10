@@ -23,6 +23,8 @@ typedef struct UpMprisValue {
     const char *text;
     const char *track_id;
     const char *title;
+    const char *artist;
+    const char *art_uri;
     const char *uri;
     int64_t duration_us;
 } UpMprisValue;
@@ -40,5 +42,6 @@ int up_mpris_active(const UpMpris *mpris);
 const char *up_mpris_error(const UpMpris *mpris);
 void up_mpris_dispatch(UpMpris *mpris);
 void up_mpris_status_changed(UpMpris *mpris, const char *status);
+void up_mpris_navigation_changed(UpMpris *mpris, bool previous, bool next);
 void up_mpris_seeked(UpMpris *mpris, int64_t position_us);
 void up_mpris_destroy(UpMpris *mpris);

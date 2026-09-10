@@ -66,13 +66,24 @@ The player starts playing immediately. The focused video window accepts:
   position
 - `A` — switch to the next audio track
 - `Left` / `Right` — seek backward or forward 10 seconds
+- `,` / `.` — jump to the previous or next chapter
 - `Space` — pause or resume
 - `S` — toggle subtitles
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
 
+For files with chapters, dots on the timeline mark each chapter's start.
+Chapter navigation keeps the current pause state and stops at the first or last
+chapter; files without chapters leave these keys inactive.
+After a chapter jump, its number and title appear in the top bar for three
+seconds. Hovering a chapter dot shows its title there too. The `I` overlay lists
+the current chapter at the top right, alongside embedded title and artist tags
+when available. Untitled chapters show only their number.
+
 The current file is also exported through MPRIS. GNOME and other desktop media
-controls can show its title and send play, pause, stop, and seek commands.
+controls show its embedded title, artist, and cover image when available, falling
+back to the filename for untitled media. They support play, pause, stop, and seek;
+previous/next buttons navigate chapters and disable at their respective ends.
 
 The borderless Wayland window can be dragged from anywhere with the left mouse
 button. Drag an edge or corner to resize it; the client-area aspect ratio is

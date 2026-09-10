@@ -45,6 +45,14 @@ fn changing_audio_format_is_safe() {
     child("changing-audio");
 }
 #[test]
+fn embedded_chapters_use_the_normal_seek_path() {
+    child("chapters");
+}
+#[test]
+fn embedded_artwork_is_extracted_and_cleaned_up() {
+    child("artwork");
+}
+#[test]
 fn delayed_audio_switch_makes_progress() {
     child("delayed-audio");
 }
@@ -141,6 +149,175 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "artwork" => {
+            for (source_width, source_height, width, height) in [
+                (64, 96, 341, 512),
+                (1020, 1024, 510, 512),
+                (1016, 1024, 508, 512),
+                (1024, 1020, 512, 510),
+            ] {
+                let cover = fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("color=red:size={source_width}x{source_height}"),
+                        "-frames:v",
+                        "1",
+                        "-update",
+                        "1",
+                    ],
+                    &format!("cover-{source_width}-{source_height}.jpg"),
+                );
+                let path = fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc2=size=64x64:rate=25:duration=0.4",
+                        "-i",
+                        cover.to_str().unwrap(),
+                        "-map",
+                        "0:v",
+                        "-map",
+                        "1:v",
+                        "-c:v:0",
+                        "mpeg4",
+                        "-c:v:1",
+                        "copy",
+                        "-disposition:v:1",
+                        "attached_pic",
+                    ],
+                    &format!("artwork-{source_width}-{source_height}.mp4"),
+                );
+                let media = unsafe { Media::open(&path, None, false) }.unwrap();
+                let artwork = unsafe { crate::artwork::Artwork::extract(media.format) }.unwrap();
+                let pixels = Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&artwork.path)
+                    .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    pixels.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&pixels.stderr)
+                );
+                assert_eq!(pixels.stdout.len(), 512 * 512 * 4);
+                let alpha = |x: usize, y: usize| pixels.stdout[(y * 512 + x) * 4 + 3];
+                let left = (512 - width) / 2;
+                let top = (512 - height) / 2;
+                for y in 0..512 {
+                    for x in 0..512 {
+                        let expected = if (left..left + width).contains(&x)
+                            && (top..top + height).contains(&y)
+                        {
+                            255
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            alpha(x, y),
+                            expected,
+                            "{source_width}x{source_height}: pixel {x},{y}"
+                        );
+                    }
+                }
+                let center = (256 * 512 + 256) * 4;
+                assert!(pixels.stdout[center] >= 250);
+                assert!(pixels.stdout[center + 1] <= 5 && pixels.stdout[center + 2] <= 5);
+                let opaque_width = (0..512).filter(|&x| alpha(x, 256) > 0).count();
+                assert_eq!(opaque_width, width);
+                let saved_path = artwork.path.clone();
+                drop(artwork);
+                assert!(!saved_path.exists());
+            }
+            assert!(unsafe { crate::artwork::Artwork::extract(ptr::null()) }.is_none());
+        }
+        "chapters" => {
+            let metadata = fixture.0.join("chapters.txt");
+            std::fs::write(&metadata, ";FFMETADATA1\ntitle=Example Movie\nartist=Example Artist\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\ntitle=First\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=800\nEND=1600\ntitle=Second\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=1600\nEND=2400\ntitle=Third\n").unwrap();
+            for (extension, rate) in [("mp4", 25), ("mkv", 25), ("mp4", 5), ("mkv", 5)] {
+                let path = fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("testsrc2=size=64x64:rate={rate}:duration=2.4"),
+                        "-f",
+                        "ffmetadata",
+                        "-i",
+                        metadata.to_str().unwrap(),
+                        "-map",
+                        "0:v",
+                        "-map_chapters",
+                        "1",
+                        "-map_metadata",
+                        "1",
+                        "-c:v",
+                        "mpeg4",
+                        "-g",
+                        "12",
+                    ],
+                    &format!("chapters-{rate}.{extension}"),
+                );
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                let metadata = unsafe { crate::metadata::MediaMetadata::inspect(media.format) };
+                assert_eq!(
+                    metadata.overlay_text(None).to_str().unwrap(),
+                    "TITLE: EXAMPLE MOVIE\nARTIST: EXAMPLE ARTIST"
+                );
+                let origin = media.first_video_pts.unwrap();
+                let duration = media.duration();
+                let mut chapters =
+                    unsafe { crate::chapters::Chapters::inspect(media.format, origin, duration) };
+                assert_eq!(unsafe { ffi::up_av_chapter_count(media.format) }, 3);
+                assert!(unsafe { ffi::up_av_chapter_start(media.format, 3) }.is_nan());
+                assert_eq!(chapters.markers(duration).len(), 3);
+                assert_eq!(
+                    chapters.label(1).unwrap().to_str().unwrap(),
+                    "CHAPTER 2 / 3 — SECOND"
+                );
+                assert!(unsafe { ffi::up_av_chapter_title(media.format, 3) }.is_null());
+                let mut clock = WallClock::new(origin);
+                clock.set_paused(true);
+                let mut notice = crate::presentation::PositionNotice::new();
+                for (forward, expected) in [(true, 0.8), (true, 1.6), (false, 0.8), (false, 0.0)] {
+                    let target = chapters
+                        .target(chapters.playback_position(clock.now() - origin), forward)
+                        .unwrap();
+                    assert!((target - expected).abs() < 0.001);
+                    unsafe {
+                        crate::playback::seek_to(
+                            &mut media,
+                            &mut clock,
+                            &mut notice,
+                            target,
+                            origin,
+                            duration,
+                        )
+                    }
+                    .unwrap();
+                    unsafe { media.fill_initial_queues() }.unwrap();
+                    let frame = media.video_queue.front().unwrap();
+                    assert!(
+                        (frame.pts - (origin + target)).abs() <= 1.0 / f64::from(rate) + 0.001,
+                        "{}: {}",
+                        extension,
+                        frame.pts
+                    );
+                    chapters.seeked(target);
+                    let landed =
+                        unsafe { media.finish_seek(Some(frame.pts), origin + target) }.unwrap();
+                    clock.seek(landed);
+                    assert_eq!(
+                        chapters.current(chapters.playback_position(clock.now() - origin)),
+                        chapters.current(target)
+                    );
+                }
+            }
+        }
         "interlacing" => {
             for (name, filter, flags, expected) in [
                 ("progressive", "null", "0", 0),

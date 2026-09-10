@@ -4,8 +4,10 @@ use cli::{CliAction, parse_cli, usage};
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod artwork;
 mod audio;
 mod autocrop;
+mod chapters;
 mod cli;
 mod clock;
 mod decoder;

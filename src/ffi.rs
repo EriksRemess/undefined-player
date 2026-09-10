@@ -152,6 +152,27 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_av_format_duration(format: *const UpAvFormat) -> f64;
+    pub fn up_av_artwork_png(
+        format: *const UpAvFormat,
+        index: u32,
+        png_size: *mut usize,
+    ) -> *mut u8;
+    pub fn up_av_artwork_free(data: *mut u8);
+    pub fn up_av_stream_attached_picture(
+        format: *const UpAvFormat,
+        index: u32,
+        data: *mut *const u8,
+    ) -> usize;
+    pub fn up_av_format_metadata(
+        format: *const UpAvFormat,
+        key: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+    pub fn up_av_chapter_count(format: *const UpAvFormat) -> u32;
+    pub fn up_av_chapter_start(format: *const UpAvFormat, index: u32) -> f64;
+    pub fn up_av_chapter_title(
+        format: *const UpAvFormat,
+        index: u32,
+    ) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     pub fn up_av_read_frame(
@@ -328,6 +349,7 @@ pub const UpEventType_UP_EVENT_MOUSE_MOTION: UpEventType = 7;
 pub const UpEventType_UP_EVENT_MOUSE_BUTTON_DOWN: UpEventType = 8;
 pub const UpEventType_UP_EVENT_MOUSE_BUTTON_UP: UpEventType = 9;
 pub const UpEventType_UP_EVENT_KEY_DOWN: UpEventType = 10;
+pub const UpEventType_UP_EVENT_MOUSE_LEAVE: UpEventType = 11;
 pub type UpEventType = ::std::os::raw::c_uint;
 pub const UpKey_UP_KEY_OTHER: UpKey = 0;
 pub const UpKey_UP_KEY_Q: UpKey = 1;
@@ -342,6 +364,8 @@ pub const UpKey_UP_KEY_A: UpKey = 9;
 pub const UpKey_UP_KEY_C: UpKey = 10;
 pub const UpKey_UP_KEY_D: UpKey = 11;
 pub const UpKey_UP_KEY_Z: UpKey = 12;
+pub const UpKey_UP_KEY_COMMA: UpKey = 13;
+pub const UpKey_UP_KEY_PERIOD: UpKey = 14;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -519,6 +543,8 @@ pub struct UpMprisValue {
     pub text: *const ::std::ffi::c_char,
     pub track_id: *const ::std::ffi::c_char,
     pub title: *const ::std::ffi::c_char,
+    pub artist: *const ::std::ffi::c_char,
+    pub art_uri: *const ::std::ffi::c_char,
     pub uri: *const ::std::ffi::c_char,
     pub duration_us: i64,
 }
@@ -549,8 +575,10 @@ unsafe extern "C" {
     pub fn up_mpris_error(mpris: *const UpMpris) -> *const ::std::ffi::c_char;
     pub fn up_mpris_dispatch(mpris: *mut UpMpris);
     pub fn up_mpris_status_changed(mpris: *mut UpMpris, status: *const ::std::ffi::c_char);
+    pub fn up_mpris_navigation_changed(mpris: *mut UpMpris, previous: bool, next: bool);
     pub fn up_mpris_seeked(mpris: *mut UpMpris, position_us: i64);
     pub fn up_mpris_destroy(mpris: *mut UpMpris);
+
 }
 
 #[repr(C)]

@@ -1,8 +1,63 @@
 use crate::decoder::{ffmpeg_name, stream_metadata};
 use crate::ffi;
 use crate::media::Media;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
+
+pub(crate) fn single_line_metadata(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+pub(crate) struct MediaMetadata {
+    title: Option<String>,
+    artist: Option<String>,
+}
+
+fn present_artist(artist: Option<String>) -> Option<String> {
+    artist.filter(|artist| !artist.eq_ignore_ascii_case("unknown"))
+}
+
+impl MediaMetadata {
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    pub(crate) fn artist(&self) -> Option<&str> {
+        self.artist.as_deref()
+    }
+    pub(crate) unsafe fn inspect(format: *const ffi::UpAvFormat) -> Self {
+        let read = |key: &CStr| {
+            let pointer = unsafe { ffi::up_av_format_metadata(format, key.as_ptr()) };
+            if pointer.is_null() {
+                return None;
+            }
+            let text = single_line_metadata(&unsafe { CStr::from_ptr(pointer) }.to_string_lossy());
+            (!text.is_empty()).then_some(text)
+        };
+        Self {
+            title: read(c"title"),
+            artist: present_artist(read(c"artist")),
+        }
+    }
+
+    pub(crate) fn overlay_text(&self, chapter: Option<&CStr>) -> CString {
+        let mut lines = Vec::new();
+        if let Some(title) = &self.title {
+            lines.push(format!("TITLE: {}", title.to_uppercase()));
+        }
+        if let Some(artist) = &self.artist {
+            lines.push(format!("ARTIST: {}", artist.to_uppercase()));
+        }
+        if let Some(chapter) = chapter {
+            lines.push(chapter.to_string_lossy().into_owned());
+        }
+        CString::new(lines.join("\n")).expect("metadata has no NUL bytes")
+    }
+}
 
 pub(crate) fn format_bitrate(bits_per_second: i64) -> String {
     if bits_per_second >= 1_000_000 {
@@ -180,4 +235,27 @@ pub(crate) fn media_title(path: &Path) -> String {
 
 pub(crate) fn display_title(path: &Path) -> String {
     media_title(path).to_uppercase()
+}
+
+#[cfg(test)]
+mod media_metadata_tests {
+    use super::*;
+    #[test]
+    fn unknown_artist_is_omitted_from_all_metadata_consumers() {
+        for artist in ["Unknown", "unknown", "UNKNOWN", " UnKnOwN\n"] {
+            let metadata = MediaMetadata {
+                title: Some("Movie".into()),
+                artist: present_artist(Some(single_line_metadata(artist))),
+            };
+            assert!(metadata.artist().is_none());
+            assert_eq!(
+                metadata.overlay_text(None).to_str().unwrap(),
+                "TITLE: MOVIE"
+            );
+        }
+        assert_eq!(
+            present_artist(Some("Unknown Mortal Orchestra".into())).as_deref(),
+            Some("Unknown Mortal Orchestra")
+        );
+    }
 }

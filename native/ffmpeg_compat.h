@@ -81,6 +81,11 @@ void up_av_format_close(UpAvFormat **format);
 int up_av_find_best_stream(UpAvFormat *format, enum UpMediaType type,
                            int related_stream);
 unsigned int up_av_stream_count(const UpAvFormat *format);
+size_t up_av_stream_attached_picture(const UpAvFormat *format,
+                                    unsigned int index, const uint8_t **data);
+uint8_t *up_av_artwork_png(const UpAvFormat *format, unsigned int index,
+                         size_t *png_size);
+void up_av_artwork_free(uint8_t *data);
 enum UpMediaType up_av_stream_type(const UpAvFormat *format,
                                    unsigned int stream_index);
 int up_av_stream_is_default(const UpAvFormat *format,
@@ -91,6 +96,11 @@ const char *up_av_stream_metadata(const UpAvFormat *format,
                                   unsigned int stream_index,
                                   const char *key);
 double up_av_format_duration(const UpAvFormat *format);
+const char *up_av_format_metadata(const UpAvFormat *format, const char *key);
+unsigned int up_av_chapter_count(const UpAvFormat *format);
+// Seconds on the media timestamp axis; NAN for an invalid chapter.
+double up_av_chapter_start(const UpAvFormat *format, unsigned int index);
+const char *up_av_chapter_title(const UpAvFormat *format, unsigned int index);
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet);
 int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds);
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,

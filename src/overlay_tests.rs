@@ -150,6 +150,7 @@ fn content(title: &str) -> Content<'_> {
         title,
         info: "",
         details: "",
+        metadata: "",
         position: "",
     }
 }
@@ -246,7 +247,7 @@ fn caches_track_content_and_title_width_without_truncating_keys() {
 }
 
 #[test]
-fn compact_details_fit_above_controls_in_a_small_window() {
+fn details_scale_to_fit_above_controls_in_a_small_window() {
     let details = [
         "CODEC: VP9",
         "RESOLUTION: 3840X2160",
@@ -278,6 +279,7 @@ fn compact_details_fit_above_controls_in_a_small_window() {
                 info: 1.0,
                 position: 1.0,
                 scrubber: None,
+                chapter_markers: &[],
             },
             640,
             360,
@@ -285,12 +287,14 @@ fn compact_details_fit_above_controls_in_a_small_window() {
         .unwrap();
     let panel = &prepared.parts[3];
     assert!(panel.dst[3] + 2.0 <= prepared.parts[4].dst[1]);
-    assert_eq!(panel.src[2] - panel.src[0], panel.dst[2] - panel.dst[0]);
-    assert_eq!(panel.src[3] - panel.src[1], panel.dst[3] - panel.dst[1]);
+    let scale_x = (panel.dst[2] - panel.dst[0]) / (panel.src[2] - panel.src[0]);
+    let scale_y = (panel.dst[3] - panel.dst[1]) / (panel.src[3] - panel.src[1]);
+    assert!((scale_x - scale_y).abs() < 0.00001);
+    assert!(scale_x > 0.0 && scale_x < 1.0);
 }
 
 #[test]
-fn compact_details_preserve_accents_between_adjacent_lines() {
+fn details_use_even_spacing_and_preserve_accents() {
     let mut overlays = Overlays::default();
     overlays
         .update(
@@ -302,16 +306,16 @@ fn compact_details_preserve_accents_between_adjacent_lines() {
         )
         .unwrap();
     let mut expected = Image::new(HEIGHT);
-    // Plain lines retain an 18-pixel advance; ring/cedilla/macron pairs
-    // reserve two clear pixels between their ink without moving the bodies.
-    for (origin, text) in [(0, "A"), (23, "Å"), (41, "Ç"), (67, "Ā"), (85, "G")] {
+    // Both info blocks use the same advance, including accented lines.
+    for (line, text) in ["A", "Å", "Ç", "Ā", "G"].into_iter().enumerate() {
+        let origin = line * LINE_ADVANCE;
         expected.text(0, DETAILS_Y + origin, text).unwrap();
     }
     assert_eq!(
         &overlays.text.pixels[DETAILS_Y * WIDTH..],
         &expected.pixels[DETAILS_Y * WIDTH..]
     );
-    assert_eq!(overlays.details_height, 85 + GLYPH_HEIGHT);
+    assert_eq!(overlays.details_height, 4 * LINE_ADVANCE + GLYPH_HEIGHT);
 }
 
 #[test]
@@ -332,6 +336,7 @@ fn oversized_details_scale_with_the_window_without_changing_cached_pixels() {
                     info: 1.0,
                     position: 1.0,
                     scrubber: None,
+                    chapter_markers: &[],
                 },
                 width,
                 height,
@@ -360,6 +365,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                 title: "TITLE",
                 info: "AUDIO",
                 details: "VIDEO\nHDR",
+                metadata: "",
                 position: "1:23",
             },
             Visibility {
@@ -367,6 +373,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                 info: 0.5,
                 position: 1.0,
                 scrubber: Some((0.5, 1.0)),
+                chapter_markers: &[],
             },
             1280,
             720,
@@ -408,6 +415,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                 info: 0.0,
                 position: 0.0,
                 scrubber: None,
+                chapter_markers: &[],
             },
             1280,
             720,
@@ -423,7 +431,8 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                     top_bar: 0.0,
                     info: 0.0,
                     position: 0.0,
-                    scrubber: None
+                    scrubber: None,
+                    chapter_markers: &[],
                 },
                 1280,
                 720
@@ -432,4 +441,207 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
             .parts
             .is_empty()
     );
+}
+
+#[test]
+fn chapter_dots_are_bounded_cached_and_follow_the_timeline() {
+    let mut overlays = Overlays::default();
+    let markers: Vec<_> = (0..100).map(|i| i as f32 / 100.0).collect();
+    for width in [320, 1280, 3840] {
+        let visibility = || Visibility {
+            top_bar: 0.0,
+            info: 0.0,
+            position: 0.0,
+            scrubber: Some((0.5, 0.75)),
+            chapter_markers: &markers,
+        };
+        let prepared = overlays
+            .prepare(content(""), visibility(), width, 720)
+            .unwrap();
+        // Two colored parts for all chapters, plus track, progress and playhead.
+        assert_eq!(prepared.parts.len(), 5);
+        let dots = &prepared.parts[2];
+        assert_eq!(dots.texture, 1);
+        assert_eq!(
+            dots.dst,
+            [SCRUBBER_MARGIN - 6.0, 696.0, width as f32 * 0.5, 708.0]
+        );
+        assert_eq!(dots.color, prepared.parts[1].color);
+        let remaining = &prepared.parts[3];
+        assert_eq!(remaining.color, prepared.parts[0].color);
+        assert_eq!(remaining.dst[0], dots.dst[2]);
+        assert_eq!(remaining.dst[2], width as f32 - SCRUBBER_MARGIN + 6.0);
+        assert_eq!(remaining.src[0], dots.src[2]);
+        let pixels = &prepared.text.pixels[..WIDTH * 12];
+        for marker in &markers {
+            let center = 6.0 + marker * (width as f32 - 2.0 * SCRUBBER_MARGIN);
+            let x =
+                (center / (width as f32 - 2.0 * SCRUBBER_MARGIN + 12.0) * WIDTH as f32) as usize;
+            assert!(pixels[2 * WIDTH + x] > 0);
+            if *marker > 0.0 {
+                assert_eq!(pixels[5 * WIDTH + x], 0);
+            }
+        }
+        let serial = prepared.text.serial;
+        assert_eq!(
+            overlays
+                .prepare(content(""), visibility(), width, 720)
+                .unwrap()
+                .text
+                .serial,
+            serial
+        );
+        // Changing text clears the atlas; markers must be restored too.
+        let prepared = overlays
+            .prepare(
+                Content {
+                    position: "0:01",
+                    ..content("")
+                },
+                visibility(),
+                width,
+                720,
+            )
+            .unwrap();
+        assert!(
+            prepared.text.pixels[..WIDTH * 12]
+                .iter()
+                .any(|pixel| *pixel > 0)
+        );
+    }
+    let prepared = overlays
+        .prepare(
+            content(""),
+            Visibility {
+                top_bar: 0.0,
+                info: 0.0,
+                position: 0.0,
+                scrubber: Some((0.5, 0.0)),
+                chapter_markers: &markers,
+            },
+            1280,
+            720,
+        )
+        .unwrap();
+    assert!(prepared.parts.is_empty());
+}
+
+#[test]
+fn chapter_info_is_top_right_and_does_not_overlap_video_details() {
+    let mut overlays = Overlays::default();
+    for (width, height) in [(320, 180), (320, 720), (1280, 720), (1920, 1080)] {
+        let label = "TITLE: SEVEN SAMURAI\nARTIST: AKIRA KUROSAWA\nCHAPTER 3 / 29 — SHOPPING FOR SAMURAI GĀČĒ";
+        let content = || Content {
+            details: "CODEC: H264\nRESOLUTION: 1436X1080",
+            metadata: label,
+            ..content("")
+        };
+        let visibility = || Visibility {
+            top_bar: 0.0,
+            info: 0.0,
+            position: 0.0,
+            scrubber: None,
+            chapter_markers: &[],
+        };
+        let prepared = overlays
+            .prepare(content(), visibility(), width, height)
+            .unwrap();
+        assert_eq!(prepared.parts.len(), 2);
+        let details = &prepared.parts[0];
+        let chapter = &prepared.parts[1];
+        assert_eq!(chapter.dst[2], width as f32 - INSET);
+        assert_eq!(chapter.dst[1], INSET - ACCENT_PAD as f32);
+        assert!(chapter.dst[0] >= INSET);
+        assert!(details.dst[2] + 16.0 <= chapter.dst[0] || details.dst[1] >= chapter.dst[3] + 8.0);
+        assert!(
+            prepared.text.pixels[METADATA_Y * WIDTH..]
+                .iter()
+                .any(|p| *p > 0)
+        );
+        let serial = prepared.text.serial;
+        assert_eq!(
+            overlays
+                .prepare(content(), visibility(), width, height)
+                .unwrap()
+                .text
+                .serial,
+            serial
+        );
+        let prepared = overlays
+            .prepare(
+                Content {
+                    metadata: "",
+                    ..content()
+                },
+                visibility(),
+                width,
+                height,
+            )
+            .unwrap();
+        assert_eq!(prepared.parts.len(), 1);
+        assert!(
+            prepared.text.pixels[METADATA_Y * WIDTH..]
+                .iter()
+                .all(|p| *p == 0)
+        );
+    }
+}
+
+#[test]
+fn info_corners_share_the_same_inset_and_metadata_rows_align_right() {
+    let mut overlays = Overlays::default();
+    let prepared = overlays
+        .prepare(
+            Content {
+                title: "",
+                details: "CODEC: H264",
+                info: "FPS: 24",
+                position: "0:01",
+                metadata: "TITLE: SEVEN SAMURAI\nARTIST: AKIRA KUROSAWA\nCHAPTER 2 / 29",
+            },
+            Visibility {
+                top_bar: 0.0,
+                info: 1.0,
+                position: 1.0,
+                scrubber: None,
+                chapter_markers: &[],
+            },
+            1280,
+            720,
+        )
+        .unwrap();
+    assert_eq!(prepared.parts.len(), 4);
+    let [details, metadata, stats, position] = prepared.parts else {
+        unreachable!()
+    };
+    assert_eq!(details.dst[0], INSET);
+    assert_eq!(metadata.dst[2], 1280.0 - INSET);
+    assert_eq!(details.dst[1], metadata.dst[1]);
+    assert_eq!(details.dst[1] + ACCENT_PAD as f32, INSET);
+    assert_eq!(stats.dst[0], INSET);
+    assert_eq!(position.dst[2], 1280.0 - INSET);
+    assert_eq!(stats.dst[1], position.dst[1]);
+    assert_eq!(
+        stats.dst[1] + (ACCENT_PAD + BASE_HEIGHT) as f32,
+        720.0 - INSET
+    );
+    let width = (metadata.src[2] - metadata.src[0]) as usize;
+    for line in 0..3 {
+        let rows = &prepared.text.pixels[(METADATA_Y + line * LINE_ADVANCE) * WIDTH
+            ..(METADATA_Y + line * LINE_ADVANCE + GLYPH_HEIGHT) * WIDTH];
+        let right = rows
+            .as_chunks::<WIDTH>()
+            .0
+            .iter()
+            .flat_map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p > 0)
+                    .map(|(x, _)| x)
+            })
+            .max()
+            .unwrap();
+        // Narrow glyphs such as I retain their normal side bearing.
+        assert!(right < width && width - (right + 1) <= SCALE);
+    }
 }
