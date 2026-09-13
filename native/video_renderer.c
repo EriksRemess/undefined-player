@@ -856,13 +856,16 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     params.background_color[1] = 0.0f;
     params.background_color[2] = 0.0f;
     params.background_transparency = 0.0f;
-    // Spend the available GPU headroom on a sharper reconstruction for small
-    // sources. Hardware-decoded Vulkan frames stay on-device throughout
-    // scaling; software-decoded frames are uploaded here by libplacebo.
+    // Use sharper reconstruction through 1080p, including portrait sources.
+    // Mild anti-ringing limits halos when enlarging these frames to 4K.
+    // Hardware-decoded Vulkan frames stay on-device throughout scaling.
     if (integer_scale)
         params.upscaler = &pl_filter_nearest;
-    else if (frame->width <= 1280 && frame->height <= 720)
+    else if ((frame->width <= 1920 && frame->height <= 1080) ||
+             (frame->width <= 1080 && frame->height <= 1920)) {
         params.upscaler = &pl_filter_ewa_lanczossharp;
+        params.antiringing_strength = 0.2f;
+    }
     // Dynamic HDR peak detection scans the full frame and eventually contends
     // with 8K60 AV1 decoding on this GPU. Keep it for lower resolutions, but
     // use the source's mastering metadata for 8K HDR presentation.
