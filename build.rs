@@ -90,6 +90,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/video_renderer.h");
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.c");
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.h");
+    println!("cargo:rerun-if-changed=native/read_ahead.h");
     println!("cargo:rerun-if-changed=native/platform.c");
     println!("cargo:rerun-if-changed=native/platform.h");
     println!("cargo:rerun-if-changed=native/input_geometry.h");

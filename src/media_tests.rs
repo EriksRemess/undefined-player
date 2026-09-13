@@ -181,6 +181,18 @@ fn playback_child() {
                 Media::open(std::path::Path::new(path.file_name().unwrap()), None, false)
             }
             .unwrap();
+            // Read through the entire ring several times before seeking. Check
+            // every decoded picture, not just demux timestamps or byte counts.
+            let mut decoded = 0;
+            while !media.eof || !media.video_queue.is_empty() {
+                unsafe { media.fill_initial_queues() }.unwrap();
+                for frame in media.video_queue.drain(..) {
+                    let luma = crate::luma::Luma::new(&frame).unwrap();
+                    assert_eq!(luma.sample(0, 0), 16 + decoded as u8);
+                    decoded += 1;
+                }
+            }
+            assert_eq!(decoded, 200);
             // Cross the buffer in both directions, then rewind after EOF.
             for target in [0.0, 6.0, 0.4, 0.8, 0.6, 7.8, 0.0] {
                 unsafe { media.seek(target) }.unwrap();
@@ -188,7 +200,8 @@ fn playback_child() {
                 let frame = media.video_queue.front().expect("seek produced a frame");
                 assert!(
                     (frame.pts - target).abs() < 0.001,
-                    "{} != {target}", frame.pts
+                    "{} != {target}",
+                    frame.pts
                 );
                 let luma = crate::luma::Luma::new(frame).unwrap();
                 assert_eq!(luma.sample(0, 0), 16 + (target * 25.0).round() as u8);

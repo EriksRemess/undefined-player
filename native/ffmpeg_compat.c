@@ -1,4 +1,5 @@
 #include "ffmpeg_compat.h"
+#include "read_ahead.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -314,29 +315,60 @@ int up_av_error_is_eof(int code)
     return code == AVERROR_EOF;
 }
 
+static int buffered_read(void *reader, uint8_t *buffer, int size)
+{
+    int result = up_read_ahead_read(reader, buffer, size);
+    return result == 0 ? AVERROR_EOF : result;
+}
+
+static int64_t buffered_seek(void *reader, int64_t offset, int whence)
+{
+    if (whence == AVSEEK_SIZE)
+        return up_read_ahead_size(reader);
+    return up_read_ahead_seek(reader, offset, whence & ~AVSEEK_FORCE);
+}
+
+static void buffered_close(AVIOContext **io)
+{
+    up_read_ahead_close((*io)->opaque);
+    av_freep(&(*io)->buffer);
+    avio_context_free(io);
+}
+
 int up_av_format_open(UpAvFormat **format, const char *path)
 {
-    AVFormatContext *native = NULL;
-    /* Read ahead compressed bytes independently of decoding. FFmpeg's async
-     * protocol keeps a bounded 4 MiB forward / 4 MiB backward buffer, including
-     * seeking and EOF handling. This also works for mounted network files.
-     * Explicit file: keeps colons and other URL-like filename text literal.
-     * Minimal FFmpeg builds without async retain ordinary file reads. */
-    const char *prefix = avio_find_protocol_name("async:") ? "async:file:" : "file:";
-    char *input_url = av_asprintf("%s%s", prefix, path);
-    if (!input_url) {
-        *format = NULL;
+    *format = NULL;
+    AVFormatContext *native = avformat_alloc_context();
+    if (!native)
+        return AVERROR(ENOMEM);
+    int result = 0;
+    void *reader = up_read_ahead_open(path, &result);
+    if (!reader) {
+        avformat_free_context(native);
+        return result;
+    }
+    const int buffer_size = 64 * 1024;
+    uint8_t *buffer = av_malloc(buffer_size);
+    AVIOContext *io = buffer ? avio_alloc_context(buffer, buffer_size, 0,
+                         reader, buffered_read, NULL, buffered_seek) : NULL;
+    if (!io) {
+        av_free(buffer);
+        up_read_ahead_close(reader);
+        avformat_free_context(native);
         return AVERROR(ENOMEM);
     }
+    native->pb = io;
+    native->flags |= AVFMT_FLAG_CUSTOM_IO;
     /* MP4 cover art has no media timescale, but the MOV demuxer warns when
      * assigning its fallback. Use the same startup log policy as stream
      * discovery below; keep errors visible and restore playback logging. */
     int log_level = av_log_get_level();
     if (log_level > AV_LOG_ERROR)
         av_log_set_level(AV_LOG_ERROR);
-    int result = avformat_open_input(&native, input_url, NULL, NULL);
+    result = avformat_open_input(&native, path, NULL, NULL);
     av_log_set_level(log_level);
-    av_free(input_url);
+    if (result < 0)
+        buffered_close(&io);
     *format = (UpAvFormat *) native;
     return result;
 }
@@ -357,8 +389,12 @@ int up_av_format_find_stream_info(UpAvFormat *format)
 
 void up_av_format_close(UpAvFormat **format)
 {
+    if (!*format)
+        return;
     AVFormatContext *native = FORMAT(*format);
+    AVIOContext *io = native->pb;
     avformat_close_input(&native);
+    buffered_close(&io);
     *format = (UpAvFormat *) native;
 }
 

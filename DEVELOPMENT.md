@@ -64,6 +64,7 @@ responsibility:
 | `chapters.rs` | Chapter timestamps, timeline markers, and previous/next navigation |
 | `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
+| `read_ahead.rs` | Bounded file buffering, background reads, and byte seeking |
 | `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |
 | `renderer.rs`, `overlay.rs`, `pixel_font.rs` | Renderer ownership, overlay pixels, and placement |
@@ -92,6 +93,14 @@ area and brightness checks allow narrow pictures while rejecting small highlight
 The FFmpeg adapter exposes
 8–16-bit luma planes and downloads hardware frames only for these samples; the
 worker finishes before the renderer destroys its Vulkan device.
+
+`src/read_ahead.rs` owns the input file and its read worker. Its buffer retains
+up to 4 MiB of history and prefetches 4 MiB ahead. A mutex protects buffer state,
+but positional file reads run outside the lock so network stalls do not prevent
+consumption of buffered data. Seeks outside the buffer invalidate in-flight
+reads, including their errors. The C FFmpeg adapter only supplies AVIO callbacks
+and translates EOF; it does not use FFmpeg's `async` protocol. Closing the AVIO
+joins the Rust worker before freeing the callback state.
 
 `src/zoom.rs` owns the fill mode, saved autocrop preference, and centered source
 crop geometry. Fill runs after autocrop and accounts for sample aspect ratio and

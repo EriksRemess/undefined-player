@@ -23,6 +23,7 @@ mod overlay;
 mod pixel_font;
 mod playback;
 mod presentation;
+mod read_ahead;
 mod renderer;
 mod subtitles;
 mod window;
