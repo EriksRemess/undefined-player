@@ -72,6 +72,11 @@ The player starts playing immediately. The focused video window accepts:
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
 
+Auto deinterlacing checks motion across decoded pictures, so film stored with
+interlacing flags can retain its original detail. It takes a few frames to settle
+and falls back to the flags when analysis is unavailable. Progressive hardware
+video keeps its fast path without readback. `D` still provides forced On and Off.
+
 For files with chapters, dots on the timeline mark each chapter's start.
 Chapter navigation keeps the current pause state and stops at the first or last
 chapter; files without chapters leave these keys inactive.

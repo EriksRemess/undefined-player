@@ -24,6 +24,7 @@ pub(crate) struct Media {
     pub(crate) format: *mut ffi::UpAvFormat,
     pub(crate) packet: *mut ffi::UpAvPacket,
     pub(crate) video: Decoder,
+    interlace_detector: crate::deinterlace::Detector,
     pub(crate) audio_tracks: Vec<MediaTrack>,
     pub(crate) selected_audio_track: usize,
     pub(crate) audio: Option<AudioOutput>,
@@ -193,6 +194,7 @@ impl Media {
                 format,
                 packet,
                 video,
+                interlace_detector: crate::deinterlace::Detector::default(),
                 audio_tracks,
                 selected_audio_track: 0,
                 audio,
@@ -256,8 +258,9 @@ impl Media {
             }
             self.video_seek_target = None;
             self.first_video_pts.get_or_insert(pts);
-            self.video_queue
-                .push_back(unsafe { VideoFrame::from_raw(frame, pts, duration) });
+            let mut frame = unsafe { VideoFrame::from_raw(frame, pts, duration) };
+            frame.detected_field = self.interlace_detector.analyze(&frame);
+            self.video_queue.push_back(frame);
         }
         Ok(())
     }
@@ -628,6 +631,7 @@ impl Media {
             }
         }
         self.video_queue.clear();
+        self.interlace_detector = crate::deinterlace::Detector::default();
         self.subtitle_queue.clear();
         self.eof = false;
         self.drained = false;

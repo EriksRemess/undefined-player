@@ -15,6 +15,7 @@ mod deinterlace;
 #[allow(warnings, clippy::all)]
 mod ffi;
 mod geometry;
+mod luma;
 mod media;
 mod metadata;
 mod mpris;

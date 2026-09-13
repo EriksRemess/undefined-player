@@ -61,6 +61,10 @@ fn decoded_frames_preserve_interlacing_and_field_order() {
     child("interlacing");
 }
 #[test]
+fn pictures_override_incorrect_interlacing_flags() {
+    child("picture-interlacing");
+}
+#[test]
 fn raw_video_timestamps_survive_queue_transfers() {
     child("raw-video");
 }
@@ -316,6 +320,63 @@ fn playback_child() {
                         chapters.current(target)
                     );
                 }
+            }
+        }
+        "picture-interlacing" => {
+            for (name, rate, filter, expected) in [
+                ("film", 25, "setfield=tff", 0),
+                ("top", 50, "interlace=scan=tff", 1),
+                ("bottom", 50, "interlace=scan=bff", 2),
+            ] {
+                let path = fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("testsrc2=size=320x240:rate={rate}:duration=2"),
+                        "-vf",
+                        filter,
+                        "-c:v",
+                        "mpeg2video",
+                        "-flags",
+                        "+ildct+ilme",
+                    ],
+                    &format!("detect-{name}.mkv"),
+                );
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                let mut seen = 0;
+                let mut matching = 0;
+                while !media.eof || !media.video_queue.is_empty() {
+                    unsafe { media.fill_initial_queues() }.unwrap();
+                    while let Some(frame) = media.video_queue.pop_front() {
+                        let flagged = unsafe { ffi::up_av_frame_field(frame.as_ptr()) };
+                        assert_ne!(flagged, 0, "fixture must be flagged interlaced");
+                        if seen >= 10 {
+                            matching += usize::from(
+                                crate::deinterlace::Mode::Auto.frame_field(&frame) == expected,
+                            );
+                        }
+                        assert_eq!(crate::deinterlace::Mode::Off.frame_field(&frame), 0);
+                        assert_eq!(crate::deinterlace::Mode::On.frame_field(&frame), flagged);
+                        assert_eq!(
+                            frame.clone_reference().unwrap().detected_field,
+                            frame.detected_field
+                        );
+                        seen += 1;
+                    }
+                }
+                assert!(seen >= 40, "{name}: only {seen} frames");
+                assert!(
+                    matching * 10 >= (seen - 10) * 9,
+                    "{name}: {matching}/{} decisions correct",
+                    seen - 10
+                );
+                unsafe { media.seek(0.0) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                assert!(
+                    media.video_queue.front().unwrap().detected_field.is_none(),
+                    "seek must discard previous decisions"
+                );
             }
         }
         "interlacing" => {

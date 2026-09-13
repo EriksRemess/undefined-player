@@ -95,6 +95,7 @@ pub(crate) struct VideoFrame {
     frame: *mut ffi::UpAvFrame,
     pub(crate) pts: f64,
     pub(crate) duration: f64,
+    pub(crate) detected_field: Option<i32>,
 }
 
 impl VideoFrame {
@@ -106,7 +107,11 @@ impl VideoFrame {
 
     pub(crate) fn clone_reference(&self) -> Option<Self> {
         let frame = unsafe { ffi::up_av_frame_clone(self.frame) };
-        (!frame.is_null()).then(|| unsafe { Self::from_raw(frame, self.pts, self.duration) })
+        (!frame.is_null()).then(|| {
+            let mut copy = unsafe { Self::from_raw(frame, self.pts, self.duration) };
+            copy.detected_field = self.detected_field;
+            copy
+        })
     }
 
     /// Takes ownership of a non-null FFmpeg frame reference.
@@ -115,6 +120,7 @@ impl VideoFrame {
             frame,
             pts,
             duration,
+            detected_field: None,
         }
     }
 

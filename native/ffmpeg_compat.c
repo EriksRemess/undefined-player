@@ -64,8 +64,8 @@ UpAvFrame *up_av_frame_clone(const UpAvFrame *frame)
     return (UpAvFrame *) av_frame_clone((const AVFrame *) frame);
 }
 
-// Expose the luma plane without conversion. Hardware readback is called only
-// by the opt-in crop worker; the presentation thread keeps its original frame.
+// Expose the luma plane without conversion. Readback runs in the crop/decode
+// workers; the presentation thread keeps its original frame.
 int up_av_frame_luma(const UpAvFrame *pointer, UpLumaView *view)
 {
     const AVFrame *source = (const AVFrame *) pointer;

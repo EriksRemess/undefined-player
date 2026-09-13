@@ -103,7 +103,15 @@ Bitmap subtitles fit their complete authored canvas inside the final visible
 source crop, after both C and Z. This preserves captions in removed bars while
 retaining their proportions and following the video's SAR and rotation.
 
-`src/deinterlace.rs` owns Auto/On/Off selection and temporal adjacency checks.
+`src/deinterlace.rs` owns Auto/On/Off selection, picture analysis, and temporal
+adjacency checks. The decode path samples bounded luma regions from three frames,
+retaining adjacent scan lines and their parity. Consistent temporal evidence
+overrides interlacing flags; inconclusive samples retain the last decision, or
+fall back to flags before a decision is available. Seeks, timestamp gaps, and
+dimension changes reset the detector. Decisions travel with each `VideoFrame`.
+`src/luma.rs` shares depth-independent sampling with autocrop. Hardware frames
+flagged as interlaced are read back on the decode worker; progressive hardware
+frames bypass analysis to preserve the normal playback path.
 Playback retains one preceding frame and borrows the next queued frame for GPU
 YADIF filtering. Every seek clears the previous frame; timestamp gaps and changes
 in dimensions or pixel format exclude references. Missing references use bob
