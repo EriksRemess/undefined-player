@@ -2,6 +2,7 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/avstring.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
@@ -316,14 +317,26 @@ int up_av_error_is_eof(int code)
 int up_av_format_open(UpAvFormat **format, const char *path)
 {
     AVFormatContext *native = NULL;
+    /* Read ahead compressed bytes independently of decoding. FFmpeg's async
+     * protocol keeps a bounded 4 MiB forward / 4 MiB backward buffer, including
+     * seeking and EOF handling. This also works for mounted network files.
+     * Explicit file: keeps colons and other URL-like filename text literal.
+     * Minimal FFmpeg builds without async retain ordinary file reads. */
+    const char *prefix = avio_find_protocol_name("async:") ? "async:file:" : "file:";
+    char *input_url = av_asprintf("%s%s", prefix, path);
+    if (!input_url) {
+        *format = NULL;
+        return AVERROR(ENOMEM);
+    }
     /* MP4 cover art has no media timescale, but the MOV demuxer warns when
      * assigning its fallback. Use the same startup log policy as stream
      * discovery below; keep errors visible and restore playback logging. */
     int log_level = av_log_get_level();
     if (log_level > AV_LOG_ERROR)
         av_log_set_level(AV_LOG_ERROR);
-    int result = avformat_open_input(&native, path, NULL, NULL);
+    int result = avformat_open_input(&native, input_url, NULL, NULL);
     av_log_set_level(log_level);
+    av_free(input_url);
     *format = (UpAvFormat *) native;
     return result;
 }

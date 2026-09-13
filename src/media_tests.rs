@@ -73,6 +73,10 @@ fn audio_tail_is_bounded() {
     child("audio-tail");
 }
 #[test]
+fn buffered_file_seeks_preserve_pictures_and_eof() {
+    child("buffered-file");
+}
+#[test]
 fn delayed_video_does_not_block_startup() {
     child("delayed-video");
 }
@@ -153,6 +157,54 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "buffered-file" => {
+            // Larger than the entire read-ahead/back buffer. Each frame has a
+            // distinct luma value, so stale bytes after a seek cannot pass by
+            // merely receiving a plausible timestamp. Include URL punctuation
+            // and Unicode in a relative filename as well.
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "nullsrc=size=320x240:rate=25:duration=8,geq=lum='16+N':cb=128:cr=128",
+                    "-c:v",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+                "buffered: gāčē %20 #?.avi",
+            );
+            assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+            env::set_current_dir(&fixture.0).unwrap();
+            let mut media = unsafe {
+                Media::open(std::path::Path::new(path.file_name().unwrap()), None, false)
+            }
+            .unwrap();
+            // Cross the buffer in both directions, then rewind after EOF.
+            for target in [0.0, 6.0, 0.4, 0.8, 0.6, 7.8, 0.0] {
+                unsafe { media.seek(target) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                let frame = media.video_queue.front().expect("seek produced a frame");
+                assert!(
+                    (frame.pts - target).abs() < 0.001,
+                    "{} != {target}", frame.pts
+                );
+                let luma = crate::luma::Luma::new(frame).unwrap();
+                assert_eq!(luma.sample(0, 0), 16 + (target * 25.0).round() as u8);
+                if target == 7.8 {
+                    let mut frames = 0;
+                    while !media.eof || !media.video_queue.is_empty() {
+                        frames += media.video_queue.len();
+                        media.video_queue.clear();
+                        unsafe { media.fill_initial_queues() }.unwrap();
+                    }
+                    assert_eq!(frames, 5);
+                }
+            }
+            drop(media); // Also close with unread background data queued.
+            env::set_current_dir(env::temp_dir()).unwrap();
+        }
         "artwork" => {
             for (source_width, source_height, width, height) in [
                 (64, 96, 341, 512),

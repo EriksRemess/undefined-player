@@ -103,6 +103,13 @@ the background so the window remains responsive, and audio and video resume
 together once buffered data is ready. Audio tracks that begin later stay silent
 until their starting timestamp.
 
+File reads run ahead in the background to absorb short network stalls, including
+files on mounted network shares. FFmpeg's `async` protocol buffers up to 4 MiB
+ahead and retains 4 MiB for backward reads without increasing the decoded-frame
+queues. At 10 Mb/s this provides roughly three seconds of read-ahead once filled;
+longer outages or a connection slower than the video bitrate can still stutter.
+FFmpeg builds without `async` support use ordinary file reads.
+
 Autocrop starts disabled. Press `C` to detect stable black borders in the video;
 press it again to restore the complete frame. Detection samples frames in a
 background worker and preserves the video's pixel aspect ratio. It ignores
