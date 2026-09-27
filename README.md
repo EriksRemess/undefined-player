@@ -55,6 +55,18 @@ Open a video from the command line:
 undefined-player ~/Videos/example.mp4
 ```
 
+HTTP and HTTPS URLs are also supported. The server should support byte-range
+requests so seeking and containers that read metadata from the end of the file
+work correctly:
+
+```sh
+undefined-player 'http://127.0.0.1:8000/example.mp4'
+```
+
+For an HLS master playlist, the player selects the decodable rendition with the
+largest resolution, then the highest frame rate and bitrate, and keeps that
+quality fixed during playback.
+
 The player starts playing immediately. The focused video window accepts:
 
 - `F` — toggle fullscreen
@@ -65,6 +77,8 @@ The player starts playing immediately. The focused video window accepts:
   FPS / shown / dropped frames, and playback
   position
 - `A` — switch to the next audio track
+- `M` — mute or unmute audio
+- `L` — toggle looping the video
 - `Left` / `Right` — seek backward or forward 10 seconds
 - `,` / `.` — jump to the previous or next chapter
 - `Space` — pause or resume
@@ -136,7 +150,9 @@ Auto uses decoder metadata; it does not scan the picture for combing.
 
 ## Scope
 
-The player accepts one local media path on the command line. Hardware video
+The player accepts one local media path or HTTP(S) URL on the command line. Local
+files use the bounded Rust read-ahead buffer; network inputs use FFmpeg's protocol
+and buffering support. Hardware video
 decode covers the codecs and profiles exposed by both the selected FFmpeg build
 and the installed Vulkan driver. If Vulkan decoder initialization or initial
 decoding fails, playback restarts with FFmpeg's software decoder and uploads

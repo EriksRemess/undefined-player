@@ -16,6 +16,8 @@ pub(crate) enum Action {
     CycleDeinterlace,
     ToggleZoom,
     ToggleInfo,
+    ToggleLoop,
+    ToggleMute,
     TogglePause,
     ToggleSubtitles,
 }
@@ -28,6 +30,8 @@ pub(crate) fn action_for_key(key: u32) -> Option<Action> {
         ffi::UpKey_UP_KEY_D => Some(Action::CycleDeinterlace),
         ffi::UpKey_UP_KEY_C => Some(Action::ToggleCrop),
         ffi::UpKey_UP_KEY_A => Some(Action::CycleAudio),
+        ffi::UpKey_UP_KEY_M => Some(Action::ToggleMute),
+        ffi::UpKey_UP_KEY_L => Some(Action::ToggleLoop),
         ffi::UpKey_UP_KEY_Q => Some(Action::Quit),
         ffi::UpKey_UP_KEY_J => Some(Action::CycleSubtitles),
         ffi::UpKey_UP_KEY_LEFT => Some(Action::SeekBackward),

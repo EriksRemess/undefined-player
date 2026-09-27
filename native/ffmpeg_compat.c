@@ -125,6 +125,12 @@ void up_av_frame_luma_free(UpLumaView *view)
 #define PACKET(value) ((AVPacket *) (value))
 #define FRAME(value) ((AVFrame *) (value))
 
+static const AVCodec *preferred_decoder(enum AVCodecID id)
+{
+    const AVCodec *codec = avcodec_find_decoder_by_name(avcodec_get_name(id));
+    return codec ? codec : avcodec_find_decoder(id);
+}
+
 static AVStream *stream_at(const UpAvFormat *format, unsigned int index)
 {
     AVFormatContext *native = FORMAT(format);
@@ -162,7 +168,7 @@ uint8_t *up_av_artwork_png(const UpAvFormat *format, unsigned int index,
     const AVStream *stream = stream_at(format, index);
     if (!stream || !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC))
         return NULL;
-    const AVCodec *decoder_codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    const AVCodec *decoder_codec = preferred_decoder(stream->codecpar->codec_id);
     const AVCodec *encoder_codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
     if (!decoder_codec || !encoder_codec)
         return NULL;
@@ -335,14 +341,125 @@ static void buffered_close(AVIOContext **io)
     avio_context_free(io);
 }
 
-int up_av_format_open(UpAvFormat **format, const char *path)
+static int hls_video_candidate(const AVStream *stream)
+{
+    return stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+           !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
+           preferred_decoder(stream->codecpar->codec_id);
+}
+
+static int compare_frame_rates(AVRational candidate, AVRational selected)
+{
+    int candidate_valid = candidate.num > 0 && candidate.den > 0;
+    int selected_valid = selected.num > 0 && selected.den > 0;
+    if (candidate_valid != selected_valid)
+        return candidate_valid ? 1 : -1;
+    return candidate_valid ? av_cmp_q(candidate, selected) : 0;
+}
+
+static int64_t hls_variant_bitrate(const AVStream *stream)
+{
+    const AVDictionaryEntry *entry = av_dict_get(stream->metadata,
+                                                  "variant_bitrate", NULL, 0);
+    if (entry) {
+        char *end = NULL;
+        int64_t bitrate = strtoll(entry->value, &end, 10);
+        if (end != entry->value && !*end && bitrate > 0)
+            return bitrate;
+    }
+    return FFMAX(stream->codecpar->bit_rate, 0);
+}
+
+static int compare_hls_video_quality(const AVStream *candidate,
+                                     const AVStream *selected)
+{
+    const AVCodecParameters *candidate_parameters = candidate->codecpar;
+    const AVCodecParameters *selected_parameters = selected->codecpar;
+    int64_t candidate_pixels = (int64_t) candidate_parameters->width *
+                               candidate_parameters->height;
+    int64_t selected_pixels = (int64_t) selected_parameters->width *
+                              selected_parameters->height;
+    if (candidate_pixels != selected_pixels)
+        return candidate_pixels > selected_pixels ? 1 : -1;
+    int frame_rate = compare_frame_rates(candidate->avg_frame_rate,
+                                         selected->avg_frame_rate);
+    if (frame_rate)
+        return frame_rate;
+    int64_t candidate_bitrate = hls_variant_bitrate(candidate);
+    int64_t selected_bitrate = hls_variant_bitrate(selected);
+    return (candidate_bitrate > selected_bitrate) -
+           (candidate_bitrate < selected_bitrate);
+}
+
+static int select_hls_video(AVFormatContext *native, unsigned int rank)
+{
+    if (!native || !native->iformat ||
+        !av_match_name("hls", native->iformat->name))
+        return -1;
+    for (unsigned int index = 0; index < native->nb_streams; index++) {
+        AVStream *candidate = native->streams[index];
+        if (!hls_video_candidate(candidate))
+            continue;
+        unsigned int better = 0;
+        for (unsigned int other_index = 0; other_index < native->nb_streams;
+             other_index++) {
+            AVStream *other = native->streams[other_index];
+            if (!hls_video_candidate(other))
+                continue;
+            int comparison = compare_hls_video_quality(other, candidate);
+            if (comparison > 0 || (comparison == 0 && other_index < index))
+                better++;
+        }
+        if (better != rank)
+            continue;
+        for (unsigned int index = 0; index < native->nb_streams; index++) {
+            AVStream *stream = native->streams[index];
+            if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC))
+                stream->discard = index == (unsigned int) candidate->index ?
+                                  AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        }
+        return candidate->index;
+    }
+    return -1;
+}
+
+int up_av_format_open(UpAvFormat **format, const char *source, int network,
+                      void *interrupt_opaque,
+                      UpAvInterruptCallback interrupt_callback)
 {
     *format = NULL;
+    if (network) {
+        AVFormatContext *native = avformat_alloc_context();
+        if (!native)
+            return AVERROR(ENOMEM);
+        native->interrupt_callback = (AVIOInterruptCB) {
+            interrupt_callback, interrupt_opaque
+        };
+        AVDictionary *options = NULL;
+        av_dict_set(&options, "rw_timeout", "15000000", 0);
+        av_dict_set(&options, "reconnect", "1", 0);
+        av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+        av_dict_set(&options, "reconnect_on_http_error", "503,504", 0);
+        av_dict_set(&options, "reconnect_delay_max", "2", 0);
+        av_dict_set(&options, "reconnect_max_retries", "3", 0);
+        int log_level = av_log_get_level();
+        if (log_level > AV_LOG_ERROR)
+            av_log_set_level(AV_LOG_ERROR);
+        int result = avformat_open_input(&native, source, NULL, &options);
+        av_log_set_level(log_level);
+        av_dict_free(&options);
+        *format = (UpAvFormat *) native;
+        return result;
+    }
     AVFormatContext *native = avformat_alloc_context();
     if (!native)
         return AVERROR(ENOMEM);
+    native->interrupt_callback = (AVIOInterruptCB) {
+        interrupt_callback, interrupt_opaque
+    };
     int result = 0;
-    void *reader = up_read_ahead_open(path, &result);
+    void *reader = up_read_ahead_open(source, &result);
     if (!reader) {
         avformat_free_context(native);
         return result;
@@ -365,7 +482,7 @@ int up_av_format_open(UpAvFormat **format, const char *path)
     int log_level = av_log_get_level();
     if (log_level > AV_LOG_ERROR)
         av_log_set_level(AV_LOG_ERROR);
-    result = avformat_open_input(&native, path, NULL, NULL);
+    result = avformat_open_input(&native, source, NULL, NULL);
     av_log_set_level(log_level);
     if (result < 0)
         buffered_close(&io);
@@ -393,14 +510,27 @@ void up_av_format_close(UpAvFormat **format)
         return;
     AVFormatContext *native = FORMAT(*format);
     AVIOContext *io = native->pb;
+    int custom_io = native->flags & AVFMT_FLAG_CUSTOM_IO;
     avformat_close_input(&native);
-    buffered_close(&io);
+    if (custom_io)
+        buffered_close(&io);
     *format = (UpAvFormat *) native;
+}
+
+int up_av_select_video_stream(UpAvFormat *format, unsigned int rank)
+{
+    AVFormatContext *native = FORMAT(format);
+    int selected = select_hls_video(native, rank);
+    if (selected >= 0 || rank > 0)
+        return selected;
+    return av_find_best_stream(native, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
 }
 
 int up_av_find_best_stream(UpAvFormat *format, enum UpMediaType type,
                            int related_stream)
 {
+    if (type == UP_MEDIA_TYPE_VIDEO)
+        return up_av_select_video_stream(format, 0);
     return av_find_best_stream(FORMAT(format), media_type(type), -1,
                                related_stream, NULL, 0);
 }
@@ -507,13 +637,7 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
         return NULL;
     }
     AVCodecParameters *parameters = stream->codecpar;
-    const AVCodec *codec;
-    if (prefer_vulkan && vulkan_device) {
-        const char *name = avcodec_get_name(parameters->codec_id);
-        codec = avcodec_find_decoder_by_name(name);
-    } else {
-        codec = avcodec_find_decoder(parameters->codec_id);
-    }
+    const AVCodec *codec = preferred_decoder(parameters->codec_id);
     if (!codec) {
         snprintf(decoder_error, sizeof(decoder_error),
                  "no decoder is available for the selected stream");

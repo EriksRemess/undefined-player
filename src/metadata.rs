@@ -1,6 +1,7 @@
 use crate::decoder::{ffmpeg_name, stream_metadata};
 use crate::ffi;
 use crate::media::Media;
+use crate::source::MediaSource;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 
@@ -233,8 +234,55 @@ pub(crate) fn media_title(path: &Path) -> String {
     }
 }
 
+fn decode_url_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (
+                char::from(bytes[index + 1]).to_digit(16),
+                char::from(bytes[index + 2]).to_digit(16),
+            )
+        {
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+pub(crate) fn source_title(source: &MediaSource) -> String {
+    match source {
+        MediaSource::File(path) => media_title(path),
+        MediaSource::Http(url) => {
+            let path = url
+                .split_once("//")
+                .map_or(url.as_str(), |(_, remainder)| remainder)
+                .split_once('/')
+                .map_or("", |(_, path)| path)
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("");
+            let name = path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
+            media_title(Path::new(&decode_url_component(name)))
+        }
+    }
+}
+
 pub(crate) fn display_title(path: &Path) -> String {
     media_title(path).to_uppercase()
+}
+
+pub(crate) fn source_display_title(source: &MediaSource) -> String {
+    match source {
+        MediaSource::File(path) => display_title(path),
+        MediaSource::Http(_) => source_title(source).to_uppercase(),
+    }
 }
 
 #[cfg(test)]

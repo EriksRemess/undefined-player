@@ -25,6 +25,7 @@ mod playback;
 mod presentation;
 mod read_ahead;
 mod renderer;
+mod source;
 mod subtitles;
 mod window;
 mod worker;
@@ -48,7 +49,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (path, perf_log) = match action {
+    let (source, perf_log) = match action {
         CliAction::Help => {
             println!("{}", usage(Path::new(&program)));
             return;
@@ -57,14 +58,17 @@ fn main() {
             println!("undefined-player {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        CliAction::Play { path, perf_log } => (path, perf_log),
+        CliAction::Play { source, perf_log } => (source, perf_log),
     };
-    if !path.is_file() {
-        eprintln!("undefined-player: {} is not a file", path.display());
+    if source.local_path().is_some_and(|path| !path.is_file()) {
+        eprintln!(
+            "undefined-player: {} is not a file",
+            source.display().to_string_lossy()
+        );
         std::process::exit(2);
     }
 
-    if let Err(error) = unsafe { playback::run(path, perf_log) } {
+    if let Err(error) = unsafe { playback::run(source, perf_log) } {
         eprintln!("undefined-player: {error}");
         std::process::exit(1);
     }

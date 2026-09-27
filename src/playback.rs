@@ -1,6 +1,6 @@
 use crate::clock::WallClock;
 use crate::media::Media;
-use crate::metadata::{VideoInfo, display_title, media_title};
+use crate::metadata::{VideoInfo, source_display_title, source_title};
 use crate::mpris::{Mpris, MprisCommand, PlaybackStatus, seconds_to_microseconds};
 use crate::presentation::timeline_text;
 use crate::presentation::{
@@ -8,13 +8,13 @@ use crate::presentation::{
     track_status_text,
 };
 use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
+use crate::source::MediaSource;
 use crate::subtitles::SubtitleCue;
 use crate::window::{Action, Sdl, WaylandInput, Window, action_for_key};
 use crate::worker::DecodeWorker;
 use crate::{Result, ffi};
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::path::PathBuf;
 use std::ptr;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,15 @@ pub(crate) fn queue_relative_seek(
     *pending = Some((pending.unwrap_or(current) + offset).clamp(0.0, maximum));
 }
 
+pub(crate) fn handle_playback_end(looping: bool, pending_position: &mut Option<f64>) -> bool {
+    if looping {
+        *pending_position = Some(0.0);
+        false
+    } else {
+        true
+    }
+}
+
 pub(crate) unsafe fn seek_to(
     media: &mut Media,
     clock: &mut WallClock,
@@ -76,12 +85,12 @@ pub(crate) unsafe fn seek_to(
     Ok(position)
 }
 
-pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
+pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let _sdl = unsafe { Sdl::init()? };
-    let metadata_title = CString::new(media_title(&path))
-        .map_err(|_| "media filename contains a NUL byte".to_string())?;
-    let title = CString::new(display_title(&path))
-        .map_err(|_| "media filename contains a NUL byte".to_string())?;
+    let metadata_title = CString::new(source_title(&source))
+        .map_err(|_| "media title contains a NUL byte".to_string())?;
+    let title = CString::new(source_display_title(&source))
+        .map_err(|_| "media title contains a NUL byte".to_string())?;
     let window = unsafe { Window::create(&title)? };
     let _wayland_input = match WaylandInput::create(&window) {
         Ok(input) => Some(input),
@@ -91,7 +100,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         }
     };
     let mut renderer = Renderer::create(&window)?;
-    let mut media = unsafe { Media::open(&path, Some(renderer.device()), perf_log)? };
+    let mut media = unsafe { Media::open(&source, Some(renderer.device()), perf_log)? };
 
     if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
         if !media.video.uses_vulkan {
@@ -101,7 +110,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             "warning: Vulkan decoding failed ({hardware_error}); restarting with software decoding"
         );
         drop(media);
-        media = unsafe { Media::open(&path, None, perf_log)? };
+        media = unsafe { Media::open(&source, None, perf_log)? };
         unsafe { media.fill_initial_queues()? };
     }
     if media.video_queue.is_empty() && media.eof {
@@ -180,7 +189,7 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
     let mpris = Mpris::create(
         mpris_title.as_deref().unwrap_or(&metadata_title),
         media_metadata.artist(),
-        &path,
+        &source,
         media_duration.map_or(0, seconds_to_microseconds),
         artwork.as_ref().map(|artwork| artwork.path.as_path()),
     );
@@ -190,7 +199,8 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             chapters.target(0.0, true).is_some(),
         );
     }
-    let decoder = DecodeWorker::start(media, path, perf_log);
+    let audio_control = media.audio_control();
+    let decoder = DecodeWorker::start(media, source, perf_log);
     let mut clock = WallClock::new(clock_origin);
     let mut current_video = None;
     let mut previous_video = None;
@@ -204,6 +214,8 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
         .collect::<Vec<Option<SubtitleCue>>>();
     let mut running = true;
     let mut paused = false;
+    let mut muted = false;
+    let mut looping = false;
     let mut mpris_stopped = false;
     let mut fullscreen = false;
     let mut info_visible = false;
@@ -376,6 +388,28 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
                         }
                         Some(Action::ToggleInfo) => {
                             info_visible = !info_visible;
+                            redraw = true;
+                        }
+                        Some(Action::ToggleMute) => {
+                            let requested = !muted;
+                            audio_control.set_muted(requested)?;
+                            muted = requested;
+                            if let Some(mpris) = &mpris {
+                                mpris.options(muted, looping);
+                            }
+                            let status = if muted { "AUDIO: MUTED" } else { "AUDIO: ON" };
+                            eprintln!("{}", status.to_ascii_lowercase());
+                            position_notice.show_text(CString::new(status).unwrap());
+                            redraw = true;
+                        }
+                        Some(Action::ToggleLoop) => {
+                            looping = !looping;
+                            if let Some(mpris) = &mpris {
+                                mpris.options(muted, looping);
+                            }
+                            let status = if looping { "LOOP: ON" } else { "LOOP: OFF" };
+                            eprintln!("{}", status.to_ascii_lowercase());
+                            position_notice.show_text(CString::new(status).unwrap());
                             redraw = true;
                         }
                         Some(Action::TogglePause) => {
@@ -788,18 +822,24 @@ pub(crate) unsafe fn run(path: PathBuf, perf_log: bool) -> Result<()> {
             report_display_calls = 0;
         }
 
-        if let Some(media) = decoder.try_lock()?
-            && media.eof
-            && media.video_queue.is_empty()
-            && video_queue.is_empty()
-            && decoder.pending_frames()
-                == usize::from(current_video.is_some()) + usize::from(previous_video.is_some())
-            && unsafe { media.audio_empty() }
-            && current_video.as_ref().is_none_or(|frame| {
-                playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)
-            })
-        {
-            break;
+        let playback_finished = if let Some(media) = decoder.try_lock()? {
+            media.eof
+                && media.video_queue.is_empty()
+                && video_queue.is_empty()
+                && decoder.pending_frames()
+                    == usize::from(current_video.is_some()) + usize::from(previous_video.is_some())
+                && unsafe { media.audio_empty() }
+                && current_video.as_ref().is_none_or(|frame| {
+                    playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)
+                })
+        } else {
+            false
+        };
+        if playback_finished {
+            if handle_playback_end(looping, &mut pending_position) {
+                break;
+            }
+            mpris_stopped = false;
         }
 
         unsafe { ffi::up_platform_delay(2) };

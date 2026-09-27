@@ -1,19 +1,26 @@
-use crate::audio::{AUDIO_QUEUE_TARGET_BYTES, AudioOutput};
+use crate::audio::{AUDIO_QUEUE_TARGET_BYTES, AudioControl, AudioOutput};
 use crate::clock::completed_seek_anchor;
 use crate::decoder::{
     Decoder, VideoFrame, ffmpeg_error, ffmpeg_error_is_again, ffmpeg_error_is_eof,
 };
 use crate::metadata::TrackLabel;
+use crate::source::MediaInput;
 use crate::subtitles::{SubtitleContent, SubtitleCue, subtitle_dialogue_text};
 use crate::{Result, ffi};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
-use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const VIDEO_QUEUE_TARGET: usize = 16;
 pub(crate) const VIDEO_QUEUE_MAX: usize = 24;
 pub(crate) const AV_NOPTS_VALUE: i64 = i64::MIN;
+
+unsafe extern "C" fn interrupt_when_stopped(opaque: *mut c_void) -> i32 {
+    let running = unsafe { &*opaque.cast::<AtomicBool>() };
+    i32::from(!running.load(Ordering::Acquire))
+}
 
 pub(crate) struct MediaTrack {
     pub(crate) decoder: Decoder,
@@ -22,6 +29,8 @@ pub(crate) struct MediaTrack {
 
 pub(crate) struct Media {
     pub(crate) format: *mut ffi::UpAvFormat,
+    interrupt: Arc<AtomicBool>,
+    audio_control: AudioControl,
     pub(crate) packet: *mut ffi::UpAvPacket,
     pub(crate) video: Decoder,
     interlace_detector: crate::deinterlace::Detector,
@@ -43,15 +52,41 @@ pub(crate) struct Media {
 }
 
 impl Media {
-    pub(crate) unsafe fn open(
-        path: &Path,
+    pub(crate) unsafe fn open<S: MediaInput + ?Sized>(
+        source: &S,
         vulkan_device: Option<*mut c_void>,
         log_subtitles: bool,
     ) -> Result<Self> {
-        let path = CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| "media path contains a NUL byte".to_string())?;
+        unsafe {
+            Self::open_with_controls(
+                source,
+                vulkan_device,
+                log_subtitles,
+                Arc::new(AtomicBool::new(true)),
+                AudioControl::default(),
+            )
+        }
+    }
+
+    pub(crate) unsafe fn open_with_controls<S: MediaInput + ?Sized>(
+        source: &S,
+        vulkan_device: Option<*mut c_void>,
+        log_subtitles: bool,
+        interrupt: Arc<AtomicBool>,
+        audio_control: AudioControl,
+    ) -> Result<Self> {
+        let input = CString::new(source.input_bytes())
+            .map_err(|_| "media source contains a NUL byte".to_string())?;
         let mut format = ptr::null_mut();
-        let ret = unsafe { ffi::up_av_format_open(&mut format, path.as_ptr()) };
+        let ret = unsafe {
+            ffi::up_av_format_open(
+                &mut format,
+                input.as_ptr(),
+                i32::from(source.is_network_input()),
+                Arc::as_ptr(&interrupt).cast_mut().cast(),
+                Some(interrupt_when_stopped),
+            )
+        };
         if ret < 0 {
             return Err(format!("could not open media: {}", unsafe {
                 ffmpeg_error(ret)
@@ -66,21 +101,34 @@ impl Media {
                 }));
             }
 
-            let video_index = unsafe {
-                ffi::up_av_find_best_stream(format, ffi::UpMediaType_UP_MEDIA_TYPE_VIDEO, -1)
-            };
-            if video_index < 0 {
-                return Err("the input has no video stream".into());
-            }
-            let video = match unsafe { Decoder::open(format, video_index, vulkan_device) } {
-                Ok(video) => video,
-                Err(hardware_error) if vulkan_device.is_some() => {
-                    eprintln!(
-                        "warning: Vulkan decoder initialization failed ({hardware_error}); trying software decoding"
-                    );
-                    unsafe { Decoder::open(format, video_index, None)? }
+            let mut video_rank = 0;
+            let (video_index, video) = loop {
+                let video_index = unsafe { ffi::up_av_select_video_stream(format, video_rank) };
+                if video_index < 0 {
+                    return Err("the input has no usable video stream".into());
                 }
-                Err(error) => return Err(error),
+                let result = match unsafe { Decoder::open(format, video_index, vulkan_device) } {
+                    Ok(video) => Ok(video),
+                    Err(hardware_error) if vulkan_device.is_some() => {
+                        eprintln!(
+                            "warning: Vulkan decoder initialization failed ({hardware_error}); trying software decoding"
+                        );
+                        unsafe { Decoder::open(format, video_index, None) }
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(video) => break (video_index, video),
+                    Err(error) => {
+                        video_rank += 1;
+                        if unsafe { ffi::up_av_select_video_stream(format, video_rank) } < 0 {
+                            return Err(error);
+                        }
+                        eprintln!(
+                            "warning: HLS video rendition {video_index} is unavailable ({error}); trying the next lower-quality rendition"
+                        );
+                    }
+                }
             };
             let video_name =
                 unsafe { CStr::from_ptr(ffi::up_av_stream_codec_name(format, video_index as u32)) }
@@ -143,7 +191,7 @@ impl Media {
                 if audio_tracks.len() > 1 {
                     eprintln!("audio: A switches tracks");
                 }
-                Some(unsafe { AudioOutput::create()? })
+                Some(unsafe { AudioOutput::create(audio_control.clone())? })
             };
 
             let mut subtitle_indices = (0..unsafe { ffi::up_av_stream_count(format) } as usize)
@@ -192,6 +240,8 @@ impl Media {
 
             Ok(Self {
                 format,
+                interrupt,
+                audio_control,
                 packet,
                 video,
                 interlace_detector: crate::deinterlace::Detector::default(),
@@ -217,6 +267,14 @@ impl Media {
             unsafe { ffi::up_av_format_close(&mut format) };
         }
         result
+    }
+
+    pub(crate) fn interrupt_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupt)
+    }
+
+    pub(crate) fn audio_control(&self) -> AudioControl {
+        self.audio_control.clone()
     }
 
     pub(crate) unsafe fn receive_video(&mut self) -> Result<()> {
@@ -704,3 +762,17 @@ impl Drop for Media {
 // holding DecodeWorker's mutex. Vulkan queue access is synchronized by the
 // lock callbacks installed on the shared FFmpeg/libplacebo Vulkan device.
 unsafe impl Send for Media {}
+
+#[cfg(test)]
+mod interrupt_tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_interrupt_tracks_worker_lifetime() {
+        let running = AtomicBool::new(true);
+        let opaque = (&running as *const AtomicBool).cast_mut().cast();
+        assert_eq!(unsafe { interrupt_when_stopped(opaque) }, 0);
+        running.store(false, Ordering::Release);
+        assert_eq!(unsafe { interrupt_when_stopped(opaque) }, 1);
+    }
+}

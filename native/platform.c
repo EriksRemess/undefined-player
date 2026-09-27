@@ -39,6 +39,10 @@ static enum UpKey translate_key(SDL_Keycode key)
         return UP_KEY_S;
     case SDLK_A:
         return UP_KEY_A;
+    case SDLK_M:
+        return UP_KEY_M;
+    case SDLK_L:
+        return UP_KEY_L;
     default:
         return UP_KEY_OTHER;
     }
@@ -219,6 +223,11 @@ int up_audio_stream_resume(UpAudioStream *stream)
 int up_audio_stream_pause(UpAudioStream *stream)
 {
     return SDL_PauseAudioStreamDevice(AUDIO(stream));
+}
+
+int up_audio_stream_set_gain(UpAudioStream *stream, float gain)
+{
+    return SDL_SetAudioStreamGain(AUDIO(stream), gain);
 }
 
 int up_audio_stream_clear(UpAudioStream *stream)

@@ -42,6 +42,7 @@ int up_mpris_active(const UpMpris *mpris);
 const char *up_mpris_error(const UpMpris *mpris);
 void up_mpris_dispatch(UpMpris *mpris);
 void up_mpris_status_changed(UpMpris *mpris, const char *status);
+void up_mpris_options_changed(UpMpris *mpris, bool muted, bool looping);
 void up_mpris_navigation_changed(UpMpris *mpris, bool previous, bool next);
 void up_mpris_seeked(UpMpris *mpris, int64_t position_us);
 void up_mpris_destroy(UpMpris *mpris);

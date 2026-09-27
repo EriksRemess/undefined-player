@@ -224,6 +224,15 @@ void up_mpris_status_changed(UpMpris *mpris, const char *status)
         emit_player_property(mpris, "PlaybackStatus", g_variant_new_string(status));
 }
 
+void up_mpris_options_changed(UpMpris *mpris, bool muted, bool looping)
+{
+    if (!up_mpris_active(mpris))
+        return;
+    emit_player_property(mpris, "Volume", g_variant_new_double(muted ? 0.0 : 1.0));
+    emit_player_property(mpris, "LoopStatus",
+                         g_variant_new_string(looping ? "Track" : "None"));
+}
+
 void up_mpris_seeked(UpMpris *mpris, int64_t position_us)
 {
     if (!up_mpris_active(mpris))

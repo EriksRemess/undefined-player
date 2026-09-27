@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::source::MediaSource;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 pub(crate) enum CliAction {
     Help,
     Version,
-    Play { path: PathBuf, perf_log: bool },
+    Play { source: MediaSource, perf_log: bool },
 }
 
 pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
@@ -33,13 +34,18 @@ pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result
     }
     path.map_or_else(
         || Err("no media file was specified".into()),
-        |path| Ok(CliAction::Play { path, perf_log }),
+        |path| {
+            Ok(CliAction::Play {
+                source: MediaSource::from_argument(path.into_os_string()),
+                perf_log,
+            })
+        },
     )
 }
 
 pub(crate) fn usage(program: &Path) -> String {
     format!(
-        "Usage: {} [OPTIONS] VIDEO\n\nOptions:\n  --perf         print playback performance statistics\n  -h, --help     show this help\n  -V, --version  show the version",
+        "Usage: {} [OPTIONS] VIDEO_FILE_OR_URL\n\nOptions:\n  --perf         print playback performance statistics\n  -h, --help     show this help\n  -V, --version  show the version",
         program.display()
     )
 }

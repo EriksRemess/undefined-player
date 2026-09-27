@@ -106,7 +106,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn up_av_format_open(
         format: *mut *mut UpAvFormat,
-        path: *const ::std::os::raw::c_char,
+        source: *const ::std::os::raw::c_char,
+        network: ::std::os::raw::c_int,
+        interrupt_opaque: *mut ::std::os::raw::c_void,
+        interrupt_callback: UpAvInterruptCallback,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -114,6 +117,15 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_av_format_close(format: *mut *mut UpAvFormat);
+}
+pub type UpAvInterruptCallback = ::std::option::Option<
+    unsafe extern "C" fn(opaque: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int,
+>;
+unsafe extern "C" {
+    pub fn up_av_select_video_stream(
+        format: *mut UpAvFormat,
+        rank: ::std::os::raw::c_uint,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_av_find_best_stream(
@@ -366,6 +378,8 @@ pub const UpKey_UP_KEY_D: UpKey = 11;
 pub const UpKey_UP_KEY_Z: UpKey = 12;
 pub const UpKey_UP_KEY_COMMA: UpKey = 13;
 pub const UpKey_UP_KEY_PERIOD: UpKey = 14;
+pub const UpKey_UP_KEY_M: UpKey = 15;
+pub const UpKey_UP_KEY_L: UpKey = 16;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -457,6 +471,10 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_audio_stream_pause(stream: *mut UpAudioStream) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn up_audio_stream_set_gain(stream: *mut UpAudioStream, gain: f32)
+    -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_audio_stream_clear(stream: *mut UpAudioStream) -> ::std::os::raw::c_int;
@@ -575,6 +593,7 @@ unsafe extern "C" {
     pub fn up_mpris_error(mpris: *const UpMpris) -> *const ::std::ffi::c_char;
     pub fn up_mpris_dispatch(mpris: *mut UpMpris);
     pub fn up_mpris_status_changed(mpris: *mut UpMpris, status: *const ::std::ffi::c_char);
+    pub fn up_mpris_options_changed(mpris: *mut UpMpris, muted: bool, looping: bool);
     pub fn up_mpris_navigation_changed(mpris: *mut UpMpris, previous: bool, next: bool);
     pub fn up_mpris_seeked(mpris: *mut UpMpris, position_us: i64);
     pub fn up_mpris_destroy(mpris: *mut UpMpris);

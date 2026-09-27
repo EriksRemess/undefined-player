@@ -69,14 +69,23 @@ fn command_line_parses_playback_options_and_paths() {
     assert_eq!(
         cli(&["--perf", "movie.mkv"]),
         Ok(CliAction::Play {
-            path: PathBuf::from("movie.mkv"),
+            source: crate::source::MediaSource::File(PathBuf::from("movie.mkv")),
             perf_log: true,
         })
     );
     assert_eq!(
         cli(&["--", "--unusual-name.mkv"]),
         Ok(CliAction::Play {
-            path: PathBuf::from("--unusual-name.mkv"),
+            source: crate::source::MediaSource::File(PathBuf::from("--unusual-name.mkv")),
+            perf_log: false,
+        })
+    );
+    assert_eq!(
+        cli(&["https://media.example/video%20file.mp4"]),
+        Ok(CliAction::Play {
+            source: crate::source::MediaSource::Http(
+                "https://media.example/video%20file.mp4".into()
+            ),
             perf_log: false,
         })
     );
@@ -119,6 +128,14 @@ fn requested_keys_map_to_requested_actions() {
         Some(Action::CycleAudio)
     );
     assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_M),
+        Some(Action::ToggleMute)
+    );
+    assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_L),
+        Some(Action::ToggleLoop)
+    );
+    assert_eq!(
         action_for_key(ffi::UpKey_UP_KEY_F),
         Some(Action::ToggleFullscreen)
     );
@@ -148,6 +165,17 @@ fn requested_keys_map_to_requested_actions() {
     );
     assert_eq!(action_for_key(ffi::UpKey_UP_KEY_Q), Some(Action::Quit));
     assert_eq!(action_for_key(ffi::UpKey_UP_KEY_OTHER), None);
+}
+
+#[test]
+fn playback_end_restarts_only_when_looping() {
+    use crate::playback::handle_playback_end;
+    let mut pending = None;
+    assert!(!handle_playback_end(true, &mut pending));
+    assert_eq!(pending, Some(0.0));
+    pending = None;
+    assert!(handle_playback_end(false, &mut pending));
+    assert_eq!(pending, None);
 }
 
 #[test]
@@ -220,6 +248,16 @@ fn display_title_collapses_filename_whitespace() {
         )),
         "KYOTO HIDDEN VALLEYS DRIVE 🌿 ARASHIYAMA TO KIBUNE ⧸ 8K 60FPS HDR ⧸ RELAXING PIANO"
     );
+}
+
+#[test]
+fn network_title_decodes_the_url_filename() {
+    let source = crate::source::MediaSource::Http(
+        "http://127.0.0.1:8000/Redwoods%208k%2060p%20HDR%20in%202022%20%5Bd_xyD3nNQuo%5D.mp4"
+            .into(),
+    );
+    assert_eq!(source_title(&source), "Redwoods 8k 60p HDR in 2022");
+    assert_eq!(source_display_title(&source), "REDWOODS 8K 60P HDR IN 2022");
 }
 
 #[test]
@@ -382,6 +420,65 @@ fn external_media_reports_complete_video_info() {
     assert!(
         !details.contains("UNKNOWN"),
         "decodable media has complete effective video information"
+    );
+}
+
+#[test]
+#[ignore = "requires UP_TEST_URL pointing to an HTTP(S) video with byte-range support"]
+fn external_network_media_decodes_and_seeks() {
+    let _serial = EXTERNAL_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let url = env::var("UP_TEST_URL").expect("UP_TEST_URL is set");
+    let source = crate::source::MediaSource::Http(url);
+    unsafe {
+        env::set_var("SDL_VIDEODRIVER", "dummy");
+        env::set_var("SDL_AUDIODRIVER", "dummy");
+    }
+    assert_ne!(unsafe { ffi::up_platform_init() }, 0, "{}", unsafe {
+        sdl_error()
+    });
+    let _sdl = Sdl;
+    let mut media = unsafe { Media::open(&source, None, false) }.expect("network media opens");
+    if let Ok(expected) = env::var("UP_TEST_EXPECTED_VIDEO_SIZE") {
+        let (width, height) = expected
+            .split_once('x')
+            .map(|(width, height)| {
+                (
+                    width.parse::<i32>().expect("expected width is an integer"),
+                    height
+                        .parse::<i32>()
+                        .expect("expected height is an integer"),
+                )
+            })
+            .expect("UP_TEST_EXPECTED_VIDEO_SIZE uses WIDTHxHEIGHT");
+        assert_eq!(
+            unsafe { ffi::up_av_decoder_width(media.video.as_ptr()) },
+            width
+        );
+        assert_eq!(
+            unsafe { ffi::up_av_decoder_height(media.video.as_ptr()) },
+            height
+        );
+    }
+    unsafe { media.fill_initial_queues() }.expect("network media decodes");
+    assert!(
+        !media.video_queue.is_empty(),
+        "startup produced a video frame"
+    );
+
+    let duration = media.duration().expect("network media reports a duration");
+    let target = duration / 2.0;
+    unsafe { media.seek(target) }.expect("HTTP range seek succeeds");
+    unsafe { media.fill_initial_queues() }.expect("network media decodes after seeking");
+    let frame = media
+        .video_queue
+        .front()
+        .expect("seek produced a video frame");
+    assert!(
+        frame.pts >= target - 0.1,
+        "seek stopped before the requested target: {} < {target}",
+        frame.pts
     );
 }
 

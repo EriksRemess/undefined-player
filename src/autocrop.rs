@@ -585,7 +585,10 @@ mod tests {
             unsafe {
                 let mut input = ptr::null_mut();
                 let name = CString::new(path.to_str().unwrap()).unwrap();
-                assert_eq!(ffi::up_av_format_open(&mut input, name.as_ptr()), 0);
+                assert_eq!(
+                    ffi::up_av_format_open(&mut input, name.as_ptr(), 0, ptr::null_mut(), None),
+                    0
+                );
                 assert!(ffi::up_av_format_find_stream_info(input) >= 0);
                 let stream =
                     ffi::up_av_find_best_stream(input, ffi::UpMediaType_UP_MEDIA_TYPE_VIDEO, -1);

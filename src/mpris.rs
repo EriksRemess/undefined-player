@@ -1,5 +1,6 @@
 //! Player state and method policy live here; native/mpris.c owns GIO transport.
 use crate::ffi;
+use crate::source::MediaSource;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -49,10 +50,12 @@ struct State {
     duration_us: i64,
     position_us: i64,
     status: PlaybackStatus,
+    muted: bool,
+    looping: bool,
     commands: VecDeque<MprisCommand>,
 }
 impl State {
-    fn new(title: &CStr, artist: Option<&str>, path: &Path, duration_us: i64) -> Self {
+    fn new(title: &CStr, artist: Option<&str>, source: &MediaSource, duration_us: i64) -> Self {
         Self {
             title: if title.is_empty() {
                 c"Unknown media"
@@ -66,10 +69,12 @@ impl State {
             art_uri: None,
             can_previous: false,
             can_next: false,
-            uri: file_uri(path),
+            uri: source_uri(source),
             duration_us: duration_us.max(0),
             position_us: 0,
             status: PlaybackStatus::Playing,
+            muted: false,
+            looping: false,
             commands: VecDeque::with_capacity(COMMAND_CAPACITY),
         }
     }
@@ -131,9 +136,13 @@ impl State {
             }
             (false, b"LoopStatus") => {
                 value.kind = ffi::UP_MPRIS_VALUE_STRING;
-                value.text = c"None".as_ptr();
+                value.text = if self.looping { c"Track" } else { c"None" }.as_ptr();
             }
-            (false, b"Rate" | b"Volume" | b"MinimumRate" | b"MaximumRate") => {
+            (false, b"Volume") => {
+                value.kind = ffi::UP_MPRIS_VALUE_DOUBLE;
+                value.real = if self.muted { 0.0 } else { 1.0 };
+            }
+            (false, b"Rate" | b"MinimumRate" | b"MaximumRate") => {
                 value.kind = ffi::UP_MPRIS_VALUE_DOUBLE;
                 value.real = 1.0;
             }
@@ -173,6 +182,12 @@ impl State {
         self.status = status;
         changed
     }
+
+    fn options(&mut self, muted: bool, looping: bool) -> bool {
+        let changed = (self.muted, self.looping) != (muted, looping);
+        (self.muted, self.looping) = (muted, looping);
+        changed
+    }
 }
 
 fn file_uri(path: &Path) -> Option<CString> {
@@ -189,6 +204,13 @@ fn file_uri(path: &Path) -> Option<CString> {
         }
     }
     CString::new(uri).ok()
+}
+
+fn source_uri(source: &MediaSource) -> Option<CString> {
+    match source {
+        MediaSource::File(path) => file_uri(path),
+        MediaSource::Http(url) => CString::new(url.as_bytes()).ok(),
+    }
 }
 
 // GIO dispatches on the context created by this object, exclusively when its
@@ -239,11 +261,11 @@ impl Mpris {
     pub(crate) fn create(
         title: &CStr,
         artist: Option<&str>,
-        path: &Path,
+        source: &MediaSource,
         duration_us: i64,
         artwork: Option<&Path>,
     ) -> Option<Self> {
-        let mut initial = State::new(title, artist, path, duration_us);
+        let mut initial = State::new(title, artist, source, duration_us);
         initial.art_uri = artwork.and_then(file_uri);
         let state = Box::new(RefCell::new(initial));
         let callbacks = ffi::UpMprisCallbacks {
@@ -292,6 +314,11 @@ impl Mpris {
             unsafe { ffi::up_mpris_status_changed(self.native.as_ptr(), status.name().as_ptr()) };
         }
     }
+    pub(crate) fn options(&self, muted: bool, looping: bool) {
+        if self.state.borrow_mut().options(muted, looping) {
+            unsafe { ffi::up_mpris_options_changed(self.native.as_ptr(), muted, looping) };
+        }
+    }
     pub(crate) fn seeked(&self, position_us: i64) {
         let position_us = position_us.max(0);
         self.state.borrow_mut().position_us = position_us;
@@ -318,7 +345,8 @@ mod tests {
     use super::*;
     #[test]
     fn commands_are_bounded_ordered_and_track_scoped() {
-        let mut state = State::new(c"Video", None, Path::new("/tmp/video.mkv"), 100);
+        let source = MediaSource::File(Path::new("/tmp/video.mkv").into());
+        let mut state = State::new(c"Video", None, &source, 100);
         state.command(false, b"SetPosition", Some(c"/wrong/track"), 20);
         state.command(false, b"Next", None, 0);
         state.command(false, b"Previous", None, 0);
@@ -344,7 +372,8 @@ mod tests {
     }
     #[test]
     fn properties_follow_state_without_advertising_a_playlist() {
-        let mut state = State::new(c"Video", None, Path::new("/tmp/video.mkv"), -1);
+        let source = MediaSource::File(Path::new("/tmp/video.mkv").into());
+        let mut state = State::new(c"Video", None, &source, -1);
         assert!(!state.update(PlaybackStatus::Playing, -1));
         assert_eq!(state.position_us, 0);
         assert!(state.update(PlaybackStatus::Paused, 100));
@@ -355,15 +384,19 @@ mod tests {
         assert_eq!(state.property(false, b"CanGoNext").unwrap().integer, 0);
         assert_eq!(state.property(false, b"CanGoPrevious").unwrap().integer, 0);
         assert_eq!(state.property(false, b"Metadata").unwrap().duration_us, 0);
+        assert_eq!(state.property(false, b"Volume").unwrap().real, 1.0);
+        let loop_status = state.property(false, b"LoopStatus").unwrap();
+        assert_eq!(unsafe { CStr::from_ptr(loop_status.text) }, c"None");
+        assert!(state.options(true, true));
+        assert!(!state.options(true, true));
+        assert_eq!(state.property(false, b"Volume").unwrap().real, 0.0);
+        let loop_status = state.property(false, b"LoopStatus").unwrap();
+        assert_eq!(unsafe { CStr::from_ptr(loop_status.text) }, c"Track");
     }
     #[test]
     fn desktop_metadata_and_chapter_capabilities_are_exposed() {
-        let mut state = State::new(
-            c"Seven Samurai",
-            Some("Akira Kurosawa"),
-            Path::new("/tmp/movie.mp4"),
-            100,
-        );
+        let source = MediaSource::File(Path::new("/tmp/movie.mp4").into());
+        let mut state = State::new(c"Seven Samurai", Some("Akira Kurosawa"), &source, 100);
         state.art_uri = file_uri(Path::new("/tmp/cover image.jpg"));
         let metadata = state.property(false, b"Metadata").unwrap();
         assert_eq!(unsafe { CStr::from_ptr(metadata.title) }, c"Seven Samurai");
@@ -382,7 +415,7 @@ mod tests {
         assert!(state.navigation(true, false));
         assert_eq!(state.property(false, b"CanGoNext").unwrap().integer, 0);
         assert_eq!(state.property(false, b"CanGoPrevious").unwrap().integer, 1);
-        let empty = State::new(c"Filename", None, Path::new("/tmp/movie.mp4"), 0);
+        let empty = State::new(c"Filename", None, &source, 0);
         let metadata = empty.property(false, b"Metadata").unwrap();
         assert!(metadata.artist.is_null() && metadata.art_uri.is_null());
     }
@@ -399,6 +432,11 @@ mod tests {
         assert_eq!(
             file_uri(path).unwrap().to_str().unwrap(),
             "file:///tmp/%FF.mkv"
+        );
+        let network = MediaSource::Http("https://media.example/video%20file.mp4".into());
+        assert_eq!(
+            source_uri(&network).unwrap().to_str().unwrap(),
+            "https://media.example/video%20file.mp4"
         );
     }
 }

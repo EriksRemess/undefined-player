@@ -73,12 +73,21 @@ fn audio_tail_is_bounded() {
     child("audio-tail");
 }
 #[test]
+fn muting_audio_changes_gain_without_pausing() {
+    child("mute");
+}
+#[test]
 fn buffered_file_seeks_preserve_pictures_and_eof() {
     child("buffered-file");
 }
 #[test]
 fn delayed_video_does_not_block_startup() {
     child("delayed-video");
+}
+
+#[test]
+fn hls_master_selects_highest_quality() {
+    child("hls-quality");
 }
 
 #[test]
@@ -157,6 +166,71 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "mute" => {
+            let control = AudioControl::default();
+            let mut audio = unsafe { AudioOutput::create(control.clone()) }.unwrap();
+            unsafe { audio.set_paused(false) }.unwrap();
+            assert!(audio.resumed);
+            assert!(!control.is_muted());
+            let thread_control = control.clone();
+            std::thread::spawn(move || thread_control.set_muted(true))
+                .join()
+                .unwrap()
+                .unwrap();
+            assert!(control.is_muted());
+            assert!(audio.resumed, "muting must not pause or stall audio");
+            control.set_muted(false).unwrap();
+            assert!(!control.is_muted());
+            assert!(audio.resumed);
+        }
+        "hls-quality" => {
+            for (name, size, color) in [
+                ("low.ts", "64x64", "black"),
+                ("high-bandwidth.ts", "64x64", "white"),
+                ("large.ts", "96x64", "gray"),
+            ] {
+                fixture.generate(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("color={color}:size={size}:rate=5:duration=1"),
+                        "-c:v",
+                        "mpeg2video",
+                        "-f",
+                        "mpegts",
+                    ],
+                    name,
+                );
+                let playlist = format!(
+                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\n{name}\n#EXT-X-ENDLIST\n"
+                );
+                std::fs::write(fixture.0.join(name.replace(".ts", ".m3u8")), playlist).unwrap();
+            }
+
+            let open_first_frame = |master: &str| {
+                let path = fixture.0.join("master.m3u8");
+                std::fs::write(&path, master).unwrap();
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                let frame = media.video_queue.pop_front().expect("decoded HLS frame");
+                (
+                    frame.dimensions(),
+                    crate::luma::Luma::new(&frame).unwrap().sample(0, 0),
+                )
+            };
+
+            let (dimensions, _) = open_first_frame(
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=64x64\nhigh-bandwidth.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=50000,RESOLUTION=96x64\nlarge.m3u8\n",
+            );
+            assert_eq!(dimensions, (96, 64), "largest rendition must win");
+
+            let (dimensions, luma) = open_first_frame(
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000,RESOLUTION=64x64\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=64x64\nhigh-bandwidth.m3u8\n",
+            );
+            assert_eq!(dimensions, (64, 64));
+            assert!(luma > 200, "higher-bandwidth rendition must win: {luma}");
+        }
         "buffered-file" => {
             // Larger than the entire read-ahead/back buffer. Each frame has a
             // distinct luma value, so stale bytes after a seek cannot pass by
@@ -764,7 +838,8 @@ fn playback_child() {
                 // cannot produce Vulkan frames, without requiring a GPU.
                 unsafe { media.select_audio_track(1, 0.5) }.unwrap();
                 media.video.uses_vulkan = true;
-                let worker = DecodeWorker::start(media, path, false);
+                let worker =
+                    DecodeWorker::start(media, crate::source::MediaSource::File(path), false);
                 let mut frames = VecDeque::new();
                 let mut recovered = false;
                 let deadline = Instant::now() + Duration::from_secs(3);

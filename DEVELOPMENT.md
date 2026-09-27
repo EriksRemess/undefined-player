@@ -64,7 +64,8 @@ responsibility:
 | `chapters.rs` | Chapter timestamps, timeline markers, and previous/next navigation |
 | `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
-| `read_ahead.rs` | Bounded file buffering, background reads, and byte seeking |
+| `read_ahead.rs` | Bounded local-file buffering, background reads, and byte seeking |
+| `source.rs` | Local-path and HTTP(S) input classification |
 | `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |
 | `renderer.rs`, `overlay.rs`, `pixel_font.rs` | Renderer ownership, overlay pixels, and placement |
@@ -101,6 +102,19 @@ consumption of buffered data. Seeks outside the buffer invalidate in-flight
 reads, including their errors. The C FFmpeg adapter only supplies AVIO callbacks
 and translates EOF; it does not use FFmpeg's `async` protocol. Closing the AVIO
 joins the Rust worker before freeing the callback state.
+
+HTTP(S) sources bypass the local-file AVIO adapter and use FFmpeg's network
+protocol implementation. Servers should support byte ranges for reliable seeks
+and containers whose metadata is not stored at the beginning. Network reads have
+a 15-second timeout and bounded retries for disconnects and transient 503/504
+responses. Their FFmpeg interrupt callback shares the decode worker's lifetime,
+so closing playback cancels a blocked protocol read before joining the worker.
+HLS master playlists select the decodable video stream by resolution, frame rate,
+then advertised variant bitrate. If that rendition's decoder cannot initialize,
+the next lower-ranked rendition is tried. Other video renditions are discarded
+after stream discovery so normal packet reads stay on the selected quality;
+associated audio and subtitle streams remain available to the existing track
+controls.
 
 `src/zoom.rs` owns the fill mode, saved autocrop preference, and centered source
 crop geometry. Fill runs after autocrop and accounts for sample aspect ratio and

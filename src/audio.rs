@@ -4,6 +4,7 @@ use crate::window::sdl_error;
 use crate::{Result, ffi};
 use std::collections::VecDeque;
 use std::ptr;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(crate) const AUDIO_RATE: i32 = 48_000;
 pub(crate) const AUDIO_CHANNELS: i32 = 2;
@@ -19,6 +20,74 @@ pub(crate) struct AudioChunk {
     pub(crate) offset: usize,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct AudioControl(Arc<Mutex<AudioControlState>>);
+
+#[derive(Default)]
+struct AudioControlState {
+    streams: Vec<*mut ffi::UpAudioStream>,
+    muted: bool,
+}
+
+// Stream lifetime is serialized by the mutex, and SDL documents stream gain
+// changes as safe from any thread while audio data is being consumed.
+unsafe impl Send for AudioControlState {}
+
+impl AudioControl {
+    fn lock(&self) -> Result<MutexGuard<'_, AudioControlState>> {
+        self.0
+            .lock()
+            .map_err(|_| "audio control lock was poisoned".into())
+    }
+
+    unsafe fn attach(&self, stream: *mut ffi::UpAudioStream) -> Result<()> {
+        let mut state = self.lock()?;
+        if unsafe { ffi::up_audio_stream_set_gain(stream, if state.muted { 0.0 } else { 1.0 }) }
+            == 0
+        {
+            return Err(format!(
+                "could not initialize audio mute state: {}",
+                unsafe { sdl_error() }
+            ));
+        }
+        state.streams.push(stream);
+        Ok(())
+    }
+
+    fn detach(&self, stream: *mut ffi::UpAudioStream) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.streams.retain(|candidate| *candidate != stream);
+    }
+
+    pub(crate) fn set_muted(&self, muted: bool) -> Result<()> {
+        let mut state = self.lock()?;
+        if state.muted == muted {
+            return Ok(());
+        }
+        for &stream in &state.streams {
+            if unsafe { ffi::up_audio_stream_set_gain(stream, if muted { 0.0 } else { 1.0 }) } == 0
+            {
+                return Err(format!("could not change audio mute state: {}", unsafe {
+                    sdl_error()
+                }));
+            }
+        }
+        state.muted = muted;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_muted(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .muted
+    }
+}
+
 pub(crate) struct AudioOutput {
     pub(crate) stream: *mut ffi::UpAudioStream,
     converter: *mut ffi::UpAvAudioConverter,
@@ -29,15 +98,20 @@ pub(crate) struct AudioOutput {
     next_output_pts: f64,
     pub(crate) pending: VecDeque<AudioChunk>,
     pub(crate) resumed: bool,
+    control: AudioControl,
 }
 
 impl AudioOutput {
-    pub(crate) unsafe fn create() -> Result<Self> {
+    pub(crate) unsafe fn create(control: AudioControl) -> Result<Self> {
         let stream = unsafe { ffi::up_audio_stream_create(AUDIO_RATE, AUDIO_CHANNELS) };
         if stream.is_null() {
             return Err(format!("could not open PipeWire audio: {}", unsafe {
                 sdl_error()
             }));
+        }
+        if let Err(error) = unsafe { control.attach(stream) } {
+            unsafe { ffi::up_audio_stream_destroy(stream) };
+            return Err(error);
         }
 
         Ok(Self {
@@ -50,6 +124,7 @@ impl AudioOutput {
             next_output_pts: 0.0,
             pending: VecDeque::new(),
             resumed: false,
+            control,
         })
     }
 
@@ -291,6 +366,7 @@ impl AudioOutput {
 
 impl Drop for AudioOutput {
     fn drop(&mut self) {
+        self.control.detach(self.stream);
         unsafe {
             ffi::up_av_audio_converter_free(&mut self.converter);
             ffi::up_audio_stream_destroy(self.stream);

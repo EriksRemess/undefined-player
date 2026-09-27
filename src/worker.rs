@@ -1,9 +1,9 @@
 use crate::Result;
 use crate::decoder::VideoFrame;
 use crate::media::{Media, VIDEO_QUEUE_MAX};
+use crate::source::MediaSource;
 use crate::subtitles::SubtitleCue;
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
@@ -35,9 +35,10 @@ impl DecodeWorker {
         self.outstanding_frames.load(Ordering::Acquire)
     }
 
-    pub(crate) fn start(media: Media, path: PathBuf, measure_performance: bool) -> Self {
+    pub(crate) fn start(media: Media, source: MediaSource, measure_performance: bool) -> Self {
+        let running = media.interrupt_token();
+        let audio_control = media.audio_control();
         let media = Arc::new(Mutex::new(media));
-        let running = Arc::new(AtomicBool::new(true));
         let fill_nanoseconds = Arc::new(AtomicU64::new(0));
         let outstanding_frames = Arc::new(AtomicUsize::new(0));
         let (frame_sender, frames) = mpsc::channel();
@@ -63,16 +64,24 @@ impl DecodeWorker {
                             );
                             let target = unsafe { media.audio_clock() }.unwrap_or(0.0);
                             let selected_audio_track = media.selected_audio_track;
-                            result = unsafe { Media::open(&path, None, measure_performance) }
-                                .and_then(|mut replacement| {
-                                    replacement.selected_audio_track = selected_audio_track;
-                                    replacement.next_video_pts = target;
-                                    replacement.video_seek_target = Some(target);
-                                    replacement.audio_seek_target = Some(target);
-                                    replacement.subtitle_seek_target = Some(target);
-                                    *media = replacement;
-                                    unsafe { media.fill_queues() }
-                                });
+                            result = unsafe {
+                                Media::open_with_controls(
+                                    &source,
+                                    None,
+                                    measure_performance,
+                                    Arc::clone(&thread_running),
+                                    audio_control.clone(),
+                                )
+                            }
+                            .and_then(|mut replacement| {
+                                replacement.selected_audio_track = selected_audio_track;
+                                replacement.next_video_pts = target;
+                                replacement.video_seek_target = Some(target);
+                                replacement.audio_seek_target = Some(target);
+                                replacement.subtitle_seek_target = Some(target);
+                                *media = replacement;
+                                unsafe { media.fill_queues() }
+                            });
                         }
                         while result.is_ok()
                             && thread_outstanding_frames.load(Ordering::Acquire) < VIDEO_QUEUE_MAX

@@ -37,6 +37,8 @@ enum UpKey {
     UP_KEY_Z,
     UP_KEY_COMMA,
     UP_KEY_PERIOD,
+    UP_KEY_M,
+    UP_KEY_L,
 };
 
 typedef struct UpEvent {
@@ -71,4 +73,5 @@ int up_audio_stream_put(UpAudioStream *stream, const void *data, int bytes);
 int up_audio_stream_queued(UpAudioStream *stream);
 int up_audio_stream_resume(UpAudioStream *stream);
 int up_audio_stream_pause(UpAudioStream *stream);
+int up_audio_stream_set_gain(UpAudioStream *stream, float gain);
 int up_audio_stream_clear(UpAudioStream *stream);

@@ -9,6 +9,7 @@ typedef struct UpAvPacket UpAvPacket;
 typedef struct UpAvFrame UpAvFrame;
 typedef struct UpAvAudioConverter UpAvAudioConverter;
 typedef struct UpAvSubtitle UpAvSubtitle;
+typedef int (*UpAvInterruptCallback)(void *opaque);
 
 enum UpMediaType {
     UP_MEDIA_TYPE_VIDEO = 0,
@@ -75,9 +76,12 @@ int up_av_error_string(int code, char *buffer, size_t buffer_size);
 int up_av_error_is_again(int code);
 int up_av_error_is_eof(int code);
 
-int up_av_format_open(UpAvFormat **format, const char *path);
+int up_av_format_open(UpAvFormat **format, const char *source, int network,
+                      void *interrupt_opaque,
+                      UpAvInterruptCallback interrupt_callback);
 int up_av_format_find_stream_info(UpAvFormat *format);
 void up_av_format_close(UpAvFormat **format);
+int up_av_select_video_stream(UpAvFormat *format, unsigned int rank);
 int up_av_find_best_stream(UpAvFormat *format, enum UpMediaType type,
                            int related_stream);
 unsigned int up_av_stream_count(const UpAvFormat *format);
