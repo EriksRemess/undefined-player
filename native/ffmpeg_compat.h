@@ -72,6 +72,8 @@ typedef struct UpSubtitleRectView {
     const char *text;
 } UpSubtitleRectView;
 
+/* Configure process-wide logging before starting media workers. */
+void up_av_set_debug(int enabled);
 int up_av_error_string(int code, char *buffer, size_t buffer_size);
 int up_av_error_is_again(int code);
 int up_av_error_is_eof(int code);

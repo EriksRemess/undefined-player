@@ -52,7 +52,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (source, perf_log) = match action {
+    let (source, perf_log, debug) = match action {
         CliAction::Help => {
             println!("{}", usage(Path::new(&program)));
             return;
@@ -61,8 +61,13 @@ fn main() {
             println!("undefined-player {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        CliAction::Play { source, perf_log } => (source, perf_log),
+        CliAction::Play {
+            source,
+            perf_log,
+            debug,
+        } => (source, perf_log, debug),
     };
+    unsafe { ffi::up_av_set_debug(i32::from(debug)) };
     if source.local_path().is_some_and(|path| !path.is_file()) {
         eprintln!(
             "undefined-player: {} is not a file",

@@ -91,6 +91,9 @@ pub struct UpSubtitleRectView {
     pub text: *const ::std::os::raw::c_char,
 }
 unsafe extern "C" {
+    pub fn up_av_set_debug(enabled: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
     pub fn up_av_error_string(
         code: ::std::os::raw::c_int,
         buffer: *mut ::std::os::raw::c_char,

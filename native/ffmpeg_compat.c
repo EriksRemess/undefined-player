@@ -427,6 +427,11 @@ static int select_hls_video(AVFormatContext *native, unsigned int rank)
 
 #include "hls_input.h"
 
+void up_av_set_debug(int enabled)
+{
+    av_log_set_level(enabled ? AV_LOG_DEBUG : AV_LOG_QUIET);
+}
+
 int up_av_video_decoder_available(const char *name)
 {
     const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(name);
@@ -449,11 +454,7 @@ int up_av_format_open(UpAvFormat **format, const char *source, int network,
         };
         AVDictionary *options = NULL;
         network_options(&options);
-        int log_level = av_log_get_level();
-        if (log_level > AV_LOG_ERROR)
-            av_log_set_level(AV_LOG_ERROR);
         int result = network_open(&native, source, select_hls, selected_hls, &options);
-        av_log_set_level(log_level);
         av_dict_free(&options);
         *format = (UpAvFormat *) native;
         return result;
@@ -482,14 +483,7 @@ int up_av_format_open(UpAvFormat **format, const char *source, int network,
     }
     native->pb = io;
     native->flags |= AVFMT_FLAG_CUSTOM_IO;
-    /* MP4 cover art has no media timescale, but the MOV demuxer warns when
-     * assigning its fallback. Use the same startup log policy as stream
-     * discovery below; keep errors visible and restore playback logging. */
-    int log_level = av_log_get_level();
-    if (log_level > AV_LOG_ERROR)
-        av_log_set_level(AV_LOG_ERROR);
     result = avformat_open_input(&native, source, NULL, NULL);
-    av_log_set_level(log_level);
     if (result < 0)
         buffered_close(&io);
     *format = (UpAvFormat *) native;
@@ -498,16 +492,7 @@ int up_av_format_open(UpAvFormat **format, const char *source, int network,
 
 int up_av_format_find_stream_info(UpAvFormat *format)
 {
-    /* Some containers cannot provide bitmap-subtitle dimensions until the
-     * first subtitle packet. FFmpeg reports that expected condition as a
-     * warning even though discovery succeeds and decoding later supplies the
-     * dimensions. Keep startup output useful while preserving actual errors. */
-    int log_level = av_log_get_level();
-    if (log_level > AV_LOG_ERROR)
-        av_log_set_level(AV_LOG_ERROR);
-    int result = avformat_find_stream_info(FORMAT(format), NULL);
-    av_log_set_level(log_level);
-    return result;
+    return avformat_find_stream_info(FORMAT(format), NULL);
 }
 
 void up_av_format_close(UpAvFormat **format)

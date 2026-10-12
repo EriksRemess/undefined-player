@@ -71,6 +71,7 @@ fn command_line_parses_playback_options_and_paths() {
         Ok(CliAction::Play {
             source: crate::source::MediaSource::File(PathBuf::from("movie.mkv")),
             perf_log: true,
+            debug: false,
         })
     );
     assert_eq!(
@@ -78,6 +79,7 @@ fn command_line_parses_playback_options_and_paths() {
         Ok(CliAction::Play {
             source: crate::source::MediaSource::File(PathBuf::from("--unusual-name.mkv")),
             perf_log: false,
+            debug: false,
         })
     );
     assert_eq!(
@@ -87,6 +89,7 @@ fn command_line_parses_playback_options_and_paths() {
                 "https://media.example/video%20file.mp4".into()
             ),
             perf_log: false,
+            debug: false,
         })
     );
 }
@@ -118,6 +121,7 @@ fn command_line_expands_youtube_shortcuts_and_rejects_invalid_ids() {
         Ok(CliAction::Play {
             source: crate::source::MediaSource::File(PathBuf::from("./yt:dQw4w9WgXcQ")),
             perf_log: false,
+            debug: false,
         })
     );
 }

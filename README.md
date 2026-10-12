@@ -48,6 +48,14 @@ Open a video from the command line:
 undefined-player ~/Videos/example.mp4
 ```
 
+FFmpeg diagnostics are hidden by default. Add `--debug` to show them:
+
+```sh
+undefined-player --debug ~/Videos/example.mp4
+```
+
+Playback failures still print an error message without `--debug`.
+
 HTTP and HTTPS URLs are also supported. The server should support byte-range
 requests so seeking and containers that read metadata from the end of the file
 work correctly:
@@ -91,6 +99,10 @@ During playback, the focused video window accepts:
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
 - `Ctrl+Shift+P` — open the command palette
+
+Right-click opens the desktop's window menu, where supported. GNOME offers
+**Always on Top** there; available actions depend on the compositor. On desktops
+without a window menu, right-click has no effect.
 
 In the palette, type to filter, use Up/Down to select, Enter to advance or run,
 and Escape to close. Choose **Seek**, then **Forward** or **Backward**, then a

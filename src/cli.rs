@@ -8,18 +8,25 @@ use std::path::PathBuf;
 pub(crate) enum CliAction {
     Help,
     Version,
-    Play { source: MediaSource, perf_log: bool },
+    Play {
+        source: MediaSource,
+        perf_log: bool,
+        debug: bool,
+    },
 }
 
 pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let mut path = None;
     let mut perf_log = false;
+    let mut debug = false;
     let mut parse_options = true;
     for argument in arguments {
         if parse_options && argument == "--" {
             parse_options = false;
         } else if parse_options && argument == "--perf" {
             perf_log = true;
+        } else if parse_options && argument == "--debug" {
+            debug = true;
         } else if parse_options && (argument == "-h" || argument == "--help") {
             return Ok(CliAction::Help);
         } else if parse_options && (argument == "-V" || argument == "--version") {
@@ -38,6 +45,7 @@ pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result
             Ok(CliAction::Play {
                 source: MediaSource::from_argument(path.into_os_string())?,
                 perf_log,
+                debug,
             })
         },
     )
@@ -45,7 +53,7 @@ pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result
 
 pub(crate) fn usage(program: &Path) -> String {
     format!(
-        "Usage: {} [OPTIONS] VIDEO_FILE_OR_URL\n\nOptions:\n  --perf         print playback performance statistics\n  -h, --help     show this help\n  -V, --version  show the version",
+        "Usage: {} [OPTIONS] VIDEO_FILE_OR_URL\n\nOptions:\n  --perf         print playback performance statistics\n  --debug        show FFmpeg diagnostic messages\n  -h, --help     show this help\n  -V, --version  show the version",
         program.display()
     )
 }

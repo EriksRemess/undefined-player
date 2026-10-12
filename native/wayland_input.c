@@ -11,6 +11,7 @@
 #include <string.h>
 
 #define BTN_LEFT 0x110
+#define BTN_RIGHT 0x111
 #define DOUBLE_CLICK_MS 400
 #define DOUBLE_CLICK_DISTANCE 8.0
 
@@ -70,8 +71,18 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 {
     (void) pointer;
     UpWaylandInput *input = data;
-    if (!input->focused || button != BTN_LEFT ||
-        state != WL_POINTER_BUTTON_STATE_PRESSED)
+    if (!input->focused || state != WL_POINTER_BUTTON_STATE_PRESSED)
+        return;
+
+    if (button == BTN_RIGHT) {
+        input->last_click_time = 0;
+        // Use the actual press serial and surface-local coordinates. The
+        // compositor decides which actions to offer, or whether to show a menu.
+        xdg_toplevel_show_window_menu(input->toplevel, input->seat, serial,
+                                     (int32_t) input->x, (int32_t) input->y);
+        return;
+    }
+    if (button != BTN_LEFT)
         return;
 
     // Rust owns the same close, resize, and scrubber regions used by SDL
