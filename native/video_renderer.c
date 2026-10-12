@@ -677,8 +677,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     struct pl_frame target = {0};
     struct pl_render_params params = pl_render_default_params;
     struct pl_color_space hint = {0};
-    struct pl_overlay overlays[16] = {0};
-    struct pl_overlay_part parts[16] = {0};
+    struct pl_overlay overlays[32] = {0};
+    struct pl_overlay_part parts[32] = {0};
     struct pl_overlay bitmap_overlay = {0};
     struct pl_overlay_part bitmap_part = {0};
     int num_overlays = 0;
@@ -688,7 +688,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         return -1;
 
     // Reserve two slots for subtitle text and its background.
-    if (!overlay || overlay->count > 14 || (overlay->count && !overlay->parts)) {
+    if (!overlay || overlay->count > 30 || (overlay->count && !overlay->parts)) {
         set_error(renderer, "invalid overlay geometry");
         return -1;
     }

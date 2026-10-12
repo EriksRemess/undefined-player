@@ -56,6 +56,19 @@ work correctly:
 undefined-player 'http://127.0.0.1:8000/example.mp4'
 ```
 
+YouTube links work directly when `yt-dlp` is installed and available on `PATH`:
+
+```sh
+undefined-player 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+undefined-player yt:dQw4w9WgXcQ
+```
+
+The player requests a fresh stream URL, prefers HLS for the highest available
+quality with audio, and uses the video's title and channel in its overlays and
+media controls. No video is downloaded to disk. If extraction fails, yt-dlp is
+missing, or the stream expires, playback exits with an error message; reopening
+the original YouTube link requests a new stream URL.
+
 For an HLS master playlist, the player selects the decodable rendition with the
 largest resolution, then the highest frame rate and bitrate, and keeps that
 quality fixed during playback.
@@ -86,7 +99,9 @@ seconds value; you can also type a custom amount, such as `seek forward 45` or
 or a timestamp (`jump 2:03` or `jump 1:02:03`). Complete commands can also be typed
 directly.
 
-Local videos with a known duration remember their position when the player closes.
+Local videos and non-live YouTube videos with a known duration remember their
+position when the player closes. YouTube positions follow the video ID, so full
+links, short links, and `yt:ID` share the same saved position.
 On reopening, the prompt asks **Resume from [time]? Y/N**: press `Y` to resume
 or `N` to play from the start.
 Playback waits for your choice. Starting over clears the old position immediately;

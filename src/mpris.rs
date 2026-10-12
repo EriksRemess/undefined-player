@@ -209,7 +209,9 @@ fn file_uri(path: &Path) -> Option<CString> {
 fn source_uri(source: &MediaSource) -> Option<CString> {
     match source {
         MediaSource::File(path) => file_uri(path),
-        MediaSource::Http(url) => CString::new(url.as_bytes()).ok(),
+        MediaSource::Http(url) | MediaSource::YouTube { url, .. } => {
+            CString::new(url.as_bytes()).ok()
+        }
     }
 }
 

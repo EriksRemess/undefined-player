@@ -1,4 +1,4 @@
-//! Local-file resume positions. One locked, atomically replaced state file.
+//! Local-file and YouTube resume positions in one atomically replaced state file.
 use crate::{Result, ffi, presentation::format_position, source::MediaSource};
 use std::collections::BTreeMap;
 use std::env;
@@ -44,11 +44,10 @@ fn state_path(state: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     Some(base.join("undefined-player/resume"))
 }
 
-fn path_hash(path: &Path) -> Result<String> {
-    let bytes = path.as_os_str().as_bytes();
+fn identity_hash(bytes: &[u8]) -> Result<String> {
     let mut hash = [0_u8; 32];
     if unsafe { ffi::up_av_sha256(bytes.as_ptr(), bytes.len(), hash.as_mut_ptr()) } == 0 {
-        return Err("could not hash media path".into());
+        return Err("could not hash media identity".into());
     }
     Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
 }
@@ -97,7 +96,7 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, Entry>> {
 
 struct Store {
     path: PathBuf,
-    media: PathBuf,
+    media: Option<PathBuf>,
     key: String,
     identity: Entry,
 }
@@ -106,16 +105,31 @@ impl Store {
     fn new(path: PathBuf, media: &Path) -> Result<Self> {
         let media = media.canonicalize().map_err(|e| e.to_string())?;
         let metadata = media.metadata().map_err(|e| e.to_string())?;
-        let key = path_hash(&media)?;
+        let key = identity_hash(media.as_os_str().as_bytes())?;
         Ok(Self {
             path,
-            media,
+            media: Some(media),
             key,
             identity: Entry {
                 seconds: 0.0,
                 size: metadata.len(),
                 modified: metadata.mtime(),
                 modified_ns: metadata.mtime_nsec(),
+            },
+        })
+    }
+
+    fn youtube(path: PathBuf, id: &str) -> Result<Self> {
+        Ok(Self {
+            path,
+            media: None,
+            // Canonical local paths start with '/', keeping the namespaces apart.
+            key: identity_hash(format!("youtube:{id}").as_bytes())?,
+            identity: Entry {
+                seconds: 0.0,
+                size: 0,
+                modified: 0,
+                modified_ns: 0,
             },
         })
     }
@@ -146,12 +160,14 @@ impl Store {
         let mut entries = read_entries(&self.path)?;
         if let Some(seconds) = position.filter(|seconds| seconds.is_finite() && *seconds > 0.0) {
             // Check inside the transaction, after any newer writer has finished.
-            let metadata = self.media.metadata().map_err(|e| e.to_string())?;
-            if metadata.len() != self.identity.size
-                || metadata.mtime() != self.identity.modified
-                || metadata.mtime_nsec() != self.identity.modified_ns
-            {
-                return Ok(());
+            if let Some(media) = &self.media {
+                let metadata = media.metadata().map_err(|e| e.to_string())?;
+                if metadata.len() != self.identity.size
+                    || metadata.mtime() != self.identity.modified
+                    || metadata.mtime_nsec() != self.identity.modified_ns
+                {
+                    return Ok(());
+                }
             }
             entries.insert(
                 self.key.clone(),
@@ -220,9 +236,17 @@ impl Session {
     }
 
     pub(crate) fn open(source: &MediaSource, duration: Option<f64>) -> Result<Self> {
-        let Some(media) = source.local_path() else {
+        if source.local_path().is_none()
+            && !matches!(
+                source,
+                MediaSource::YouTube {
+                    resume_id: Some(_),
+                    ..
+                }
+            )
+        {
             return Ok(Self::disabled());
-        };
+        }
         let Some(duration) = duration.filter(|d| d.is_finite() && *d > 0.0) else {
             return Ok(Self::disabled());
         };
@@ -231,7 +255,14 @@ impl Session {
             env::var_os("HOME").as_deref(),
         )
         .ok_or("no state directory is available")?;
-        let store = Store::new(path, media)?;
+        let store = match source {
+            MediaSource::File(media) => Store::new(path, media)?,
+            MediaSource::YouTube {
+                resume_id: Some(id),
+                ..
+            } => Store::youtube(path, id)?,
+            _ => return Ok(Self::disabled()),
+        };
         let saved = store.load()?.filter(|position| *position < duration);
         Ok(Self {
             store: Some(store),
@@ -331,6 +362,9 @@ mod tests {
         }
 
         fn store(&self, name: &str) -> Store {
+            if let Some(id) = name.strip_prefix("yt:") {
+                return Store::youtube(self.0.join("state/resume"), id).unwrap();
+            }
             let media = self.0.join(name);
             if !media.exists() {
                 fs::write(&media, b"original video").unwrap();
@@ -378,34 +412,36 @@ mod tests {
 
     #[test]
     fn cancel_restart_resume_and_completion_preserve_expected_position() {
-        let fixture = Fixture::new();
-        let store = fixture.store("video");
-        store.update(Some(42.0)).unwrap();
-        {
-            let mut session = fixture.session("video");
-            session.observe(0.0); // Waiting for an answer must not update state.
-        }
-        assert_eq!(store.load().unwrap(), Some(42.0));
-        {
-            let mut session = fixture.session("video");
-            session.choose(false);
+        for name in ["video", "yt:dQw4w9WgXcQ"] {
+            let fixture = Fixture::new();
+            let store = fixture.store(name);
+            store.update(Some(42.0)).unwrap();
+            {
+                let mut session = fixture.session(name);
+                session.observe(0.0); // Waiting for an answer must not update state.
+            }
+            assert_eq!(store.load().unwrap(), Some(42.0));
+            {
+                let mut session = fixture.session(name);
+                session.choose(false);
+                assert_eq!(store.load().unwrap(), None);
+                session.observe(5.0);
+            }
+            assert_eq!(store.load().unwrap(), Some(5.0));
+            {
+                let mut session = fixture.session(name);
+                session.choose(true);
+                session.observe(12.0);
+            }
+            assert_eq!(store.load().unwrap(), Some(12.0));
+            {
+                let mut session = fixture.session(name);
+                session.choose(true);
+                session.complete();
+                assert_eq!(store.load().unwrap(), None);
+            }
             assert_eq!(store.load().unwrap(), None);
-            session.observe(5.0);
         }
-        assert_eq!(store.load().unwrap(), Some(5.0));
-        {
-            let mut session = fixture.session("video");
-            session.choose(true);
-            session.observe(12.0);
-        }
-        assert_eq!(store.load().unwrap(), Some(12.0));
-        {
-            let mut session = fixture.session("video");
-            session.choose(true);
-            session.complete();
-            assert_eq!(store.load().unwrap(), None);
-        }
-        assert_eq!(store.load().unwrap(), None);
     }
 
     #[test]

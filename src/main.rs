@@ -15,6 +15,7 @@ mod deinterlace;
 #[allow(warnings, clippy::all)]
 mod ffi;
 mod geometry;
+mod hls;
 mod luma;
 mod media;
 mod metadata;
@@ -30,6 +31,7 @@ mod source;
 mod subtitles;
 mod window;
 mod worker;
+mod youtube;
 mod zoom;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
@@ -69,7 +71,20 @@ fn main() {
         std::process::exit(2);
     }
 
+    let source = match youtube::resolve(source) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("undefined-player: {error}");
+            std::process::exit(1);
+        }
+    };
+    let is_youtube = matches!(source, source::MediaSource::YouTube { .. });
     if let Err(error) = unsafe { playback::run(source, perf_log) } {
+        let error = if is_youtube {
+            youtube::playback_error(&error)
+        } else {
+            error
+        };
         eprintln!("undefined-player: {error}");
         std::process::exit(1);
     }

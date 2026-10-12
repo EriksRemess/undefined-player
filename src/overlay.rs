@@ -599,7 +599,17 @@ impl Overlays {
         let (width, height) = (width as f32, height as f32);
         self.parts.clear();
         let parts = &mut self.parts;
-        let mut add = |texture, src, dst, color| {
+        let mut add = |texture, src: [f32; 4], dst: [f32; 4], color: [f32; 4]| {
+            // The atlas's first rows are timeline marks; all other masks are
+            // text. Offset in output pixels, even when the text is scaled.
+            if texture == 2 || (texture == 1 && src[1] >= INFO_Y as f32) {
+                parts.push(ffi::UpOverlayPart {
+                    texture,
+                    src,
+                    dst: dst.map(|coordinate| coordinate + 1.0),
+                    color: [0.0, 0.0, 0.0, 0.85 * color[3]],
+                });
+            }
             parts.push(ffi::UpOverlayPart {
                 texture,
                 src,
@@ -687,12 +697,6 @@ impl Overlays {
                     32.0 + self.palette_width as f32,
                     (PALETTE_Y + self.palette_height) as f32,
                 ];
-                add(
-                    1,
-                    source,
-                    [x + 1.0, y + 1.0, x + w + 1.0, y + h + 1.0],
-                    [0.0, 0.0, 0.0, 0.85],
-                );
                 add(1, source, [x, y, x + w, y + h], white(1.0));
             }
         }

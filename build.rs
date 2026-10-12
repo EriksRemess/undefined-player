@@ -91,6 +91,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.c");
     println!("cargo:rerun-if-changed=native/ffmpeg_compat.h");
     println!("cargo:rerun-if-changed=native/read_ahead.h");
+    println!("cargo:rerun-if-changed=native/hls_input.h");
     println!("cargo:rerun-if-changed=native/platform.c");
     println!("cargo:rerun-if-changed=native/platform.h");
     println!("cargo:rerun-if-changed=native/input_geometry.h");
@@ -143,6 +144,7 @@ fn main() {
         .arg("-std=c11")
         .args(["-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
         .args(&ffmpeg_cflags)
+        .args(pkg_config("--cflags", &["glib-2.0"]))
         .arg("-c")
         .arg("native/ffmpeg_compat.c")
         .arg("-o")

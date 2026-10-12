@@ -76,12 +76,17 @@ int up_av_error_string(int code, char *buffer, size_t buffer_size);
 int up_av_error_is_again(int code);
 int up_av_error_is_eof(int code);
 
+int up_av_video_decoder_available(const char *name);
+
 int up_av_format_open(UpAvFormat **format, const char *source, int network,
                       void *interrupt_opaque,
-                      UpAvInterruptCallback interrupt_callback);
+                      UpAvInterruptCallback interrupt_callback,
+                      int select_hls, int *selected_hls);
 int up_av_format_find_stream_info(UpAvFormat *format);
 void up_av_format_close(UpAvFormat **format);
 int up_av_select_video_stream(UpAvFormat *format, unsigned int rank);
+void up_av_select_audio_stream(UpAvFormat *format, int stream_index);
+int up_av_hls_finish_discovery(UpAvFormat *format, int video_index);
 int up_av_find_best_stream(UpAvFormat *format, enum UpMediaType type,
                            int related_stream);
 unsigned int up_av_stream_count(const UpAvFormat *format);

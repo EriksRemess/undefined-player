@@ -586,7 +586,15 @@ mod tests {
                 let mut input = ptr::null_mut();
                 let name = CString::new(path.to_str().unwrap()).unwrap();
                 assert_eq!(
-                    ffi::up_av_format_open(&mut input, name.as_ptr(), 0, ptr::null_mut(), None),
+                    ffi::up_av_format_open(
+                        &mut input,
+                        name.as_ptr(),
+                        0,
+                        ptr::null_mut(),
+                        None,
+                        0,
+                        &mut 0
+                    ),
                     0
                 );
                 assert!(ffi::up_av_format_find_stream_info(input) >= 0);

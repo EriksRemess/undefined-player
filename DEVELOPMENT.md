@@ -61,7 +61,7 @@ responsibility:
 | Modules | Responsibility |
 | --- | --- |
 | `playback.rs`, `clock.rs` | Event loop, command palette, seeking, and playback synchronization |
-| `resume.rs` | Local-file resume storage and startup choice |
+| `resume.rs` | Local-file and YouTube resume storage and startup choice |
 | `chapters.rs` | Chapter timestamps, timeline markers, and previous/next navigation |
 | `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
@@ -85,15 +85,19 @@ the complete printable ASCII font. Canonically decomposable Latin letters use
 the same pixel bodies with supported accents above or below, preserving their
 size and cell spacing. Other characters use shaped masks. Prepared frames borrow
 the Rust buffers for a synchronous renderer call; image revisions avoid repeated
-GPU uploads.
+GPU uploads. Text masks have a one-pixel dark shadow that fades with the
+foreground; timeline geometry is not shadowed.
 Detail lines use a fixed spacing that accommodates accents. Oversized detail
 panels scale uniformly to fit above the playback controls when the window shrinks.
 The renderer borrows its window and takes references to owned video frames.
 
 `src/resume.rs` stores positions in a versioned text file under the XDG state
 directory. Each record contains a SHA-256 hash of the canonical path, seconds,
-file size, and modification time (seconds and nanoseconds). FFmpeg's existing
-libavutil dependency supplies the hash. Updates lock `resume.lock`, reload the
+file size, and modification time (seconds and nanoseconds). Non-live YouTube
+videos instead hash `youtube:VIDEO_ID`, using the ID reported by yt-dlp, with
+zeroes in the file metadata fields. Expiring stream URLs are never stored.
+FFmpeg's existing libavutil dependency supplies the hash. Updates lock
+`resume.lock`, reload the
 records, and atomically replace the data file. The lock uses a separate file
 because replacing the data file changes its inode. The startup prompt can render
 on a black frame when audio buffering delays the first decoded picture.
@@ -120,12 +124,44 @@ and containers whose metadata is not stored at the beginning. Network reads have
 a 15-second timeout and bounded retries for disconnects and transient 503/504
 responses. Their FFmpeg interrupt callback shares the decode worker's lifetime,
 so closing playback cancels a blocked protocol read before joining the worker.
-HLS master playlists select the decodable video stream by resolution, frame rate,
-then advertised variant bitrate. If that rendition's decoder cannot initialize,
-the next lower-ranked rendition is tried. Other video renditions are discarded
-after stream discovery so normal packet reads stay on the selected quality;
-associated audio and subtitle streams remain available to the existing track
-controls.
+`src/youtube.rs` resolves YouTube page URLs through an optional `yt-dlp` on
+`PATH`, before creating the player window. It runs without a shell or yt-dlp
+config, requests one video in simulation mode, and validates its output before
+passing the stream to FFmpeg. It prefers an HLS master, with a combined
+HTTP audio/video format as fallback. JSON string output preserves title/channel
+metadata without adding a JSON dependency. The original page URL remains the
+MPRIS URI; stream URLs are not persisted. Extraction failures and rejected
+streams return normal player errors. HLS HTTP rejection errors are preserved
+when FFmpeg would otherwise skip segments and return EOF.
+
+For network HLS masters, `src/hls.rs` selects video by advertised resolution,
+frame rate, then bandwidth before FFmpeg opens the media playlists. The filtered
+master retains the selected variant's audio/subtitle groups and global tags.
+Unknown quality metadata retains full discovery; failure to open or initialize
+the selected rendition retries full discovery and the existing decoder fallback.
+Full discovery retains the same network IO, error handling, and caption support.
+Local HLS files keep FFmpeg's full discovery and stream ranking.
+
+`native/hls_input.h` preserves the master URL after redirects and starts the next
+ordinary HTTP media segment connection in a background thread. FFmpeg's `async`
+protocol then buffers up to 4 MiB ahead, plus 4 MiB of read-back history, per open
+segment. This buffers compressed bytes without growing the decoded frame queues.
+Manifest, byte-range, encrypted, and unknown resource types use native protocol
+handling; builds without `async` also retain native reads. Closing or seeking
+cancels and joins pending connections before freeing their callback state.
+Only the selected HLS audio stream is read during playback; switching tracks
+updates FFmpeg's discard flags before seeking. HTTP failures during discovery
+trigger a replay from the start with that selection, so an unused audio rendition
+cannot leave a stale error behind. HTTP error capture also covers requests that
+do not use prefetching. Network HLS permits extensionless segments while retaining
+the protocol restrictions, and opened subtitle decoders enable their HLS streams
+so WebVTT tracks produce cues.
+Subtitle playlists and segments are identified from their manifest declarations,
+including redirected and extensionless URLs. Each caption resource is buffered
+with an 8 MiB limit; unavailable captions become empty subtitle data without
+changing video/audio error handling. Live subtitle URL tracking retains only the
+current playlist window. URL resolution uses the existing GLib dependency.
+`--perf` reports input-open and stream-discovery times as well as playback stats.
 
 `src/zoom.rs` owns the fill mode, saved autocrop preference, and centered source
 crop geometry. Fill runs after autocrop and accounts for sample aspect ratio and

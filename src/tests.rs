@@ -92,6 +92,37 @@ fn command_line_parses_playback_options_and_paths() {
 }
 
 #[test]
+fn command_line_expands_youtube_shortcuts_and_rejects_invalid_ids() {
+    assert_eq!(
+        cli(&["--perf", "yt:dQw4w9WgXcQ"]),
+        cli(&["--perf", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"])
+    );
+    assert_eq!(
+        cli(&["yt:ab_CD-12345"]),
+        cli(&["https://www.youtube.com/watch?v=ab_CD-12345"])
+    );
+    for input in [
+        "yt:",
+        "yt:short",
+        "yt:dQw4w9WgXcQ&list=abc",
+        "yt:1234567890/",
+    ] {
+        assert!(
+            cli(&[input])
+                .unwrap_err()
+                .contains("invalid YouTube shortcut")
+        );
+    }
+    assert_eq!(
+        cli(&["./yt:dQw4w9WgXcQ"]),
+        Ok(CliAction::Play {
+            source: crate::source::MediaSource::File(PathBuf::from("./yt:dQw4w9WgXcQ")),
+            perf_log: false,
+        })
+    );
+}
+
+#[test]
 fn command_line_rejects_missing_files_and_unknown_options() {
     assert_eq!(cli(&[]), Err("no media file was specified".into()));
     assert_eq!(cli(&["--wat"]), Err("unknown option: --wat".into()));

@@ -104,12 +104,17 @@ unsafe extern "C" {
     pub fn up_av_error_is_eof(code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn up_av_video_decoder_available(
+        name: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
     pub fn up_av_format_open(
         format: *mut *mut UpAvFormat,
         source: *const ::std::os::raw::c_char,
         network: ::std::os::raw::c_int,
         interrupt_opaque: *mut ::std::os::raw::c_void,
         interrupt_callback: UpAvInterruptCallback,
+        select_hls: ::std::os::raw::c_int,
+        selected_hls: *mut ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -193,6 +198,11 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn up_av_select_audio_stream(format: *mut UpAvFormat, stream_index: ::std::os::raw::c_int);
+    pub fn up_av_hls_finish_discovery(
+        format: *mut UpAvFormat,
+        video_index: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
     pub fn up_av_seek(
         format: *mut UpAvFormat,
         stream_index: ::std::os::raw::c_int,

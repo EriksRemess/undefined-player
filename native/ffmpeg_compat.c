@@ -425,11 +425,21 @@ static int select_hls_video(AVFormatContext *native, unsigned int rank)
     return -1;
 }
 
+#include "hls_input.h"
+
+int up_av_video_decoder_available(const char *name)
+{
+    const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(name);
+    return codec && preferred_decoder(codec->id);
+}
+
 int up_av_format_open(UpAvFormat **format, const char *source, int network,
                       void *interrupt_opaque,
-                      UpAvInterruptCallback interrupt_callback)
+                      UpAvInterruptCallback interrupt_callback,
+                      int select_hls, int *selected_hls)
 {
     *format = NULL;
+    *selected_hls = 0;
     if (network) {
         AVFormatContext *native = avformat_alloc_context();
         if (!native)
@@ -438,16 +448,11 @@ int up_av_format_open(UpAvFormat **format, const char *source, int network,
             interrupt_callback, interrupt_opaque
         };
         AVDictionary *options = NULL;
-        av_dict_set(&options, "rw_timeout", "15000000", 0);
-        av_dict_set(&options, "reconnect", "1", 0);
-        av_dict_set(&options, "reconnect_on_network_error", "1", 0);
-        av_dict_set(&options, "reconnect_on_http_error", "503,504", 0);
-        av_dict_set(&options, "reconnect_delay_max", "2", 0);
-        av_dict_set(&options, "reconnect_max_retries", "3", 0);
+        network_options(&options);
         int log_level = av_log_get_level();
         if (log_level > AV_LOG_ERROR)
             av_log_set_level(AV_LOG_ERROR);
-        int result = avformat_open_input(&native, source, NULL, &options);
+        int result = network_open(&native, source, select_hls, selected_hls, &options);
         av_log_set_level(log_level);
         av_dict_free(&options);
         *format = (UpAvFormat *) native;
@@ -513,8 +518,13 @@ void up_av_format_close(UpAvFormat **format)
     AVIOContext *io = native->pb;
     int custom_io = native->flags & AVFMT_FLAG_CUSTOM_IO;
     avformat_close_input(&native);
-    if (custom_io)
+    if (custom_io && io->read_packet == hls_manifest_read) {
+        hls_input_free(io->opaque);
+        av_freep(&io->buffer);
+        avio_context_free(&io);
+    } else if (custom_io) {
         buffered_close(&io);
+    }
     *format = (UpAvFormat *) native;
 }
 
@@ -612,9 +622,53 @@ const char *up_av_chapter_title(const UpAvFormat *format, unsigned int index)
     return title ? title->value : NULL;
 }
 
+void up_av_select_audio_stream(UpAvFormat *format, int stream_index)
+{
+    AVFormatContext *native = FORMAT(format);
+    if (!native->iformat || !av_match_name("hls", native->iformat->name))
+        return;
+    for (unsigned int i = 0; i < native->nb_streams; i++) {
+        AVStream *stream = native->streams[i];
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            stream->discard = stream->index == stream_index ?
+                              AVDISCARD_DEFAULT : AVDISCARD_ALL;
+    }
+}
+
+int up_av_hls_finish_discovery(UpAvFormat *format, int video_index)
+{
+    AVFormatContext *native = FORMAT(format);
+    if (!native->pb || native->pb->read_packet != hls_manifest_read)
+        return 0;
+    struct HlsInput *input = native->opaque;
+    int error = atomic_load(&input->http_error);
+    if (!error)
+        return 0;
+    /* Discovery probes every rendition, including unused audio. If it saw a
+     * rejected request, replay with the selected streams so only failures in
+     * those streams affect playback. Healthy startup needs no extra seek. */
+    double start = native->start_time == AV_NOPTS_VALUE ? 0.0 :
+                   (double) native->start_time / AV_TIME_BASE;
+    int result = up_av_seek(format, video_index, start);
+    /* A broken rendition can make the full master unseekable. Preserve the
+     * actual media failure instead of replacing it with a misleading EPERM. */
+    return result < 0 && result != AVERROR_EXIT ? error : result;
+}
+
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet)
 {
-    return av_read_frame(FORMAT(format), PACKET(packet));
+    AVFormatContext *native = FORMAT(format);
+    int result = av_read_frame(native, PACKET(packet));
+    /* HLS can skip rejected segments and report EOF. Preserve the HTTP error
+     * so an expired signed URL is not mistaken for a completed video. */
+    if (result == AVERROR_EOF && native->pb &&
+        native->pb->read_packet == hls_manifest_read) {
+        struct HlsInput *input = native->opaque;
+        int error = atomic_load(&input->http_error);
+        if (error < 0)
+            return error;
+    }
+    return result;
 }
 
 int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
@@ -624,8 +678,15 @@ int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
         return AVERROR(EINVAL);
     int64_t timestamp = llround(target_seconds * stream->time_base.den /
                                 stream->time_base.num);
-    return av_seek_frame(FORMAT(format), stream_index, timestamp,
-                         AVSEEK_FLAG_BACKWARD);
+    AVFormatContext *native = FORMAT(format);
+    int result = av_seek_frame(native, stream_index, timestamp,
+                               AVSEEK_FLAG_BACKWARD);
+    if (result >= 0 && native->pb &&
+        native->pb->read_packet == hls_manifest_read) {
+        struct HlsInput *input = native->opaque;
+        atomic_store(&input->http_error, 0);
+    }
+    return result;
 }
 
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
@@ -684,6 +745,10 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
         set_decoder_error("could not open decoder", result);
         goto fail;
     }
+    /* HLS exposes subtitle metadata with packets discarded by default. The
+     * player decodes each available subtitle track for its track switcher. */
+    if (parameters->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        stream->discard = AVDISCARD_DEFAULT;
     return decoder;
 
 fail:

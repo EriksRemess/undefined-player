@@ -540,7 +540,8 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut chapters =
         unsafe { crate::chapters::Chapters::inspect(media.format, playback_start, media_duration) };
     let chapter_markers = chapters.markers(media_duration);
-    let media_metadata = unsafe { crate::metadata::MediaMetadata::inspect(media.format) };
+    let mut media_metadata = unsafe { crate::metadata::MediaMetadata::inspect(media.format) };
+    media_metadata.apply_source(&source);
     let artwork = unsafe { crate::artwork::Artwork::extract(media.format) };
     let mpris_title = media_metadata
         .title()

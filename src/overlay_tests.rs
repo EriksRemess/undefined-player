@@ -287,8 +287,8 @@ fn details_scale_to_fit_above_controls_in_a_small_window() {
             360,
         )
         .unwrap();
-    let panel = &prepared.parts[3];
-    assert!(panel.dst[3] + 2.0 <= prepared.parts[4].dst[1]);
+    let panel = &prepared.parts[6];
+    assert!(panel.dst[3] + 2.0 <= prepared.parts[8].dst[1]);
     let scale_x = (panel.dst[2] - panel.dst[0]) / (panel.src[2] - panel.src[0]);
     let scale_y = (panel.dst[3] - panel.dst[1]) / (panel.src[3] - panel.src[1]);
     assert!((scale_x - scale_y).abs() < 0.00001);
@@ -344,9 +344,9 @@ fn oversized_details_scale_with_the_window_without_changing_cached_pixels() {
                 height,
             )
             .unwrap();
-        let panel = &prepared.parts[3];
+        let panel = &prepared.parts[6];
         assert!(panel.dst[2] <= width as f32 - INSET);
-        assert!(panel.dst[3] + 2.0 <= prepared.parts[4].dst[1]);
+        assert!(panel.dst[3] + 2.0 <= prepared.parts[8].dst[1]);
         let scale_x = (panel.dst[2] - panel.dst[0]) / (panel.src[2] - panel.src[0]);
         let scale_y = (panel.dst[3] - panel.dst[1]) / (panel.src[3] - panel.src[1]);
         assert!((scale_x - scale_y).abs() < 0.00001);
@@ -382,7 +382,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
             720,
         )
         .unwrap();
-    assert_eq!(parts.parts.len(), 9);
+    assert_eq!(parts.parts.len(), 14);
     for part in parts.parts {
         let (width, height) = match part.texture {
             0 => (1, 1),
@@ -398,11 +398,11 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
             assert_eq!(part.src[3] - part.src[1], part.dst[3] - part.dst[1]);
         }
     }
-    assert_eq!(parts.parts[1].dst[1] + 1.0 + ACCENT_PAD as f32, 14.0);
-    assert_eq!(parts.parts[3].dst[1] + ACCENT_PAD as f32, INSET);
-    assert_eq!(parts.parts[4].dst[1] + ACCENT_PAD as f32, 674.0);
-    assert_eq!(parts.parts[5].dst[1] + ACCENT_PAD as f32, 674.0);
-    assert_eq!(parts.parts[2].dst, [1254.0, 14.0, 1264.0, 28.0]);
+    assert_eq!(parts.parts[2].dst[1] + 1.0 + ACCENT_PAD as f32, 14.0);
+    assert_eq!(parts.parts[6].dst[1] + ACCENT_PAD as f32, INSET);
+    assert_eq!(parts.parts[8].dst[1] + ACCENT_PAD as f32, 674.0);
+    assert_eq!(parts.parts[10].dst[1] + ACCENT_PAD as f32, 674.0);
+    assert_eq!(parts.parts[4].dst, [1254.0, 14.0, 1264.0, 28.0]);
     assert_eq!(
         parts.parts.last().unwrap().dst,
         [637.0, 696.0, 643.0, 708.0]
@@ -424,7 +424,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
             720,
         )
         .unwrap();
-    assert_eq!(parts.parts.len(), 2);
+    assert_eq!(parts.parts.len(), 3);
     assert!(empty.text.pixels.iter().any(|p| *p != 0));
     assert!(
         empty
@@ -549,9 +549,9 @@ fn chapter_info_is_top_right_and_does_not_overlap_video_details() {
         let prepared = overlays
             .prepare(content(), visibility(), width, height)
             .unwrap();
-        assert_eq!(prepared.parts.len(), 2);
-        let details = &prepared.parts[0];
-        let chapter = &prepared.parts[1];
+        assert_eq!(prepared.parts.len(), 4);
+        let details = &prepared.parts[1];
+        let chapter = &prepared.parts[3];
         assert_eq!(chapter.dst[2], width as f32 - INSET);
         assert_eq!(chapter.dst[1], INSET - ACCENT_PAD as f32);
         assert!(chapter.dst[0] >= INSET);
@@ -581,7 +581,7 @@ fn chapter_info_is_top_right_and_does_not_overlap_video_details() {
                 height,
             )
             .unwrap();
-        assert_eq!(prepared.parts.len(), 1);
+        assert_eq!(prepared.parts.len(), 2);
         assert!(
             prepared.text.pixels[METADATA_Y * WIDTH..]
                 .iter()
@@ -614,8 +614,8 @@ fn info_corners_share_the_same_inset_and_metadata_rows_align_right() {
             720,
         )
         .unwrap();
-    assert_eq!(prepared.parts.len(), 4);
-    let [details, metadata, stats, position] = prepared.parts else {
+    assert_eq!(prepared.parts.len(), 8);
+    let [_, details, _, metadata, _, stats, _, position] = prepared.parts else {
         unreachable!()
     };
     assert_eq!(details.dst[0], INSET);
@@ -720,4 +720,43 @@ fn palette_pixels_survive_updates_without_erasing_media_details() {
             .iter()
             .all(|pixel| *pixel == 0)
     );
+}
+
+#[test]
+fn text_shadows_follow_glyphs_and_fade_with_the_foreground() {
+    let mut overlays = Overlays::default();
+    let prepared = overlays
+        .prepare(
+            Content {
+                title: "TITLE",
+                info: "FPS: 30",
+                details: "CODEC: VP9",
+                metadata: "TITLE: VIDEO",
+                position: "1:23",
+                palette: "",
+            },
+            Visibility {
+                top_bar: 0.5,
+                info: 0.25,
+                position: 0.75,
+                scrubber: Some((0.5, 1.0)),
+                chapter_markers: &[0.25, 0.75],
+            },
+            1280,
+            720,
+        )
+        .unwrap();
+    assert!(prepared.parts.len() <= 30);
+    let mut shadows = 0;
+    for pair in prepared.parts.windows(2) {
+        let (shadow, text) = (&pair[0], &pair[1]);
+        if shadow.texture > 0 && shadow.color[..3] == [0.0, 0.0, 0.0] {
+            shadows += 1;
+            assert_eq!(shadow.src, text.src);
+            assert_eq!(shadow.texture, text.texture);
+            assert_eq!(shadow.dst, text.dst.map(|coordinate| coordinate + 1.0));
+            assert_eq!(shadow.color[3], text.color[3] * 0.85);
+        }
+    }
+    assert_eq!(shadows, 6);
 }

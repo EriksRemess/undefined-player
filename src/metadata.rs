@@ -45,6 +45,13 @@ impl MediaMetadata {
         }
     }
 
+    pub(crate) fn apply_source(&mut self, source: &MediaSource) {
+        if let MediaSource::YouTube { title, channel, .. } = source {
+            self.title = Some(title.clone());
+            self.artist = channel.clone();
+        }
+    }
+
     pub(crate) fn overlay_text(&self, chapter: Option<&CStr>) -> CString {
         let mut lines = Vec::new();
         if let Some(title) = &self.title {
@@ -259,6 +266,7 @@ fn decode_url_component(value: &str) -> String {
 pub(crate) fn source_title(source: &MediaSource) -> String {
     match source {
         MediaSource::File(path) => media_title(path),
+        MediaSource::YouTube { title, .. } => title.clone(),
         MediaSource::Http(url) => {
             let path = url
                 .split_once("//")
@@ -281,7 +289,7 @@ pub(crate) fn display_title(path: &Path) -> String {
 pub(crate) fn source_display_title(source: &MediaSource) -> String {
     match source {
         MediaSource::File(path) => display_title(path),
-        MediaSource::Http(_) => source_title(source).to_uppercase(),
+        MediaSource::Http(_) | MediaSource::YouTube { .. } => source_title(source).to_uppercase(),
     }
 }
 

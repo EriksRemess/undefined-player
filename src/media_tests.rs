@@ -91,6 +91,11 @@ fn hls_master_selects_highest_quality() {
 }
 
 #[test]
+fn hls_audio_tracks_can_be_reselected_after_discard() {
+    child("hls-audio-selection");
+}
+
+#[test]
 fn deferred_video_keeps_software_fallback() {
     child("deferred-fallback");
 }
@@ -182,6 +187,91 @@ fn playback_child() {
             control.set_muted(false).unwrap();
             assert!(!control.is_muted());
             assert!(audio.resumed);
+        }
+        "hls-audio-selection" => {
+            fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=black:s=64x64:r=5",
+                    "-t",
+                    "2",
+                    "-c:v",
+                    "mpeg2video",
+                    "-g",
+                    "5",
+                    "-f",
+                    "hls",
+                    "-hls_time",
+                    "1",
+                ],
+                "video.m3u8",
+            );
+            fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    "2",
+                    "-c:a",
+                    "aac",
+                    "-f",
+                    "hls",
+                    "-hls_time",
+                    "1",
+                ],
+                "audio.m3u8",
+            );
+            std::fs::copy(fixture.0.join("audio.m3u8"), fixture.0.join("other.m3u8")).unwrap();
+            std::fs::write(
+                fixture.0.join("captions.vtt"),
+                "WEBVTT\n\n00:00:01.800 --> 00:00:02.000\nCaption fixture\n",
+            )
+            .unwrap();
+            std::fs::write(
+                fixture.0.join("captions.m3u8"),
+                "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\ncaptions.vtt\n#EXT-X-ENDLIST\n",
+            )
+            .unwrap();
+            let master = fixture.0.join("master.m3u8");
+            std::fs::write(&master, concat!(
+                "#EXTM3U\n",
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,URI=\"audio.m3u8\"\n",
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"French\",LANGUAGE=\"fr\",DEFAULT=NO,URI=\"other.m3u8\"\n",
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"English\",LANGUAGE=\"en\",URI=\"captions.m3u8\"\n",
+                "#EXT-X-STREAM-INF:BANDWIDTH=100000,RESOLUTION=64x64,AUDIO=\"a\",SUBTITLES=\"s\"\nvideo.m3u8\n",
+            )).unwrap();
+            let mut media = unsafe { Media::open(&master, None, false) }.unwrap();
+            assert_eq!(media.audio_tracks.len(), 2);
+            assert_eq!(media.subtitle_tracks.len(), 1);
+            for track in [0, 1, 0] {
+                unsafe { media.select_audio_track(track, 1.6) }.unwrap();
+                let wanted = media.audio_tracks[track].decoder.stream_index;
+                let unwanted = media.audio_tracks[1 - track].decoder.stream_index;
+                let mut packets = 0;
+                loop {
+                    let result = unsafe { ffi::up_av_read_frame(media.format, media.packet) };
+                    if result < 0 {
+                        assert!(unsafe { crate::decoder::ffmpeg_error_is_eof(result) });
+                        break;
+                    }
+                    let index = unsafe { ffi::up_av_packet_stream_index(media.packet) };
+                    assert_ne!(index, unwanted, "discarded audio must not be read");
+                    packets += usize::from(index == wanted);
+                    if index == media.subtitle_tracks[0].decoder.stream_index {
+                        unsafe { media.decode_packet() }.unwrap();
+                    }
+                    unsafe { ffi::up_av_packet_unref(media.packet) };
+                }
+                assert!(packets > 0, "selected audio must be readable after seeking");
+                assert!(
+                    !media.subtitle_queue.is_empty(),
+                    "HLS subtitle cues must be decoded after seeking"
+                );
+            }
         }
         "hls-quality" => {
             for (name, size, color) in [

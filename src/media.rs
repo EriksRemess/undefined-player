@@ -75,6 +75,45 @@ impl Media {
         interrupt: Arc<AtomicBool>,
         audio_control: AudioControl,
     ) -> Result<Self> {
+        let mut selected_hls = 0;
+        let result = unsafe {
+            Self::open_input(
+                source,
+                vulkan_device,
+                log_subtitles,
+                Arc::clone(&interrupt),
+                audio_control.clone(),
+                true,
+                &mut selected_hls,
+            )
+        };
+        if result.is_err() && selected_hls != 0 && interrupt.load(Ordering::Acquire) {
+            eprintln!("warning: selected HLS rendition failed; retrying full stream discovery");
+            return unsafe {
+                Self::open_input(
+                    source,
+                    vulkan_device,
+                    log_subtitles,
+                    interrupt,
+                    audio_control,
+                    false,
+                    &mut selected_hls,
+                )
+            };
+        }
+        result
+    }
+
+    unsafe fn open_input<S: MediaInput + ?Sized>(
+        source: &S,
+        vulkan_device: Option<*mut c_void>,
+        log_subtitles: bool,
+        interrupt: Arc<AtomicBool>,
+        audio_control: AudioControl,
+        select_hls: bool,
+        selected_hls: &mut i32,
+    ) -> Result<Self> {
+        let opened_at = std::time::Instant::now();
         let input = CString::new(source.input_bytes())
             .map_err(|_| "media source contains a NUL byte".to_string())?;
         let mut format = ptr::null_mut();
@@ -85,6 +124,8 @@ impl Media {
                 i32::from(source.is_network_input()),
                 Arc::as_ptr(&interrupt).cast_mut().cast(),
                 Some(interrupt_when_stopped),
+                i32::from(select_hls),
+                selected_hls,
             )
         };
         if ret < 0 {
@@ -93,8 +134,21 @@ impl Media {
             }));
         }
 
+        if log_subtitles {
+            eprintln!(
+                "perf: input opened in {:.2} s",
+                opened_at.elapsed().as_secs_f64()
+            );
+        }
         let result = (|| {
+            let inspected_at = std::time::Instant::now();
             let ret = unsafe { ffi::up_av_format_find_stream_info(format) };
+            if log_subtitles {
+                eprintln!(
+                    "perf: streams inspected in {:.2} s",
+                    inspected_at.elapsed().as_secs_f64()
+                );
+            }
             if ret < 0 {
                 return Err(format!("could not inspect media streams: {}", unsafe {
                     ffmpeg_error(ret)
@@ -233,6 +287,21 @@ impl Media {
                 eprintln!("subtitles: S toggles, J switches tracks");
             }
 
+            unsafe {
+                ffi::up_av_select_audio_stream(
+                    format,
+                    audio_tracks
+                        .first()
+                        .map_or(-1, |track| track.decoder.stream_index),
+                );
+            }
+            let ret = unsafe { ffi::up_av_hls_finish_discovery(format, video_index) };
+            if ret < 0 {
+                return Err(format!(
+                    "could not restart selected HLS streams: {}",
+                    unsafe { ffmpeg_error(ret) }
+                ));
+            }
             let packet = unsafe { ffi::up_av_packet_alloc() };
             if packet.is_null() {
                 return Err("out of memory while allocating a packet".into());
@@ -590,6 +659,7 @@ impl Media {
     }
 
     pub(crate) unsafe fn fill_queues(&mut self) -> Result<()> {
+        unsafe { self.sync_audio_selection() };
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.pump()? };
         }
@@ -660,6 +730,7 @@ impl Media {
     }
 
     pub(crate) unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
+        unsafe { self.sync_audio_selection() };
         if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
@@ -701,6 +772,14 @@ impl Media {
         Ok(playback_target)
     }
 
+    unsafe fn sync_audio_selection(&self) {
+        let index = self
+            .audio_tracks
+            .get(self.selected_audio_track)
+            .map_or(-1, |track| track.decoder.stream_index);
+        unsafe { ffi::up_av_select_audio_stream(self.format, index) };
+    }
+
     pub(crate) unsafe fn select_audio_track(
         &mut self,
         track: usize,
@@ -719,6 +798,7 @@ impl Media {
             }
             Err(error) => {
                 self.selected_audio_track = previous;
+                unsafe { self.sync_audio_selection() };
                 Err(error)
             }
         }

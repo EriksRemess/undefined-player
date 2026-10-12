@@ -36,7 +36,7 @@ pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result
         || Err("no media file was specified".into()),
         |path| {
             Ok(CliAction::Play {
-                source: MediaSource::from_argument(path.into_os_string()),
+                source: MediaSource::from_argument(path.into_os_string())?,
                 perf_log,
             })
         },
