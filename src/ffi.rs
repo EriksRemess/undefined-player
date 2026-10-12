@@ -435,6 +435,10 @@ unsafe extern "C" {
     pub fn up_platform_capture_mouse(captured: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    pub fn up_platform_show_cursor(visible: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+    pub fn up_window_can_hide_cursor(window: *mut UpWindow) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn up_platform_start_text_input(started: ::std::os::raw::c_int);
 }
 unsafe extern "C" {

@@ -163,6 +163,20 @@ void up_platform_capture_mouse(int captured)
     SDL_CaptureMouse(captured != 0);
 }
 
+int up_platform_show_cursor(int visible)
+{
+    return visible ? SDL_ShowCursor() : SDL_HideCursor();
+}
+
+int up_window_can_hide_cursor(UpWindow *window)
+{
+    const SDL_WindowFlags required = SDL_WINDOW_FULLSCREEN |
+                                    SDL_WINDOW_INPUT_FOCUS |
+                                    SDL_WINDOW_MOUSE_FOCUS;
+    return (SDL_GetWindowFlags(WINDOW(window)) & required) == required &&
+           SDL_GetMouseState(NULL, NULL) == 0;
+}
+
 void up_platform_start_text_input(int started)
 {
     if (started) SDL_StartTextInput(SDL_GetKeyboardFocus());

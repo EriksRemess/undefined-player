@@ -104,6 +104,10 @@ Right-click opens the desktop's window menu, where supported. GNOME offers
 **Always on Top** there; available actions depend on the compositor. On desktops
 without a window menu, right-click has no effect.
 
+In fullscreen, the mouse cursor hides after 1.5 seconds of inactivity. Moving
+or clicking the mouse shows it again; it stays visible while dragging and in
+windowed mode.
+
 In the palette, type to filter, use Up/Down to select, Enter to advance or run,
 and Escape to close. Choose **Seek**, then **Forward** or **Backward**, then a
 seconds value; you can also type a custom amount, such as `seek forward 45` or

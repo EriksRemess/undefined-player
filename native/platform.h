@@ -75,6 +75,8 @@ const char *up_platform_error(void);
 void up_platform_delay(uint32_t milliseconds);
 int up_platform_poll_event(UpEvent *event);
 void up_platform_capture_mouse(int captured);
+int up_platform_show_cursor(int visible);
+int up_window_can_hide_cursor(UpWindow *window);
 void up_platform_start_text_input(int started);
 
 UpWindow *up_window_create(const char *title, int width, int height);

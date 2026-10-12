@@ -11,7 +11,9 @@ use crate::presentation::{
 use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
 use crate::source::MediaSource;
 use crate::subtitles::SubtitleCue;
-use crate::window::{Action, Sdl, WaylandInput, Window, action_for_key, action_shortcut};
+use crate::window::{
+    Action, IdleCursor, Sdl, WaylandInput, Window, action_for_key, action_shortcut,
+};
 use crate::worker::DecodeWorker;
 use crate::{Result, ffi};
 use std::collections::VecDeque;
@@ -586,6 +588,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut redraw = true;
     let mut new_frame_pending = true;
     let mut top_bar = TopBar::new();
+    let mut cursor = IdleCursor::new();
     let mut chapter_heading = ChapterHeading::default();
     let mut position_notice = PositionNotice::new();
     let mut scrubbing = false;
@@ -615,10 +618,12 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                 }
                 ffi::UpEventType_UP_EVENT_WINDOW_EXPOSED => redraw = true,
                 ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_GAINED => {
+                    cursor.activity();
                     top_bar.set_focused(true);
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_LOST => {
+                    cursor.activity();
                     top_bar.set_focused(false);
                     chapter_heading.hovered = None;
                     if scrubbing {
@@ -629,10 +634,12 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_LEAVE => {
+                    cursor.activity();
                     chapter_heading.hovered = None;
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_MOTION => {
+                    cursor.activity();
                     top_bar.mouse_activity();
                     chapter_heading.hovered =
                         window.chapter_hover(event.x, event.y, &chapter_markers);
@@ -646,6 +653,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_BUTTON_DOWN => {
+                    cursor.activity();
                     top_bar.mouse_activity();
                     redraw = true;
                     if resume_prompt.is_some() {
@@ -672,6 +680,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     }
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_BUTTON_UP => {
+                    cursor.activity();
                     if event.button == ffi::UP_MOUSE_BUTTON_LEFT as u8 && scrubbing {
                         if let Some(target) =
                             window.scrubber_target(event.x, event.y, media_duration)
@@ -1017,6 +1026,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                 }
             }
         }
+        cursor.update(&window);
         if !running {
             break;
         }

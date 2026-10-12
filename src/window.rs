@@ -1,6 +1,52 @@
 use crate::{Result, ffi, geometry};
 use std::env;
 use std::ffi::CStr;
+use std::time::{Duration, Instant};
+
+pub(crate) struct IdleCursor {
+    last_activity: Instant,
+    can_hide: bool,
+    visible: bool,
+}
+
+impl IdleCursor {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_activity: Instant::now(),
+            can_hide: false,
+            visible: true,
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if self.visible != visible
+            && unsafe { ffi::up_platform_show_cursor(i32::from(visible)) } != 0
+        {
+            self.visible = visible;
+        }
+    }
+
+    pub(crate) fn activity(&mut self) {
+        self.last_activity = Instant::now();
+        self.set_visible(true);
+    }
+
+    pub(crate) fn update(&mut self, window: &Window) {
+        // Read SDL's actual state, including compositor-driven fullscreen changes.
+        let can_hide = unsafe { ffi::up_window_can_hide_cursor(window.as_ptr()) } != 0;
+        if !can_hide || !self.can_hide {
+            self.last_activity = Instant::now();
+        }
+        self.can_hide = can_hide;
+        self.set_visible(!can_hide || self.last_activity.elapsed() < Duration::from_millis(1500));
+    }
+}
+
+impl Drop for IdleCursor {
+    fn drop(&mut self) {
+        self.set_visible(true);
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
