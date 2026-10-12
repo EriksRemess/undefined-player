@@ -830,6 +830,13 @@ fn playback_child() {
             if case != "audio-tail" {
                 assert!(media.video_queue.is_empty());
                 assert!(unsafe { media.audio_full() });
+                // A resume prompt must be drawable while this audio remains
+                // paused: the decoder cannot produce its first picture yet.
+                let background =
+                    crate::playback::resume_background(true, !media.video_queue.is_empty())
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(background.dimensions(), (16, 16));
                 let info = unsafe { VideoInfo::inspect(&media, ptr::null()) };
                 assert!(info.lines[1].contains("64X64"));
             }

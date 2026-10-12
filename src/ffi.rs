@@ -362,6 +362,7 @@ pub const UpEventType_UP_EVENT_MOUSE_BUTTON_DOWN: UpEventType = 8;
 pub const UpEventType_UP_EVENT_MOUSE_BUTTON_UP: UpEventType = 9;
 pub const UpEventType_UP_EVENT_KEY_DOWN: UpEventType = 10;
 pub const UpEventType_UP_EVENT_MOUSE_LEAVE: UpEventType = 11;
+pub const UpEventType_UP_EVENT_TEXT_INPUT: UpEventType = 12;
 pub type UpEventType = ::std::os::raw::c_uint;
 pub const UpKey_UP_KEY_OTHER: UpKey = 0;
 pub const UpKey_UP_KEY_Q: UpKey = 1;
@@ -380,6 +381,14 @@ pub const UpKey_UP_KEY_COMMA: UpKey = 13;
 pub const UpKey_UP_KEY_PERIOD: UpKey = 14;
 pub const UpKey_UP_KEY_M: UpKey = 15;
 pub const UpKey_UP_KEY_L: UpKey = 16;
+pub const UpKey_UP_KEY_P: UpKey = 17;
+pub const UpKey_UP_KEY_UP: UpKey = 18;
+pub const UpKey_UP_KEY_DOWN: UpKey = 19;
+pub const UpKey_UP_KEY_RETURN: UpKey = 20;
+pub const UpKey_UP_KEY_ESCAPE: UpKey = 21;
+pub const UpKey_UP_KEY_BACKSPACE: UpKey = 22;
+pub const UpKey_UP_KEY_Y: UpKey = 23;
+pub const UpKey_UP_KEY_N: UpKey = 24;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -391,6 +400,8 @@ pub struct UpEvent {
     pub y: f32,
     pub button: u8,
     pub clicks: u8,
+    pub modifiers: u16,
+    pub text: [::std::os::raw::c_char; 32],
 }
 unsafe extern "C" {
     pub fn up_platform_init() -> ::std::os::raw::c_int;
@@ -409,6 +420,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_platform_capture_mouse(captured: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn up_platform_start_text_input(started: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
     pub fn up_window_create(
@@ -674,6 +688,11 @@ unsafe extern "C" {
     pub fn up_av_frame_field(frame: *const UpAvFrame) -> i32;
     pub fn up_av_frame_dimensions(frame: *const UpAvFrame, width: *mut i32, height: *mut i32);
     pub fn up_av_frame_clone(frame: *const UpAvFrame) -> *mut UpAvFrame;
+    pub fn up_av_frame_black() -> *mut UpAvFrame;
     pub fn up_av_frame_luma(frame: *const UpAvFrame, view: *mut UpLumaView) -> i32;
     pub fn up_av_frame_luma_free(view: *mut UpLumaView);
+}
+
+unsafe extern "C" {
+    pub fn up_av_sha256(data: *const u8, length: usize, digest: *mut u8) -> ::std::os::raw::c_int;
 }

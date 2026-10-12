@@ -43,6 +43,14 @@ static enum UpKey translate_key(SDL_Keycode key)
         return UP_KEY_M;
     case SDLK_L:
         return UP_KEY_L;
+    case SDLK_P: return UP_KEY_P;
+    case SDLK_UP: return UP_KEY_UP;
+    case SDLK_DOWN: return UP_KEY_DOWN;
+    case SDLK_RETURN: return UP_KEY_RETURN;
+    case SDLK_ESCAPE: return UP_KEY_ESCAPE;
+    case SDLK_BACKSPACE: return UP_KEY_BACKSPACE;
+    case SDLK_Y: return UP_KEY_Y;
+    case SDLK_N: return UP_KEY_N;
     default:
         return UP_KEY_OTHER;
     }
@@ -136,6 +144,12 @@ int up_platform_poll_event(UpEvent *event)
         event->type = UP_EVENT_KEY_DOWN;
         event->key = translate_key(native.key.key);
         event->repeat = native.key.repeat;
+        if (native.key.mod & SDL_KMOD_SHIFT) event->modifiers |= UP_MOD_SHIFT;
+        if (native.key.mod & SDL_KMOD_CTRL) event->modifiers |= UP_MOD_CTRL;
+        break;
+    case SDL_EVENT_TEXT_INPUT:
+        event->type = UP_EVENT_TEXT_INPUT;
+        SDL_strlcpy(event->text, native.text.text, sizeof(event->text));
         break;
     default:
         event->type = UP_EVENT_NONE;
@@ -147,6 +161,12 @@ int up_platform_poll_event(UpEvent *event)
 void up_platform_capture_mouse(int captured)
 {
     SDL_CaptureMouse(captured != 0);
+}
+
+void up_platform_start_text_input(int started)
+{
+    if (started) SDL_StartTextInput(SDL_GetKeyboardFocus());
+    else SDL_StopTextInput(SDL_GetKeyboardFocus());
 }
 
 UpWindow *up_window_create(const char *title, int width, int height)

@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 
 const WIDTH: usize = 1024;
-const HEIGHT: usize = 704;
+const PALETTE_Y: usize = 704;
+const HEIGHT: usize = PALETTE_Y + 7 * LINE_ADVANCE;
 const SCALE: usize = 2;
 const BASE_HEIGHT: usize = 7 * SCALE;
 // Accents occupy their own rows so the 5x7 letter bodies never shrink.
@@ -339,6 +340,7 @@ pub struct Content<'a> {
     pub details: &'a str,
     pub metadata: &'a str,
     pub position: &'a str,
+    pub palette: &'a str,
 }
 
 pub struct Visibility<'a> {
@@ -358,11 +360,14 @@ pub struct Overlays {
     metadata_key: Option<(String, usize)>,
     metadata_width: usize,
     metadata_height: usize,
+    palette_width: usize,
+    palette_height: usize,
     title_width: usize,
     info_width: usize,
     details_width: usize,
     details_height: usize,
     position_width: usize,
+    palette_key: Option<(String, usize)>,
     parts: Vec<ffi::UpOverlayPart>,
 }
 impl Default for Overlays {
@@ -376,11 +381,14 @@ impl Default for Overlays {
             metadata_key: None,
             metadata_width: 0,
             metadata_height: 0,
+            palette_width: 0,
+            palette_height: 0,
             title_width: 0,
             info_width: 0,
             details_width: 0,
             details_height: 0,
             position_width: 0,
+            palette_key: None,
             parts: Vec::with_capacity(9),
         }
     }
@@ -423,6 +431,9 @@ impl Overlays {
             self.text.clear();
             self.chapter_key = None;
             self.metadata_key = None;
+            // `Image::clear` also erases the palette region. Force it to be
+            // rasterized again even when its query and selection are unchanged.
+            self.palette_key = None;
             self.info_width = self.text.text(0, INFO_Y, content.info)?;
             self.position_width = self.text.text(0, POSITION_Y, content.position)?;
             self.text.glyph(CLOSE_X, CLOSE_Y, b'X');
@@ -456,6 +467,27 @@ impl Overlays {
                 content.position.into(),
             ));
         }
+        if self.palette_key.as_ref().is_none_or(|(old, old_width)| {
+            old != content.palette || *old_width != width.max(1) as usize
+        }) {
+            let palette_changed = self.palette_width > 0 || !content.palette.is_empty();
+            for row in PALETTE_Y..HEIGHT {
+                self.text.pixels[row * WIDTH..(row + 1) * WIDTH].fill(0);
+            }
+            self.palette_width = 0;
+            self.palette_height = 0;
+            if !content.palette.is_empty() {
+                for (line, text) in content.palette.lines().take(7).enumerate() {
+                    let y = PALETTE_Y + line * LINE_ADVANCE;
+                    self.palette_width = self.palette_width.max(self.text.text(32, y, text)?);
+                    self.palette_height = (line + 1) * LINE_ADVANCE;
+                }
+            }
+            if palette_changed {
+                self.text.serial += 1;
+            }
+            self.palette_key = Some((content.palette.into(), width.max(1) as usize));
+        }
         Ok(())
     }
 
@@ -474,7 +506,7 @@ impl Overlays {
         if label.is_empty() && self.metadata_key.is_none() {
             return Ok(());
         }
-        self.text.pixels[METADATA_Y * WIDTH..].fill(0);
+        self.text.pixels[METADATA_Y * WIDTH..PALETTE_Y * WIDTH].fill(0);
         let mut widths = Vec::new();
         for (line, text) in label.lines().take(3).enumerate() {
             let y = METADATA_Y + line * LINE_ADVANCE;
@@ -639,7 +671,32 @@ impl Overlays {
                 );
             }
         }
-        if self.metadata_width > 0 && metadata_scale > 0.0 {
+        if self.palette_width > 0 {
+            let panel_height = self.palette_height as f32;
+            let available_width = (width - 2.0 * INSET).max(0.0);
+            let scale = 1.0_f32.min(available_width / self.palette_width as f32);
+            if scale > 0.0 {
+                let w = self.palette_width as f32 * scale;
+                let h = panel_height * scale;
+                // Keep the pixel font on whole pixels, as in the info overlay.
+                let x = ((width - w) * 0.5).round();
+                let y = ((height - h) * 0.5).round();
+                let source = [
+                    32.0,
+                    PALETTE_Y as f32,
+                    32.0 + self.palette_width as f32,
+                    (PALETTE_Y + self.palette_height) as f32,
+                ];
+                add(
+                    1,
+                    source,
+                    [x + 1.0, y + 1.0, x + w + 1.0, y + h + 1.0],
+                    [0.0, 0.0, 0.0, 0.85],
+                );
+                add(1, source, [x, y, x + w, y + h], white(1.0));
+            }
+        }
+        if self.palette_width == 0 && self.metadata_width > 0 && metadata_scale > 0.0 {
             let x = (width - INSET - metadata_width).max(INSET);
             add(
                 1,

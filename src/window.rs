@@ -2,7 +2,7 @@ use crate::{Result, ffi, geometry};
 use std::env;
 use std::ffi::CStr;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
     CycleAudio,
     CycleSubtitles,
@@ -20,6 +20,27 @@ pub(crate) enum Action {
     ToggleMute,
     TogglePause,
     ToggleSubtitles,
+}
+
+pub(crate) fn action_shortcut(action: &Action) -> &'static str {
+    match action {
+        Action::CycleAudio => "A",
+        Action::CycleSubtitles => "J",
+        Action::Quit => "Q",
+        Action::SeekBackward => "LEFT",
+        Action::SeekForward => "RIGHT",
+        Action::PreviousChapter => ",",
+        Action::NextChapter => ".",
+        Action::ToggleFullscreen => "F",
+        Action::ToggleCrop => "C",
+        Action::CycleDeinterlace => "D",
+        Action::ToggleZoom => "Z",
+        Action::ToggleInfo => "I",
+        Action::ToggleLoop => "L",
+        Action::ToggleMute => "M",
+        Action::TogglePause => "SPACE",
+        Action::ToggleSubtitles => "S",
+    }
 }
 
 pub(crate) fn action_for_key(key: u32) -> Option<Action> {

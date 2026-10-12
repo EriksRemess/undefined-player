@@ -99,6 +99,14 @@ pub(crate) struct VideoFrame {
 }
 
 impl VideoFrame {
+    pub(crate) fn black() -> Result<Self> {
+        let frame = unsafe { ffi::up_av_frame_black() };
+        if frame.is_null() {
+            return Err("could not allocate the prompt background".into());
+        }
+        Ok(unsafe { Self::from_raw(frame, 0.0, 0.0) })
+    }
+
     pub(crate) fn dimensions(&self) -> (i32, i32) {
         let (mut width, mut height) = (0, 0);
         unsafe { ffi::up_av_frame_dimensions(self.frame, &mut width, &mut height) };

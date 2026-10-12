@@ -9,6 +9,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/sha.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
@@ -1125,5 +1126,35 @@ int up_av_subtitle_rect(const UpAvSubtitle *subtitle, unsigned int index,
     view->pixels = rect->data[0];
     view->palette = rect->data[1];
     view->text = rect->type == SUBTITLE_ASS ? rect->ass : rect->text;
+    return 1;
+}
+
+UpAvFrame *up_av_frame_black(void)
+{
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) return NULL;
+    frame->format = AV_PIX_FMT_RGB24;
+    frame->width = frame->height = 16;
+    frame->sample_aspect_ratio = (AVRational) {1, 1};
+    frame->color_range = AVCOL_RANGE_JPEG;
+    frame->colorspace = AVCOL_SPC_RGB;
+    frame->color_primaries = AVCOL_PRI_BT709;
+    frame->color_trc = AVCOL_TRC_IEC61966_2_1;
+    if (av_frame_get_buffer(frame, 0) < 0) {
+        av_frame_free(&frame);
+        return NULL;
+    }
+    memset(frame->data[0], 0, (size_t) frame->linesize[0] * frame->height);
+    return (UpAvFrame *) frame;
+}
+
+int up_av_sha256(const uint8_t *data, size_t length, uint8_t *digest)
+{
+    struct AVSHA *sha = av_sha_alloc();
+    if (!sha) return 0;
+    if (av_sha_init(sha, 256) < 0) { av_free(sha); return 0; }
+    av_sha_update(sha, data, length);
+    av_sha_final(sha, digest);
+    av_free(sha);
     return 1;
 }

@@ -36,16 +36,9 @@ client library, Pango/Cairo, GIO, and compatible FFmpeg 8 or newer shared
 libraries. Vulkan Video support enables hardware decoding; unsupported codecs
 fall back to software decoding but still use Vulkan for presentation.
 
-When the player is built against Ubuntu 26.04's packaged libraries, the base
-runtime packages can be installed with:
-
-```sh
-sudo apt install libvulkan1 libsdl3-0 libplacebo360 libwayland-client0 \
-  libpangocairo-1.0-0 libcairo2 pipewire-audio
-```
-
-The GPU vendor's Vulkan driver is an additional runtime requirement. On Arch
-Linux with an AMD Radeon GPU, that driver is `vulkan-radeon`.
+Wayland and PipeWire are the only supported display and audio backends.
+The Debian package declares its shared-library dependencies; binary tarball
+users must provide compatible libraries and their GPU's Vulkan driver.
 
 ## Usage
 
@@ -67,15 +60,14 @@ For an HLS master playlist, the player selects the decodable rendition with the
 largest resolution, then the highest frame rate and bitrate, and keeps that
 quality fixed during playback.
 
-The player starts playing immediately. The focused video window accepts:
+Playback starts immediately unless a saved position requires a resume choice.
+During playback, the focused video window accepts:
 
 - `F` — toggle fullscreen
 - `C` — toggle automatic cropping of encoded black borders
 - `Z` — toggle zoom to fill the window, using autocrop first
 - `D` — cycle deinterlacing: Auto (default), On, Off
-- `I` — toggle video/color details, deinterlacing status, cropped resolution,
-  FPS / shown / dropped frames, and playback
-  position
+- `I` — toggle media details, processing status, frame statistics, and position
 - `A` — switch to the next audio track
 - `M` — mute or unmute audio
 - `L` — toggle looping the video
@@ -85,11 +77,33 @@ The player starts playing immediately. The focused video window accepts:
 - `S` — toggle subtitles
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
+- `Ctrl+Shift+P` — open the command palette
+
+In the palette, type to filter, use Up/Down to select, Enter to advance or run,
+and Escape to close. Choose **Seek**, then **Forward** or **Backward**, then a
+seconds value; you can also type a custom amount, such as `seek forward 45` or
+`seek backward 2 minutes`. Choose **Jump to time** and enter seconds (`jump 123`)
+or a timestamp (`jump 2:03` or `jump 1:02:03`). Complete commands can also be typed
+directly.
+
+Local videos with a known duration remember their position when the player closes.
+On reopening, the prompt asks **Resume from [time]? Y/N**: press `Y` to resume
+or `N` to play from the start.
+Playback waits for your choice. Starting over clears the old position immediately;
+closing the player saves the new position. Playing through to the end removes it.
+Pressing `Q` or Escape, or closing the window, leaves the previous position intact
+if you have not answered the prompt.
+
+Resume positions live in one file, `$XDG_STATE_HOME/undefined-player/resume`,
+or `~/.local/state/undefined-player/resume` by default. Changed files do not reuse
+positions saved with a different size or modification time.
 
 Auto deinterlacing checks motion across decoded pictures, so film stored with
 interlacing flags can retain its original detail. It takes a few frames to settle
 and falls back to the flags when analysis is unavailable. Progressive hardware
-video keeps its fast path without readback. `D` still provides forced On and Off.
+video keeps its fast path without readback. Press `D` to cycle Auto, On, and Off;
+On assumes top-field-first when the frame has no interlacing flag. Changes also
+apply while paused. Filtering runs on the GPU at the source frame rate.
 
 For files with chapters, dots on the timeline mark each chapter's start.
 Chapter navigation keeps the current pause state and stops at the first or last
@@ -117,11 +131,9 @@ the background so the window remains responsive, and audio and video resume
 together once buffered data is ready. Audio tracks that begin later stay silent
 until their starting timestamp.
 
-File reads run ahead in the background to absorb short network stalls, including
-files on mounted network shares. The player's file reader buffers up to 4 MiB
-ahead and retains 4 MiB for backward reads without increasing the decoded-frame
-queues. At 10 Mb/s this provides roughly three seconds of read-ahead once filled;
-longer outages or a connection slower than the video bitrate can still stutter.
+Local files, including files on mounted network shares, are buffered ahead to
+absorb short stalls. HTTP(S) inputs use FFmpeg's network buffering. A connection
+slower than the video's bitrate can still stutter.
 
 Autocrop starts disabled. Press `C` to detect stable black borders in the video;
 press it again to restore the complete frame. Detection samples frames in a
@@ -141,20 +153,12 @@ waiting for a reliable border sample. Dark scenes retain the last detected crop;
 if border sampling is unsupported, zoom uses the full frame. Both controls work
 while paused.
 
-Deinterlacing starts in Auto mode and follows each decoded frame's interlacing
-flag and field order. Press `D` to force it On for incorrectly flagged files,
-again to turn it Off, and again to return to Auto. On assumes top-field-first
-when the frame has no interlacing flag. Changes also apply while paused.
-Filtering runs on the GPU at the source frame rate (not doubled field rate).
-Auto uses decoder metadata; it does not scan the picture for combing.
-
 ## Scope
 
-The player accepts one local media path or HTTP(S) URL on the command line. Local
-files use the bounded Rust read-ahead buffer; network inputs use FFmpeg's protocol
-and buffering support. Hardware video
-decode covers the codecs and profiles exposed by both the selected FFmpeg build
-and the installed Vulkan driver. If Vulkan decoder initialization or initial
+The player accepts one local media path or HTTP(S) URL on the command line;
+there is no playlist. Hardware video decoding covers the codecs and profiles
+exposed by both the selected FFmpeg build and the installed Vulkan driver.
+If Vulkan decoder initialization or initial
 decoding fails, playback restarts with FFmpeg's software decoder and uploads
 frames for Vulkan presentation.
 HDR metadata is retained from FFmpeg through libplacebo, which supplies the
@@ -164,24 +168,14 @@ integer scale that fits, with nearest-neighbour filtering and centered black
 borders. If the video needs shrinking, normal aspect-preserving scaling applies.
 Other sources up to 1920×1080 (or 1080×1920 in portrait) use libplacebo's GPU
 EWA Lanczos-sharp upscaler with mild anti-ringing for cleaner enlargement to 4K.
-Larger sources use the normal Lanczos path.
-
-The current platform scope is:
-
-- Wayland only (`SDL_VIDEODRIVER=wayland`)
-- PipeWire only (`SDL_AUDIODRIVER=pipewire`)
-- a Vulkan-capable GPU
-- FFmpeg 8 or newer shared libraries
-- system SDL3 and libplacebo
-- system Pango/Cairo and Wayland client libraries
+Larger sources use libplacebo's default scaling.
 
 The default embedded subtitle track is preselected, but subtitles start hidden;
 `S` shows them and `J` cycles through all decodable embedded tracks while
 briefly showing the selected number.
 DVD/PGS bitmap subtitles retain their authored placement. Text and ASS dialogue
 use a compact bold monospace Pango font with Unicode shaping and automatic font
-fallback; advanced ASS styling is ignored. There is no playlist or audio-stream
-selection menu yet; audio tracks are cycled with `A`.
+fallback; advanced ASS styling is ignored.
 
 ## License
 

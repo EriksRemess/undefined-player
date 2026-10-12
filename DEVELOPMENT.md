@@ -60,7 +60,8 @@ responsibility:
 
 | Modules | Responsibility |
 | --- | --- |
-| `playback.rs`, `clock.rs` | Event loop, seeking, and playback synchronization |
+| `playback.rs`, `clock.rs` | Event loop, command palette, seeking, and playback synchronization |
+| `resume.rs` | Local-file resume storage and startup choice |
 | `chapters.rs` | Chapter timestamps, timeline markers, and previous/next navigation |
 | `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
@@ -70,6 +71,7 @@ responsibility:
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |
 | `renderer.rs`, `overlay.rs`, `pixel_font.rs` | Renderer ownership, overlay pixels, and placement |
 | `autocrop.rs` | Background luma sampling and stable black-border detection |
+| `deinterlace.rs`, `luma.rs`, `zoom.rs` | Picture analysis, luma sampling, and fit/fill behavior |
 | `metadata.rs`, `subtitles.rs`, `presentation.rs` | Media labels, subtitle content, and UI state |
 | `mpris.rs`, `mpris.xml` | MPRIS metadata, playback state, commands, and interface definition |
 
@@ -84,16 +86,25 @@ the same pixel bodies with supported accents above or below, preserving their
 size and cell spacing. Other characters use shaped masks. Prepared frames borrow
 the Rust buffers for a synchronous renderer call; image revisions avoid repeated
 GPU uploads.
-Detail lines reserve extra space only where accent pixels need it. Oversized
+Detail lines use a fixed spacing that accommodates accents. Oversized detail
 panels scale uniformly to fit above the playback controls when the window shrinks.
 The renderer borrows its window and takes references to owned video frames.
+
+`src/resume.rs` stores positions in a versioned text file under the XDG state
+directory. Each record contains a SHA-256 hash of the canonical path, seconds,
+file size, and modification time (seconds and nanoseconds). FFmpeg's existing
+libavutil dependency supplies the hash. Updates lock `resume.lock`, reload the
+records, and atomically replace the data file. The lock uses a separate file
+because replacing the data file changes its inode. The startup prompt can render
+on a black frame when audio buffering delays the first decoded picture.
+
 `src/autocrop.rs` samples owned frame references on a bounded background worker
 when enabled. It checks luma edges, stabilizes crop bounds, and rejects stale
 results after toggles, every explicit seek, or timeline discontinuities. Its
 area and brightness checks allow narrow pictures while rejecting small highlights.
-The FFmpeg adapter exposes
-8–16-bit luma planes and downloads hardware frames only for these samples; the
-worker finishes before the renderer destroys its Vulkan device.
+The FFmpeg adapter exposes 8–16-bit luma planes and downloads hardware frames
+when sampling requires it; the worker finishes before the renderer destroys its
+Vulkan device.
 
 `src/read_ahead.rs` owns the input file and its read worker. Its buffer retains
 up to 4 MiB of history and prefetches 4 MiB ahead. A mutex protects buffer state,
@@ -171,7 +182,7 @@ cargo build --release --locked
 git diff --check
 ```
 
-`make check` runs the native integration tests, Rust tests, strict Clippy checks,
+`make check` runs the native renderer logic tests, Rust tests, strict Clippy checks,
 and desktop-file validation. The Rust overlay tests cover printable symbols,
 Unicode accents, mask bounds, title truncation, caching, and control placement.
 Geometry and MPRIS state tests run without a desktop or D-Bus session.
@@ -195,8 +206,8 @@ optionally `DESTDIR` for another installation root.
 
 ## Debian package
 
-The package currently targets Ubuntu 26.04 and Debian testing/unstable. Debian
-stable ships an older FFmpeg release than the player supports.
+The package is built on Ubuntu 26.04 in CI. Other Debian-based distributions
+must satisfy the minimum versions declared in `debian/control`.
 
 Install the build dependencies declared in `debian/control`, then build an
 unsigned binary package:
@@ -245,4 +256,4 @@ versioned releases. Pull requests do not run the release workflow. The workflow
 uses the latest stable Rust toolchain for both build jobs. It builds and
 checks on Arch Linux, builds and lints the Debian package on Ubuntu 26.04,
 creates the binary tarball, and uploads both package formats. User builds
-require Rust 1.93.1 or newer, matching Ubuntu 26.04's packaged compiler.
+require Rust 1.93.1 or newer, as declared in `Cargo.toml`.

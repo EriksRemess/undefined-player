@@ -25,6 +25,7 @@ mod playback;
 mod presentation;
 mod read_ahead;
 mod renderer;
+mod resume;
 mod source;
 mod subtitles;
 mod window;

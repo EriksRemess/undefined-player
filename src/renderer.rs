@@ -28,6 +28,7 @@ pub(crate) struct RendererOverlays<'a> {
     pub(crate) scrubber: Option<(f32, f32)>,
     pub(crate) chapter_markers: &'a [f32],
     pub(crate) subtitle: Option<&'a SubtitleCue>,
+    pub(crate) palette: &'a CStr,
 }
 
 fn processing_details(
@@ -166,6 +167,7 @@ impl<'window> Renderer<'window> {
                 details: &details,
                 metadata: &overlays.metadata.map_or(c"", |text| text).to_string_lossy(),
                 position: &position,
+                palette: &overlays.palette.to_string_lossy(),
             },
             overlay::Visibility {
                 top_bar: top_bar_alpha,

@@ -19,6 +19,7 @@ enum UpEventType {
     UP_EVENT_MOUSE_BUTTON_UP,
     UP_EVENT_KEY_DOWN,
     UP_EVENT_MOUSE_LEAVE,
+    UP_EVENT_TEXT_INPUT,
 };
 
 enum UpKey {
@@ -39,6 +40,14 @@ enum UpKey {
     UP_KEY_PERIOD,
     UP_KEY_M,
     UP_KEY_L,
+    UP_KEY_P,
+    UP_KEY_UP,
+    UP_KEY_DOWN,
+    UP_KEY_RETURN,
+    UP_KEY_ESCAPE,
+    UP_KEY_BACKSPACE,
+    UP_KEY_Y,
+    UP_KEY_N,
 };
 
 typedef struct UpEvent {
@@ -49,7 +58,14 @@ typedef struct UpEvent {
     float y;
     uint8_t button;
     uint8_t clicks;
+    uint16_t modifiers;
+    char text[32];
 } UpEvent;
+
+enum UpModifier {
+    UP_MOD_SHIFT = 1,
+    UP_MOD_CTRL = 2,
+};
 
 #define UP_MOUSE_BUTTON_LEFT 1
 
@@ -59,6 +75,7 @@ const char *up_platform_error(void);
 void up_platform_delay(uint32_t milliseconds);
 int up_platform_poll_event(UpEvent *event);
 void up_platform_capture_mouse(int captured);
+void up_platform_start_text_input(int started);
 
 UpWindow *up_window_create(const char *title, int width, int height);
 void up_window_destroy(UpWindow *window);

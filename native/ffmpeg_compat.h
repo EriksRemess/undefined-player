@@ -134,6 +134,7 @@ void up_av_frame_free(UpAvFrame **frame);
 int up_av_frame_field(const UpAvFrame *frame);
 void up_av_frame_dimensions(const UpAvFrame *frame, int *width, int *height);
 UpAvFrame *up_av_frame_clone(const UpAvFrame *frame);
+UpAvFrame *up_av_frame_black(void);
 typedef struct UpLumaView {
     UpAvFrame *frame;
     const uint8_t *data;
@@ -170,3 +171,5 @@ void up_av_subtitle_free(UpAvSubtitle **subtitle);
 void up_av_subtitle_info(const UpAvSubtitle *subtitle, UpSubtitleInfo *info);
 int up_av_subtitle_rect(const UpAvSubtitle *subtitle, unsigned int index,
                         UpSubtitleRectView *view);
+
+int up_av_sha256(const uint8_t *data, size_t length, uint8_t *digest);

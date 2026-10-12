@@ -152,6 +152,7 @@ fn content(title: &str) -> Content<'_> {
         details: "",
         metadata: "",
         position: "",
+        palette: "",
     }
 }
 
@@ -231,6 +232,7 @@ fn caches_track_content_and_title_width_without_truncating_keys() {
         .update(
             Content {
                 position: "1:23",
+                palette: "",
                 ..content(&title)
             },
             640,
@@ -367,6 +369,7 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                 details: "VIDEO\nHDR",
                 metadata: "",
                 position: "1:23",
+                palette: "",
             },
             Visibility {
                 top_bar: 1.0,
@@ -594,6 +597,7 @@ fn info_corners_share_the_same_inset_and_metadata_rows_align_right() {
         .prepare(
             Content {
                 title: "",
+                palette: "",
                 details: "CODEC: H264",
                 info: "FPS: 24",
                 position: "0:01",
@@ -644,4 +648,76 @@ fn info_corners_share_the_same_inset_and_metadata_rows_align_right() {
         // Narrow glyphs such as I retain their normal side bearing.
         assert!(right < width && width - (right + 1) <= SCALE);
     }
+}
+
+#[test]
+fn palette_pixels_survive_updates_without_erasing_media_details() {
+    let mut overlays = Overlays::default();
+    let details = "CODEC: H264\nRESOLUTION: 1920X1080\nDECODE: SOFTWARE";
+    let palette = "COMMAND PALETTE\n> SEEK FORWARD 30 SECONDS";
+    overlays
+        .update(
+            Content {
+                details,
+                ..content("")
+            },
+            1280,
+        )
+        .unwrap();
+    let detail_pixels = overlays.text.pixels[DETAILS_Y * WIDTH..METADATA_Y * WIDTH].to_vec();
+    assert!(detail_pixels.iter().any(|pixel| *pixel != 0));
+
+    overlays
+        .update(
+            Content {
+                details,
+                palette,
+                ..content("")
+            },
+            1280,
+        )
+        .unwrap();
+    let palette_pixels = overlays.text.pixels[PALETTE_Y * WIDTH..].to_vec();
+    assert!(palette_pixels.iter().any(|pixel| *pixel != 0));
+    assert_eq!(
+        detail_pixels,
+        overlays.text.pixels[DETAILS_Y * WIDTH..METADATA_Y * WIDTH]
+    );
+
+    overlays.update_metadata("TITLE: EXAMPLE", 1280).unwrap();
+    overlays.update_metadata("", 1280).unwrap();
+    assert_eq!(palette_pixels, overlays.text.pixels[PALETTE_Y * WIDTH..]);
+    // A timeline update rebuilds the shared atlas, so the unchanged palette
+    // must be rasterized again as well.
+    overlays
+        .update(
+            Content {
+                details,
+                palette,
+                position: "0:01",
+                ..content("")
+            },
+            1280,
+        )
+        .unwrap();
+    assert_eq!(palette_pixels, overlays.text.pixels[PALETTE_Y * WIDTH..]);
+    overlays
+        .update(
+            Content {
+                details,
+                position: "0:01",
+                ..content("")
+            },
+            1280,
+        )
+        .unwrap();
+    assert_eq!(
+        detail_pixels,
+        overlays.text.pixels[DETAILS_Y * WIDTH..METADATA_Y * WIDTH]
+    );
+    assert!(
+        overlays.text.pixels[PALETTE_Y * WIDTH..]
+            .iter()
+            .all(|pixel| *pixel == 0)
+    );
 }
