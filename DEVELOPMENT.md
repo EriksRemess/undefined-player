@@ -1,8 +1,8 @@
 # Development
 
 This document covers building, testing, diagnostics, packaging, and custom
-dependency setups for undefined-player. User installation and playback are
-documented in [README.md](README.md).
+dependency setups for undefined-player. See [README.md](README.md) for installation,
+[USAGE.md](USAGE.md) for playback, and [CONFIGURATION.md](CONFIGURATION.md) for settings.
 
 ## Build requirements
 

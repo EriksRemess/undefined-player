@@ -27,6 +27,14 @@ pub(crate) struct MediaTrack {
     pub(crate) label: TrackLabel,
 }
 
+#[derive(Debug)]
+pub(crate) enum AudioTrackError {
+    // The source rejected the seek; the previous track remains selected.
+    Unavailable(String),
+    // Seeking succeeded, but resetting playback failed. State cannot be reused.
+    Playback(String),
+}
+
 pub(crate) struct Media {
     pub(crate) format: *mut ffi::UpAvFormat,
     interrupt: Arc<AtomicBool>,
@@ -241,7 +249,6 @@ impl Media {
             let audio = if audio_tracks.is_empty() {
                 None
             } else {
-                eprintln!("audio: track 1 selected via PipeWire");
                 if audio_tracks.len() > 1 {
                     eprintln!("audio: A switches tracks");
                 }
@@ -730,6 +737,11 @@ impl Media {
     }
 
     pub(crate) unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
+        unsafe { self.seek_input(requested_target)? };
+        unsafe { self.reset_after_seek(requested_target) }
+    }
+
+    unsafe fn seek_input(&mut self, requested_target: f64) -> Result<()> {
         unsafe { self.sync_audio_selection() };
         if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
@@ -742,7 +754,10 @@ impl Media {
         if ret < 0 {
             return Err(format!("could not seek: {}", unsafe { ffmpeg_error(ret) }));
         }
+        Ok(())
+    }
 
+    unsafe fn reset_after_seek(&mut self, requested_target: f64) -> Result<f64> {
         unsafe {
             ffi::up_av_packet_unref(self.packet);
             ffi::up_av_decoder_flush(self.video.as_ptr());
@@ -780,28 +795,40 @@ impl Media {
         unsafe { ffi::up_av_select_audio_stream(self.format, index) };
     }
 
+    // Startup selection must happen before any audio is queued. No seek is
+    // necessary, including for non-seekable sources.
+    pub(crate) unsafe fn prefer_initial_audio_language(&mut self, language: &str) {
+        if let Some(index) = crate::language::preferred_track(
+            self.audio_tracks
+                .iter()
+                .map(|track| track.label.language.as_deref()),
+            language,
+        ) {
+            self.selected_audio_track = index;
+            unsafe { self.sync_audio_selection() };
+        }
+    }
+
     pub(crate) unsafe fn select_audio_track(
         &mut self,
         track: usize,
         playback_target: f64,
-    ) -> Result<f64> {
+    ) -> std::result::Result<f64, AudioTrackError> {
         if track >= self.audio_tracks.len() {
-            return Err("invalid audio track".into());
+            return Err(AudioTrackError::Unavailable("invalid audio track".into()));
         }
         let previous = self.selected_audio_track;
         self.selected_audio_track = track;
-        match unsafe { self.seek(playback_target) } {
-            Ok(target) => {
-                let label = &self.audio_tracks[track].label;
-                eprintln!("audio: track {} selected ({})", track + 1, label.codec);
-                Ok(target)
-            }
-            Err(error) => {
-                self.selected_audio_track = previous;
-                unsafe { self.sync_audio_selection() };
-                Err(error)
-            }
+        if let Err(error) = unsafe { self.seek_input(playback_target) } {
+            self.selected_audio_track = previous;
+            unsafe { self.sync_audio_selection() };
+            return Err(AudioTrackError::Unavailable(error));
         }
+        let target =
+            unsafe { self.reset_after_seek(playback_target) }.map_err(AudioTrackError::Playback)?;
+        let label = &self.audio_tracks[track].label;
+        eprintln!("audio: track {} selected ({})", track + 1, label.codec);
+        Ok(target)
     }
 
     pub(crate) unsafe fn audio_clock(&self) -> Option<f64> {

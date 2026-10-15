@@ -1,0 +1,191 @@
+# Playback guide
+
+[README](README.md) · [Configuration](CONFIGURATION.md)
+
+## Opening media
+
+Open a video from the command line:
+
+```sh
+undefined-player ~/Videos/example.mp4
+```
+
+FFmpeg diagnostics are hidden by default. Add `--debug` to show them:
+
+```sh
+undefined-player --debug ~/Videos/example.mp4
+```
+
+Playback failures still print an error message without `--debug`.
+
+HTTP and HTTPS URLs are also supported. The server should support byte-range
+requests so seeking and containers that read metadata from the end of the file
+work correctly:
+
+```sh
+undefined-player 'http://127.0.0.1:8000/example.mp4'
+```
+
+YouTube links work directly when `yt-dlp` is installed and available on `PATH`:
+
+```sh
+undefined-player 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+undefined-player yt:dQw4w9WgXcQ
+```
+
+The player requests a fresh stream URL, prefers HLS for the highest available
+quality with audio, and uses the video's title and channel in its overlays and
+media controls. No video is downloaded to disk. If extraction fails, yt-dlp is
+missing, or the stream expires, playback exits with an error message; reopening
+the original YouTube link requests a new stream URL.
+
+For an HLS master playlist, the player selects the decodable rendition with the
+largest resolution, then the highest frame rate and bitrate, and keeps that
+quality fixed during playback.
+
+## Keyboard shortcuts
+
+Playback starts immediately unless a saved position requires a resume choice.
+During playback, the focused video window accepts:
+
+- `F` — toggle fullscreen
+- `C` — toggle automatic cropping of encoded black borders
+- `Z` — toggle zoom to fill the window, using autocrop first
+- `D` — cycle deinterlacing: Auto (default), On, Off
+- `I` — toggle media details, processing status, frame statistics, and position
+- `A` — switch to the next audio track
+- `M` — mute or unmute audio
+- `L` — toggle looping the video
+- `Left` / `Right` — seek backward or forward 10 seconds
+- `,` / `.` — jump to the previous or next chapter
+- `Space` — pause or resume
+- `S` — toggle subtitles
+- `J` — switch to the next embedded subtitle track
+- `Q` — quit
+- `Ctrl+Shift+P` — open the command palette
+
+## Desktop interaction
+
+Right-click opens the desktop's window menu, where supported. GNOME offers
+**Always on Top** there; available actions depend on the compositor. On desktops
+without a window menu, right-click has no effect.
+
+In fullscreen, the mouse cursor hides after 1.5 seconds of inactivity. Moving
+or clicking the mouse shows it again; it stays visible while dragging and in
+windowed mode.
+
+## Command palette
+
+In the palette, type to filter, use Up/Down to select, Enter to advance or run,
+and Escape to close. Choose **Seek**, then **Forward** or **Backward**, then a
+seconds value; you can also type a custom amount, such as `seek forward 45` or
+`seek backward 2 minutes`. Choose **Jump to time** and enter seconds (`jump 123`)
+or a timestamp (`jump 2:03` or `jump 1:02:03`). Complete commands can also be typed
+directly.
+
+## Resume playback
+
+Local videos and non-live YouTube videos with a known duration remember their
+position when the player closes. YouTube positions follow the video ID, so full
+links, short links, and `yt:ID` share the same saved position.
+On reopening, the prompt asks **Resume from [time]? Y/N**: press `Y` to resume
+or `N` to play from the start.
+Playback waits for your choice. Starting over clears the old position immediately;
+closing the player saves the new position. Playing through to the end removes it.
+Pressing `Q` or Escape, or closing the window, leaves the previous position intact
+if you have not answered the prompt.
+
+Resume positions live in one file, `$XDG_STATE_HOME/undefined-player/resume`,
+or `~/.local/state/undefined-player/resume` by default. Changed files do not reuse
+positions saved with a different size or modification time.
+
+## Deinterlacing
+
+Auto deinterlacing checks motion across decoded pictures, so film stored with
+interlacing flags can retain its original detail. It takes a few frames to settle
+and falls back to the flags when analysis is unavailable. Progressive hardware
+video keeps its fast path without readback. Press `D` to cycle Auto, On, and Off;
+On assumes top-field-first when the frame has no interlacing flag. Changes also
+apply while paused. Filtering runs on the GPU at the source frame rate.
+
+## Chapters and media metadata
+
+For files with chapters, dots on the timeline mark each chapter's start.
+Chapter navigation keeps the current pause state and stops at the first or last
+chapter; files without chapters leave these keys inactive.
+After a chapter jump, its number and title appear in the top bar for three
+seconds. Hovering a chapter dot shows its title there too. The `I` overlay lists
+the current chapter at the top right, alongside embedded title and artist tags
+when available. Untitled chapters show only their number.
+
+The current file is also exported through MPRIS. GNOME and other desktop media
+controls show its embedded title, artist, and cover image when available, falling
+back to the filename for untitled media. They support play, pause, stop, and seek;
+previous/next buttons navigate chapters and disable at their respective ends.
+
+## Window and timeline
+
+The borderless Wayland window can be dragged from anywhere with the left mouse
+button. Drag an edge or corner to resize it; the client-area aspect ratio is
+free, while the video itself retains its display aspect ratio with black bars
+where needed. Double-click anywhere to toggle fullscreen. Its custom title bar
+fades after 1.5 seconds without mouse movement and whenever the window loses
+focus. Its close button is at the top-right. The minimum window size is 320x180.
+The bottom timeline appears with the controls; click it or drag its handle to
+seek. Timeline, keyboard, and MPRIS seeking target the requested position;
+FFmpeg resolves its nearest usable preceding keyframe. Decoding continues in
+the background so the window remains responsive, and audio and video resume
+together once buffered data is ready. Audio tracks that begin later stay silent
+until their starting timestamp.
+
+## Buffering
+
+Local files, including files on mounted network shares, are buffered ahead to
+absorb short stalls. HTTP(S) inputs use FFmpeg's network buffering. A connection
+slower than the video's bitrate can still stutter.
+
+## Autocrop and zoom
+
+Autocrop starts disabled. Press `C` to detect stable black borders in the video;
+press it again to restore the complete frame. Detection samples frames in a
+background worker and preserves the video's pixel aspect ratio. It ignores
+black frames and very dark scenes, so allow a few visible frames for detection.
+When paused, it scans the current frame. Borders required by the window's own
+aspect ratio can remain after encoded bars are removed.
+
+Zoom fills the current window (or the screen in fullscreen) without stretching.
+It first enables autocrop, then trims the center of the remaining picture to the
+window's aspect ratio. Wider pictures lose content at the sides; narrower pictures
+lose content at the top and bottom. Integer scaling is bypassed while filling.
+Press `Z` again to restore normal fitting and your previous autocrop setting.
+`C` can override cropping during zoom; leaving zoom still restores the earlier
+setting. The `I` panel shows `ZOOM: FILL`, `FIT`, or `FILL (DETECTING)` while
+waiting for a reliable border sample. Dark scenes retain the last detected crop;
+if border sampling is unsupported, zoom uses the full frame. Both controls work
+while paused.
+
+## Rendering and supported media
+
+The player accepts one local media path or HTTP(S) URL on the command line;
+there is no playlist. Hardware video decoding covers the codecs and profiles
+exposed by both the selected FFmpeg build and the installed Vulkan driver.
+If Vulkan decoder initialization or initial
+decoding fails, playback restarts with FFmpeg's software decoder and uploads
+frames for Vulkan presentation.
+HDR metadata is retained from FFmpeg through libplacebo, which supplies the
+matching colorspace hint to the Vulkan swapchain for an HDR-enabled compositor.
+Small square-pixel videos (up to 640×480, or 480×640 in portrait) use the largest
+integer scale that fits, with nearest-neighbour filtering and centered black
+borders. If the video needs shrinking, normal aspect-preserving scaling applies.
+Other sources up to 1920×1080 (or 1080×1920 in portrait) use libplacebo's GPU
+EWA Lanczos-sharp upscaler with mild anti-ringing for cleaner enlargement to 4K.
+Larger sources use libplacebo's default scaling.
+
+## Subtitles
+
+The default embedded subtitle track is preselected, but subtitles start hidden;
+`S` shows them and `J` cycles through all decodable embedded tracks while
+briefly showing the selected number.
+DVD/PGS bitmap subtitles retain their authored placement. Text and ASS dialogue
+use a compact bold monospace Pango font with Unicode shaping and automatic font
+fallback; advanced ASS styling is ignored.

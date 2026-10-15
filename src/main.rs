@@ -17,6 +17,7 @@ mod deinterlace;
 mod ffi;
 mod geometry;
 mod hls;
+mod language;
 mod luma;
 mod media;
 mod metadata;

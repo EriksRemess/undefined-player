@@ -56,8 +56,9 @@ fn setting(line: &str) -> Result<Option<(&str, &str)>> {
     Ok(Some((key, value)))
 }
 
-fn parse(text: &str) -> Result<u16> {
+fn parse(text: &str) -> Result<(u16, String)> {
     let mut radius = None;
+    let mut language = None;
     for (index, line) in text.lines().enumerate() {
         let result = (|| {
             if let Some((key, value)) = setting(line)? {
@@ -68,6 +69,12 @@ fn parse(text: &str) -> Result<u16> {
                         }
                         radius = Some(parse_radius(value)?);
                     }
+                    "preferred_audio_language" => {
+                        if language.is_some() {
+                            return Err("duplicate preferred_audio_language".into());
+                        }
+                        language = Some(crate::language::parse_preference(value)?);
+                    }
                     _ => return Err(format!("unknown setting: {key}")),
                 }
             }
@@ -75,32 +82,38 @@ fn parse(text: &str) -> Result<u16> {
         })();
         result.map_err(|error: String| format!("line {}: {error}", index + 1))?;
     }
-    Ok(radius.unwrap_or(0))
+    Ok((
+        radius.unwrap_or(0),
+        language.unwrap_or_else(|| "en-US".into()),
+    ))
 }
 
 pub(crate) struct Config {
     path: Option<PathBuf>,
     pub(crate) corner_radius: u16,
+    pub(crate) preferred_audio_language: String,
 }
 
 impl Config {
     pub(crate) fn load() -> Self {
         let path = config_path();
-        let corner_radius =
-            path.as_deref()
-                .map_or(0, |path| match read(path).and_then(|text| parse(&text)) {
-                    Ok(radius) => radius,
-                    Err(error) => {
-                        eprintln!(
-                            "warning: invalid config {}: {error}; using defaults",
-                            path.display()
-                        );
-                        0
-                    }
-                });
+        let (corner_radius, preferred_audio_language) = path.as_deref().map_or_else(
+            || (0, "en-US".into()),
+            |path| match read(path).and_then(|text| parse(&text)) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!(
+                        "warning: invalid config {}: {error}; using defaults",
+                        path.display()
+                    );
+                    (0, "en-US".into())
+                }
+            },
+        );
         Self {
             path,
             corner_radius,
+            preferred_audio_language,
         }
     }
 
@@ -108,6 +121,29 @@ impl Config {
         if radius > MAX_CORNER_RADIUS {
             return Err("corner radius is out of range".into());
         }
+        self.save_setting(
+            "corner_radius",
+            &radius.to_string(),
+            "# Window corner radius in logical pixels (0-32). 0 disables rounding.\n\
+             # Fullscreen and maximized windows always have square corners.\n",
+        )?;
+        self.corner_radius = radius;
+        Ok(())
+    }
+
+    pub(crate) fn set_preferred_audio_language(&mut self, value: &str) -> Result<()> {
+        let language = crate::language::parse_preference(value)?;
+        self.save_setting(
+            "preferred_audio_language",
+            &language,
+            "# Preferred audio language, e.g. en_US, eng, pt-BR. Default: en_US.\n\
+             # Use auto to keep the normal default track.\n",
+        )?;
+        self.preferred_audio_language = language;
+        Ok(())
+    }
+
+    fn save_setting(&self, name: &str, value: &str, comment: &str) -> Result<()> {
         let path = self
             .path
             .as_deref()
@@ -134,9 +170,9 @@ impl Config {
             let mut found = false;
             let mut text = String::new();
             for line in old.lines() {
-                if setting(line)?.is_some_and(|(key, _)| key == "corner_radius") {
+                if setting(line)?.is_some_and(|(key, _)| key == name) {
                     found = true;
-                    text.push_str(&format!("corner_radius = {radius}"));
+                    text.push_str(&format!("{name} = {value}"));
                     if let Some((_, comment)) = line.split_once('#') {
                         text.push_str(" #");
                         text.push_str(comment);
@@ -147,11 +183,8 @@ impl Config {
                 text.push('\n');
             }
             if !found {
-                text.push_str(
-                    "# Window corner radius in logical pixels (0-32). 0 disables rounding.\n",
-                );
-                text.push_str("# Fullscreen and maximized windows always have square corners.\n");
-                text.push_str(&format!("corner_radius = {radius}\n"));
+                text.push_str(comment);
+                text.push_str(&format!("{name} = {value}\n"));
             }
             let temporary = directory.join(format!(
                 ".config-{}-{}.tmp",
@@ -175,7 +208,6 @@ impl Config {
             write_result.map_err(|e| e.to_string())
         })();
         result.map_err(|e| format!("could not save {}: {e}", path.display()))?;
-        self.corner_radius = radius;
         Ok(())
     }
 }

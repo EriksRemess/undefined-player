@@ -1,6 +1,6 @@
 use crate::clock::WallClock;
 use crate::decoder::VideoFrame;
-use crate::media::Media;
+use crate::media::{AudioTrackError, Media};
 use crate::metadata::{VideoInfo, source_display_title, source_title};
 use crate::mpris::{Mpris, MprisCommand, PlaybackStatus, seconds_to_microseconds};
 use crate::presentation::timeline_text;
@@ -39,6 +39,7 @@ enum PaletteCommand {
     Seek(PaletteSeek),
     Input(&'static str),
     CornerRadius(u16),
+    AudioLanguage(String),
 }
 
 struct PaletteRow {
@@ -184,6 +185,10 @@ impl Palette {
         rows.insert(1, PaletteRow::input("seek ", "Seek..."));
         rows.insert(2, PaletteRow::input("jump ", "Jump to time..."));
         rows.push(PaletteRow::input("corners ", "Rounded corners..."));
+        rows.push(PaletteRow::input(
+            "language ",
+            "Preferred audio language...",
+        ));
         if audio {
             rows.push(PaletteRow {
                 command: PaletteCommand::Action(Action::CycleAudio),
@@ -230,6 +235,33 @@ impl Palette {
 
     fn rows(&self, audio: bool, subtitles: bool) -> Vec<PaletteRow> {
         let query = self.query_words();
+        if query == "language" {
+            return vec![
+                PaletteRow {
+                    command: PaletteCommand::AudioLanguage("en-US".into()),
+                    label: "English (US)".into(),
+                    shortcut: "ENTER",
+                },
+                PaletteRow {
+                    command: PaletteCommand::AudioLanguage("auto".into()),
+                    label: "Auto (default track)".into(),
+                    shortcut: "ENTER",
+                },
+                PaletteRow::input("language custom ", "Enter language code..."),
+            ];
+        }
+        if let Some(value) = query.strip_prefix("language ") {
+            let value = value.strip_prefix("custom ").unwrap_or(value);
+            return crate::language::parse_preference(value)
+                .ok()
+                .into_iter()
+                .map(|language| PaletteRow {
+                    label: format!("Prefer audio: {language}"),
+                    command: PaletteCommand::AudioLanguage(language),
+                    shortcut: "ENTER",
+                })
+                .collect();
+        }
         if query == "corners" || query.starts_with("corners ") {
             let values = if query == "corners" {
                 vec![0, 15]
@@ -341,7 +373,9 @@ impl Palette {
             .unwrap_or(0);
         let query = self.query_words();
         let command = query.split_whitespace().next().unwrap_or("");
-        let hint = if query == "corners" {
+        let hint = if command == "language" {
+            Some("LANGUAGE CODE: en_US, eng, pt-BR, OR auto")
+        } else if query == "corners" {
             Some("CHOOSE OFF, 15 PX, OR A CUSTOM RADIUS")
         } else if command == "corners" {
             Some("ENTER A WHOLE NUMBER FROM 0 TO 32")
@@ -492,6 +526,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut renderer = Renderer::create(&window)?;
     renderer.set_corner_radius(config.corner_radius);
     let mut media = unsafe { Media::open(&source, Some(renderer.device()), perf_log)? };
+    unsafe { media.prefer_initial_audio_language(&config.preferred_audio_language) };
 
     if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
         if !media.video.uses_vulkan {
@@ -502,6 +537,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
         );
         drop(media);
         media = unsafe { Media::open(&source, None, perf_log)? };
+        unsafe { media.prefer_initial_audio_language(&config.preferred_audio_language) };
         unsafe { media.fill_initial_queues()? };
     }
     if media.video_queue.is_empty() && media.eof {
@@ -530,10 +566,16 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let audio_track_count = audio_labels.len();
     let subtitle_track_count = subtitle_labels.len();
     let subtitles_available = subtitle_track_count > 0;
-    let mut selected_audio_track = 0;
+    let mut selected_audio_track = media.selected_audio_track;
+    if audio_track_count > 0 {
+        eprintln!(
+            "audio: track {} selected via PipeWire",
+            selected_audio_track + 1
+        );
+    }
     let mut video_details = video_info.overlay_text(
         audio_labels
-            .first()
+            .get(selected_audio_track)
             .map(|label| (selected_audio_track, audio_track_count, label)),
     );
     let media_duration = media.duration();
@@ -765,6 +807,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                         redraw = true;
                         continue;
                     }
+                    let mut requested_audio_track = None;
                     let (action, seek_command) = if palette.open {
                         let selection = match event.key {
                             ffi::UpKey_UP_KEY_ESCAPE => {
@@ -802,6 +845,39 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                         };
                         redraw = true;
                         match selection {
+                            Some(PaletteCommand::AudioLanguage(language)) => {
+                                if let Err(error) = config.set_preferred_audio_language(&language) {
+                                    eprintln!("warning: {error}");
+                                    position_notice
+                                        .show_text(c"COULD NOT SAVE SETTINGS".to_owned());
+                                    continue;
+                                }
+                                requested_audio_track = if language == "auto" {
+                                    (!audio_labels.is_empty()).then_some(0)
+                                } else {
+                                    crate::language::preferred_track(
+                                        audio_labels.iter().map(|label| label.language.as_deref()),
+                                        &language,
+                                    )
+                                };
+                                position_notice.show_text(
+                                    CString::new(format!(
+                                        "PREFERRED AUDIO: {language}{}",
+                                        if requested_audio_track.is_none() {
+                                            " (NO MATCH IN THIS VIDEO)"
+                                        } else {
+                                            ""
+                                        },
+                                    ))
+                                    .unwrap(),
+                                );
+                                if requested_audio_track.is_none()
+                                    || requested_audio_track == Some(selected_audio_track)
+                                {
+                                    continue;
+                                }
+                                (Some(Action::CycleAudio), None)
+                            }
                             Some(PaletteCommand::CornerRadius(radius)) => {
                                 match config.set_corner_radius(radius) {
                                     Ok(()) => {
@@ -948,9 +1024,31 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                             mpris_stopped = false;
                         }
                         Some(Action::CycleAudio) if audio_track_count > 1 => {
-                            let next = next_track(selected_audio_track, audio_track_count);
+                            let next = requested_audio_track.unwrap_or_else(|| {
+                                next_track(selected_audio_track, audio_track_count)
+                            });
                             let requested_target = clock.now();
                             let mut media = decoder.lock()?;
+                            let playback_target =
+                                match unsafe { media.select_audio_track(next, requested_target) } {
+                                    Ok(target) => target,
+                                    Err(AudioTrackError::Unavailable(error)) => {
+                                        eprintln!("warning: could not switch audio track: {error}");
+                                        position_notice.show_text(
+                                            if requested_audio_track.is_some() {
+                                                c"PREFERENCE SAVED; AUDIO SWITCH UNAVAILABLE"
+                                            } else {
+                                                c"AUDIO SWITCH UNAVAILABLE"
+                                            }
+                                            .to_owned(),
+                                        );
+                                        redraw = true;
+                                        continue;
+                                    }
+                                    Err(AudioTrackError::Playback(error)) => return Err(error),
+                                };
+                            // Clear presentation queues only after a successful
+                            // switch, while the decoder is still locked.
                             renderer.reset_autocrop();
                             previous_video = None;
                             decoder.clear_frames(&mut video_queue, &mut current_video);
@@ -959,8 +1057,6 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                                 &mut subtitle_queues,
                                 &mut current_subtitles,
                             );
-                            let playback_target =
-                                unsafe { media.select_audio_track(next, requested_target)? };
                             clock.seek(playback_target);
                             pending_seek_anchor = Some(playback_target);
                             chapters.seeked(playback_target - playback_start);
