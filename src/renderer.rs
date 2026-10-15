@@ -1,6 +1,6 @@
 use crate::decoder::VideoFrame;
 use crate::subtitles::{SubtitleContent, SubtitleCue};
-use crate::window::Window;
+use crate::window::{WaylandInput, Window};
 use crate::{Result, ffi, overlay};
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
@@ -11,6 +11,10 @@ pub(crate) struct Renderer<'window> {
     autocrop: crate::autocrop::AutoCrop,
     deinterlace: crate::deinterlace::Mode,
     zoom: crate::zoom::Zoom,
+    corner_radius: u16,
+    corner_pixels: f32,
+    corner_disabled: bool,
+    shape_key: Option<(i32, i32, i32, i32, u32)>,
     _window: &'window Window,
 }
 
@@ -82,12 +86,54 @@ impl<'window> Renderer<'window> {
             autocrop: crate::autocrop::AutoCrop::default(),
             deinterlace: crate::deinterlace::Mode::default(),
             zoom: crate::zoom::Zoom::default(),
+            corner_radius: 0,
+            corner_pixels: 0.0,
+            corner_disabled: false,
+            shape_key: None,
             _window: window,
         })
     }
 
     pub(crate) unsafe fn device(&self) -> *mut c_void {
         unsafe { ffi::up_video_renderer_device(self.context) }
+    }
+
+    pub(crate) fn set_corner_radius(&mut self, radius: u16) {
+        self.corner_radius = radius;
+    }
+
+    pub(crate) fn update_window_shape(&mut self, input: Option<&WaylandInput<'_>>) -> Result<bool> {
+        let (width, height, pw, ph) = self._window.dimensions()?;
+        if width <= 0 || height <= 0 || pw <= 0 || ph <= 0 {
+            return Ok(false);
+        }
+        let scale = unsafe { ffi::up_window_corner_scale(self._window.as_ptr()) };
+        let pixels = if !self.corner_disabled && input.is_some() && scale.is_finite() && scale > 0.0
+        {
+            (f32::from(self.corner_radius) * scale).min(pw.min(ph) as f32 * 0.5)
+        } else {
+            0.0
+        };
+        let key = (width, height, pw, ph, pixels.to_bits());
+        if self.shape_key == Some(key) {
+            return Ok(false);
+        }
+        if let Some(input) = input {
+            let rectangles = if pixels > 0.0 {
+                crate::geometry::WindowGeometry::new(width, height, pw, ph)
+                    .unwrap()
+                    .with_radius(pixels)
+                    .input_rectangles()
+            } else {
+                Vec::new()
+            };
+            input.set_region(&rectangles, pixels)?;
+        }
+        self.shape_key = Some(key);
+        self.corner_pixels = pixels;
+        self.overlays
+            .set_corner_inset(crate::geometry::corner_inset(pixels));
+        Ok(true)
     }
 
     pub(crate) fn cycle_deinterlace(&mut self) -> &'static str {
@@ -114,6 +160,10 @@ impl<'window> Renderer<'window> {
         let unavailable = self.autocrop.unavailable();
         let changed = self.autocrop.update(frame, paused);
         changed || unavailable != self.autocrop.unavailable()
+    }
+
+    pub(crate) fn set_close_hovered(&mut self, hovered: bool) -> bool {
+        self.overlays.set_close_hovered(hovered)
     }
 
     pub(crate) fn display(
@@ -205,7 +255,7 @@ impl<'window> Renderer<'window> {
                 },
                 None => (ptr::null(), ptr::null(), 0, 0, 0),
             };
-        if unsafe {
+        let result = unsafe {
             ffi::up_video_renderer_display(
                 self.context,
                 frame.as_ptr().cast(),
@@ -222,14 +272,30 @@ impl<'window> Renderer<'window> {
                 subtitle_width,
                 subtitle_height,
                 subtitle_serial,
+                self.corner_pixels,
+                c"
+                    vec2 half_size = window_geometry.xy * 0.5;
+                    float radius = min(window_geometry.z, min(half_size.x, half_size.y));
+                    vec2 distance_to_corner = abs(gl_FragCoord.xy - half_size) - half_size + radius;
+                    float distance_to_edge = length(max(distance_to_corner, vec2(0.0)))
+                        + min(max(distance_to_corner.x, distance_to_corner.y), 0.0) - radius;
+                    float coverage = clamp(0.5 - distance_to_edge, 0.0, 1.0);
+                    color = vec4(coverage);
+                "
+                .as_ptr(),
             )
-        } < 0
-        {
+        };
+        if result < 0 {
             return Err(
                 unsafe { CStr::from_ptr(ffi::up_video_renderer_error(self.context)) }
                     .to_string_lossy()
                     .into_owned(),
             );
+        }
+        if result > 0 {
+            // The native swapchain cannot composite alpha. Restore square input
+            // and control geometry on the next loop as well as square pixels.
+            self.corner_disabled = true;
         }
         Ok(())
     }

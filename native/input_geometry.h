@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#define UP_CORNER_RADIUS_PROPERTY "undefined-player.corner-radius"
 
 // Implemented in Rust. SDL and Wayland use the same hit regions as playback.
 enum UpHitRegion {
@@ -19,3 +20,5 @@ enum UpHitRegion {
 
 uint32_t up_input_hit_test(double x, double y, int width, int height,
                            int pixel_width, int pixel_height);
+uint32_t up_input_hit_test_rounded(double x, double y, int width, int height,
+                                  int pixel_width, int pixel_height, float radius);

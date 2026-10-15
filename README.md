@@ -108,6 +108,35 @@ In fullscreen, the mouse cursor hides after 1.5 seconds of inactivity. Moving
 or clicking the mouse shows it again; it stays visible while dragging and in
 windowed mode.
 
+### Saved settings
+
+Preferences are read at startup from `$XDG_CONFIG_HOME/undefined-player/config`,
+or `~/.config/undefined-player/config` when XDG_CONFIG_HOME is unset or relative.
+The file uses plain `key = value` lines and `#` comments:
+
+```ini
+# Window corner radius in logical pixels, from 0 to 32. Default: 0 (square).
+corner_radius = 12
+```
+
+Open the command palette and choose **Rounded corners...**, then **Off**, **15
+pixels**, or **Enter custom radius...**. You can also type `corners 12` directly.
+Changes apply immediately and are saved automatically; the
+first change creates the config file. `corners 0` turns rounding off. The radius
+scales with display scaling; fullscreen and maximized windows remain square.
+Transparent corners let clicks reach the windows beneath. Controls and their
+clickable areas are inset together to stay inside the rounded outline.
+If the Vulkan surface cannot composite transparent corners, the player warns
+and keeps square corners.
+
+The entire config is validated before applying it. Invalid syntax, unknown or
+duplicate settings, and out-of-range values produce a warning with the file and
+line number and use defaults. Invalid files are never overwritten by palette
+changes: fix the file first. Successful saves preserve comments and replace the
+file atomically. Manual edits take effect on the next launch.
+
+### Command palette and playback
+
 In the palette, type to filter, use Up/Down to select, Enter to advance or run,
 and Escape to close. Choose **Seek**, then **Forward** or **Backward**, then a
 seconds value; you can also type a custom amount, such as `seek forward 45` or

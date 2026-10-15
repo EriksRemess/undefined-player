@@ -38,6 +38,7 @@ typedef struct UpOverlayFrame {
 
 UpVideoRenderer *up_video_renderer_create(void *window);
 void *up_video_renderer_device(UpVideoRenderer *renderer);
+// Returns 0 on success, 1 if corner compositing is unavailable, -1 on failure.
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
@@ -45,7 +46,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
-                              uint64_t subtitle_serial);
+                              uint64_t subtitle_serial,
+                              float corner_radius, const char *corner_shader);
 int up_video_renderer_resize(UpVideoRenderer *renderer, int width, int height);
 const char *up_video_renderer_error(const UpVideoRenderer *renderer);
 void up_video_renderer_destroy(UpVideoRenderer *renderer);

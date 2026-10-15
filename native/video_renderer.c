@@ -6,6 +6,8 @@
 
 #include <SDL3/SDL_vulkan.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/dispatch.h>
+#include <libplacebo/shaders/custom.h>
 #include <libplacebo/swapchain.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
@@ -30,6 +32,8 @@ struct UpVideoRenderer {
     pl_vulkan vulkan;
     pl_swapchain swapchain;
     pl_renderer renderer;
+    pl_dispatch corner_dispatch;
+    bool corner_warning;
     pl_tex textures[4];
     pl_tex reference_textures[2][4];
     pl_tex solid_texture;
@@ -659,6 +663,13 @@ static void configure_deinterlace(struct pl_frame *image,
                                 image->prev && image->next ? &temporal : &spatial;
 }
 
+static bool overlay_rect_visible(pl_rect2df rect)
+{
+    return isfinite(rect.x0) && isfinite(rect.y0) &&
+           isfinite(rect.x1) && isfinite(rect.y1) &&
+           rect.x1 > rect.x0 && rect.y1 > rect.y0;
+}
+
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
@@ -666,7 +677,8 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               const char *subtitle_text,
                               const uint8_t *subtitle_pixels,
                               int subtitle_width, int subtitle_height,
-                              uint64_t subtitle_serial)
+                              uint64_t subtitle_serial,
+                              float corner_radius, const char *corner_shader)
 {
     AVFrame *frame = frame_pointer;
     struct pl_swapchain_frame swap_frame = {0};
@@ -773,8 +785,10 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
             .num_parts = 1,
         };
         bitmap_overlay.repr.alpha = PL_ALPHA_INDEPENDENT;
-        image.overlays = &bitmap_overlay;
-        image.num_overlays = 1;
+        if (overlay_rect_visible(bitmap_part.dst)) {
+            image.overlays = &bitmap_overlay;
+            image.num_overlays = 1;
+        }
     }
 
     if (subtitle_text && *subtitle_text) {
@@ -849,6 +863,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
         overlays[num_overlays].repr.alpha = PL_ALPHA_INDEPENDENT;
         num_overlays++;
     }
+    // Include native subtitle geometry in the final check. A collapsed
+    // overlay must not make libplacebo reject the entire video frame.
+    for (int i = 0; i < num_overlays; i++) {
+        if (!overlay_rect_visible(parts[i].dst))
+            overlays[i].num_parts = 0;
+    }
     target.overlays = overlays;
     target.num_overlays = num_overlays;
     params.background = PL_CLEAR_COLOR;
@@ -887,12 +907,58 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                  render_errors.errors);
         goto out;
     }
+    // Apply Rust's window mask after video, letterboxing, and all overlays.
+    // Blending avoids a framebuffer copy and preserves HDR color values.
+    const bool corner_supported =
+        (swap_frame.color_repr.alpha == PL_ALPHA_INDEPENDENT ||
+         swap_frame.color_repr.alpha == PL_ALPHA_PREMULTIPLIED) &&
+        swap_frame.fbo->params.format &&
+        (swap_frame.fbo->params.format->caps & PL_FMT_CAP_BLENDABLE);
+    if (corner_radius > 0.0f && !corner_supported && !renderer->corner_warning) {
+        fprintf(stderr, "warning: rounded corners are unavailable on this Vulkan surface\n");
+        renderer->corner_warning = true;
+    }
+    if (corner_radius > 0.0f && corner_supported) {
+        if (!renderer->corner_dispatch)
+            renderer->corner_dispatch = pl_dispatch_create(renderer->log, renderer->vulkan->gpu);
+        if (!renderer->corner_dispatch) {
+            set_error(renderer, "could not create corner mask dispatcher");
+            goto out;
+        }
+        pl_dispatch_reset_frame(renderer->corner_dispatch);
+        pl_shader shader = pl_dispatch_begin(renderer->corner_dispatch);
+        const float geometry[3] = {swap_frame.fbo->params.w,
+                                   swap_frame.fbo->params.h, corner_radius};
+        const struct pl_shader_var variable = {
+            .var = pl_var_vec3("window_geometry"), .data = geometry, .dynamic = true,
+        };
+        const struct pl_blend_params blend = {
+            .src_rgb = PL_BLEND_ZERO, .src_alpha = PL_BLEND_ZERO,
+            .dst_rgb = swap_frame.color_repr.alpha == PL_ALPHA_PREMULTIPLIED ?
+                       PL_BLEND_SRC_ALPHA : PL_BLEND_ONE,
+            .dst_alpha = PL_BLEND_SRC_ALPHA,
+        };
+        if (!pl_shader_custom(shader, &(struct pl_custom_shader) {
+                .body = corner_shader, .description = "Window corner mask",
+                .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR,
+                .variables = &variable, .num_variables = 1,
+            })) {
+            pl_dispatch_abort(renderer->corner_dispatch, &shader);
+            set_error(renderer, "could not create corner mask shader");
+            goto out;
+        }
+        if (!pl_dispatch_finish(renderer->corner_dispatch, pl_dispatch_params(
+                .shader = &shader, .target = swap_frame.fbo, .blend_params = &blend))) {
+            set_error(renderer, "could not render window corners");
+            goto out;
+        }
+    }
     if (!pl_swapchain_submit_frame(renderer->swapchain)) {
         set_error(renderer, "libplacebo failed to submit the video frame");
         goto out;
     }
     pl_swapchain_swap_buffers(renderer->swapchain);
-    ret = 0;
+    ret = corner_radius > 0.0f && !corner_supported ? 1 : 0;
 
 out:
     for (int i = 0; i < 2; i++) {
@@ -936,6 +1002,7 @@ void up_video_renderer_destroy(UpVideoRenderer *renderer)
         pl_tex_destroy(renderer->vulkan->gpu,
                        &renderer->text_subtitle_texture);
         pl_renderer_destroy(&renderer->renderer);
+        pl_dispatch_destroy(&renderer->corner_dispatch);
         pl_swapchain_destroy(&renderer->swapchain);
         pl_vulkan_destroy(&renderer->vulkan);
     }

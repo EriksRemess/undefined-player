@@ -10,6 +10,7 @@ mod autocrop;
 mod chapters;
 mod cli;
 mod clock;
+mod config;
 mod decoder;
 mod deinterlace;
 #[allow(warnings, clippy::all)]

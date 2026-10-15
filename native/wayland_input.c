@@ -19,6 +19,7 @@ struct UpWaylandInput {
     SDL_Window *window;
     struct wl_display *display;
     struct wl_registry *registry;
+    struct wl_compositor *compositor;
     struct wl_seat *seat;
     struct wl_pointer *pointer;
     struct wl_surface *surface;
@@ -90,8 +91,10 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
     if (!SDL_GetWindowSize(input->window, &width, &height) ||
         !SDL_GetWindowSizeInPixels(input->window, &pixel_width, &pixel_height) ||
-        up_input_hit_test(input->x, input->y, width, height,
-                           pixel_width, pixel_height) != UP_HIT_CONTENT) {
+        up_input_hit_test_rounded(input->x, input->y, width, height,
+                           pixel_width, pixel_height,
+                           SDL_GetFloatProperty(SDL_GetWindowProperties(input->window),
+                                                UP_CORNER_RADIUS_PROPERTY, 0.0f)) != UP_HIT_CONTENT) {
         input->last_click_time = 0;
         return;
     }
@@ -195,6 +198,8 @@ static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t version)
 {
     UpWaylandInput *input = data;
+    if (!input->compositor && !strcmp(interface, wl_compositor_interface.name))
+        input->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 1);
     if (!input->seat && !strcmp(interface, wl_seat_interface.name)) {
         const uint32_t supported = version < 9 ? version : 9;
         input->seat = wl_registry_bind(registry, name, &wl_seat_interface,
@@ -238,7 +243,7 @@ UpWaylandInput *up_wayland_input_create(void *window_pointer)
     wl_registry_add_listener(input->registry, &registry_listener, input);
     if (wl_display_roundtrip(input->display) < 0 ||
         wl_display_roundtrip(input->display) < 0 || !input->seat ||
-        !input->pointer) {
+        !input->pointer || !input->compositor) {
         snprintf(input->error, sizeof(input->error),
                  "could not initialize the Wayland pointer drag bridge");
         return input;
@@ -250,6 +255,32 @@ UpWaylandInput *up_wayland_input_create(void *window_pointer)
 bool up_wayland_input_ready(const UpWaylandInput *input)
 {
     return input && input->ready;
+}
+
+bool up_wayland_input_set_region(UpWaylandInput *input, const int32_t *rectangles,
+                                 size_t count, float radius)
+{
+    struct wl_region *region = NULL;
+    if (count) {
+        region = wl_compositor_create_region(input->compositor);
+        if (!region)
+            return false;
+        for (size_t i = 0; i < count; i++) {
+            const int32_t *rect = rectangles + i * 4;
+            wl_region_add(region, rect[0], rect[1], rect[2], rect[3]);
+        }
+    }
+    if (!SDL_SetFloatProperty(SDL_GetWindowProperties(input->window),
+                              UP_CORNER_RADIUS_PROPERTY, radius)) {
+        if (region)
+            wl_region_destroy(region);
+        return false;
+    }
+    // Applied with the next video-buffer commit, keeping pixels and input in sync.
+    wl_surface_set_input_region(input->surface, region);
+    if (region)
+        wl_region_destroy(region);
+    return true;
 }
 
 const char *up_wayland_input_error(const UpWaylandInput *input)
@@ -269,5 +300,7 @@ void up_wayland_input_destroy(UpWaylandInput *input)
         wl_seat_destroy(input->seat);
     if (input->registry)
         wl_registry_destroy(input->registry);
+    if (input->compositor)
+        wl_compositor_destroy(input->compositor);
     free(input);
 }

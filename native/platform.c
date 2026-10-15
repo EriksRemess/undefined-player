@@ -64,7 +64,8 @@ static SDL_HitTestResult resize_hit_test(SDL_Window *window,
     if (!SDL_GetWindowSize(window, &width, &height) ||
         !SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height))
         return SDL_HITTEST_NORMAL;
-    switch (up_input_hit_test(point->x, point->y, width, height, pixel_width, pixel_height)) {
+    switch (up_input_hit_test_rounded(point->x, point->y, width, height, pixel_width, pixel_height,
+            SDL_GetFloatProperty(SDL_GetWindowProperties(window), UP_CORNER_RADIUS_PROPERTY, 0.0f))) {
     case UP_HIT_TOP_LEFT: return SDL_HITTEST_RESIZE_TOPLEFT;
     case UP_HIT_TOP_RIGHT: return SDL_HITTEST_RESIZE_TOPRIGHT;
     case UP_HIT_BOTTOM_LEFT: return SDL_HITTEST_RESIZE_BOTTOMLEFT;
@@ -188,7 +189,7 @@ UpWindow *up_window_create(const char *title, int width, int height)
     SDL_Window *window = SDL_CreateWindow(
         title, width, height,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
-        SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS);
+        SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT);
     if (!window)
         return NULL;
     if (!SDL_SetWindowHitTest(window, resize_hit_test, NULL)) {
@@ -221,6 +222,19 @@ int up_window_set_minimum_size(UpWindow *window, int width, int height)
 int up_window_set_fullscreen(UpWindow *window, int fullscreen)
 {
     return SDL_SetWindowFullscreen(WINDOW(window), fullscreen != 0);
+}
+
+float up_window_corner_scale(UpWindow *window)
+{
+    if (SDL_GetWindowFlags(WINDOW(window)) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))
+        return 0.0f;
+    return SDL_GetWindowDisplayScale(WINDOW(window));
+}
+
+float up_window_corner_radius(UpWindow *window)
+{
+    return SDL_GetFloatProperty(SDL_GetWindowProperties(WINDOW(window)),
+                                UP_CORNER_RADIUS_PROPERTY, 0.0f);
 }
 
 UpAudioStream *up_audio_stream_create(int rate, int channels)

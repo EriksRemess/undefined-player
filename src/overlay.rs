@@ -18,6 +18,13 @@ const TITLE_HEIGHT: usize = GLYPH_HEIGHT + 2;
 const INFO_Y: usize = 16;
 const CLOSE_X: usize = WIDTH - 12;
 const CLOSE_Y: usize = 48;
+const CLOSE_HOVER_SIZE: usize = 32;
+const CLOSE_HOVER_SRC: [f32; 4] = [
+    0.0,
+    CLOSE_Y as f32,
+    CLOSE_HOVER_SIZE as f32,
+    (CLOSE_Y + CLOSE_HOVER_SIZE) as f32,
+];
 const POSITION_Y: usize = 80;
 const DETAILS_Y: usize = 112;
 // Maximum advance, for adjacent lines with accents below and above.
@@ -369,6 +376,8 @@ pub struct Overlays {
     position_width: usize,
     palette_key: Option<(String, usize)>,
     parts: Vec<ffi::UpOverlayPart>,
+    corner_inset: i32,
+    close_hovered: bool,
 }
 impl Default for Overlays {
     fn default() -> Self {
@@ -390,10 +399,21 @@ impl Default for Overlays {
             position_width: 0,
             palette_key: None,
             parts: Vec::with_capacity(9),
+            corner_inset: 0,
+            close_hovered: false,
         }
     }
 }
 impl Overlays {
+    pub(crate) fn set_corner_inset(&mut self, inset: i32) {
+        self.corner_inset = inset;
+    }
+
+    pub(crate) fn set_close_hovered(&mut self, hovered: bool) -> bool {
+        let changed = self.close_hovered != hovered;
+        self.close_hovered = hovered;
+        changed
+    }
     fn update(&mut self, content: Content<'_>, width: i32) -> Result<()> {
         let layout_width = width.saturating_sub((2.0 * TOP_BAR_HEIGHT) as i32).max(1) as usize;
         if !self
@@ -437,6 +457,16 @@ impl Overlays {
             self.info_width = self.text.text(0, INFO_Y, content.info)?;
             self.position_width = self.text.text(0, POSITION_Y, content.position)?;
             self.text.glyph(CLOSE_X, CLOSE_Y, b'X');
+            // The unused space beside the close glyph holds its circular
+            // hover mask. Recreate it whenever the shared atlas is cleared.
+            let radius = CLOSE_HOVER_SIZE as f32 * 0.5;
+            for y in 0..CLOSE_HOVER_SIZE {
+                for x in 0..CLOSE_HOVER_SIZE {
+                    let distance = (x as f32 + 0.5 - radius).hypot(y as f32 + 0.5 - radius);
+                    let coverage = (radius - distance).clamp(0.0, 1.0);
+                    self.text.pixels[(CLOSE_Y + y) * WIDTH + x] = (coverage * 255.0).round() as u8;
+                }
+            }
             self.details_width = 0;
             self.details_height = 0;
             let mut line_image = Image::new(GLYPH_HEIGHT);
@@ -592,6 +622,9 @@ impl Overlays {
         width: i32,
         height: i32,
     ) -> Result<Prepared<'_>> {
+        let inset = self.corner_inset;
+        let width = width - 2 * inset;
+        let height = height - 2 * inset;
         let chapter = content.metadata;
         self.update(content, width)?;
         self.update_metadata(chapter, width)?;
@@ -600,9 +633,9 @@ impl Overlays {
         self.parts.clear();
         let parts = &mut self.parts;
         let mut add = |texture, src: [f32; 4], dst: [f32; 4], color: [f32; 4]| {
-            // The atlas's first rows are timeline marks; all other masks are
-            // text. Offset in output pixels, even when the text is scaled.
-            if texture == 2 || (texture == 1 && src[1] >= INFO_Y as f32) {
+            // Only text gets a shadow, not timeline marks or the hover mask.
+            // Offset in output pixels, even when the text is scaled.
+            if texture == 2 || (texture == 1 && src[1] >= INFO_Y as f32 && src != CLOSE_HOVER_SRC) {
                 parts.push(ffi::UpOverlayPart {
                     texture,
                     src,
@@ -624,7 +657,12 @@ impl Overlays {
             add(
                 0,
                 solid,
-                [0.0, 0.0, width, TOP_BAR_HEIGHT],
+                [
+                    -(inset as f32),
+                    -(inset as f32),
+                    width + inset as f32,
+                    TOP_BAR_HEIGHT,
+                ],
                 [0.02, 0.02, 0.02, 0.72 * top_alpha],
             );
             if self.title_width > 0 {
@@ -636,6 +674,14 @@ impl Overlays {
                     [0.0, 0.0, tw, TITLE_HEIGHT as f32],
                     [x, y, x + tw, y + TITLE_HEIGHT as f32],
                     white(top_alpha),
+                );
+            }
+            if self.close_hovered {
+                add(
+                    1,
+                    CLOSE_HOVER_SRC,
+                    [width - 37.0, 5.0, width - 5.0, 37.0],
+                    [1.0, 1.0, 1.0, 0.18 * top_alpha],
                 );
             }
             add(
@@ -784,6 +830,18 @@ impl Overlays {
                 add(0, solid, [x - 3.0, y - 6.0, x + 3.0, y + 6.0], white(alpha));
             }
         }
+        for part in &mut self.parts {
+            part.dst = part.dst.map(|v| v + inset as f32);
+        }
+        // Check the final coordinates: adding the corner inset or a text
+        // shadow offset can round a very narrow rectangle down to zero width.
+        // Collapsed layouts also have nothing to draw, and libplacebo rejects
+        // empty overlay destinations instead of ignoring them.
+        self.parts.retain(|part| {
+            part.dst.iter().all(|v| v.is_finite())
+                && part.dst[2] > part.dst[0]
+                && part.dst[3] > part.dst[1]
+        });
         Ok(Prepared {
             text: &self.text,
             title: &self.title,

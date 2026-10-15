@@ -122,6 +122,7 @@ pub(crate) unsafe fn sdl_error() -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn close_button_contains(
     x: f32,
     y: f32,
@@ -136,6 +137,7 @@ pub(crate) fn close_button_contains(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn scrubber_target(
     x: f32,
     y: f32,
@@ -210,48 +212,34 @@ impl Window {
         Ok((width, height))
     }
 
-    pub(crate) fn close_button_contains(&self, x: f32, y: f32) -> bool {
-        let mut logical_width = 0;
-        let mut logical_height = 0;
-        let mut pixel_width = 0;
-        let mut pixel_height = 0;
-        if unsafe { ffi::up_window_size(self.0, &mut logical_width, &mut logical_height) } == 0
-            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
-                == 0
-        {
-            return false;
-        }
-        close_button_contains(
-            x,
-            y,
-            logical_width,
-            logical_height,
-            pixel_width,
-            pixel_height,
+    fn geometry(&self) -> Option<geometry::WindowGeometry> {
+        let (width, height, pixel_width, pixel_height) = self.dimensions().ok()?;
+        let radius = unsafe { ffi::up_window_corner_radius(self.0) };
+        Some(
+            geometry::WindowGeometry::new(width, height, pixel_width, pixel_height)?
+                .with_radius(radius),
         )
     }
 
-    pub(crate) fn scrubber_target(&self, x: f32, y: f32, duration: Option<f64>) -> Option<f64> {
-        let duration = duration?;
-        let mut logical_width = 0;
-        let mut logical_height = 0;
-        let mut pixel_width = 0;
-        let mut pixel_height = 0;
-        if unsafe { ffi::up_window_size(self.0, &mut logical_width, &mut logical_height) } == 0
-            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
-                == 0
-        {
-            return None;
+    pub(crate) fn dimensions(&self) -> Result<(i32, i32, i32, i32)> {
+        let (mut width, mut height) = (0, 0);
+        if unsafe { ffi::up_window_size(self.0, &mut width, &mut height) } == 0 {
+            return Err(format!("could not query window size: {}", unsafe {
+                sdl_error()
+            }));
         }
-        scrubber_target(
-            x,
-            y,
-            logical_width,
-            logical_height,
-            pixel_width,
-            pixel_height,
-            duration,
-        )
+        let (pw, ph) = self.pixel_size()?;
+        Ok((width, height, pw, ph))
+    }
+
+    pub(crate) fn close_button_contains(&self, x: f32, y: f32) -> bool {
+        self.geometry()
+            .is_some_and(|g| g.hit(f64::from(x), f64::from(y)) == geometry::HitRegion::Close)
+    }
+
+    pub(crate) fn scrubber_target(&self, x: f32, y: f32, duration: Option<f64>) -> Option<f64> {
+        self.geometry()?
+            .scrubber_target(f64::from(x), f64::from(y), duration?)
     }
 
     pub(crate) fn set_minimum_size(&self) -> Result<()> {
@@ -265,18 +253,8 @@ impl Window {
     }
 
     pub(crate) fn chapter_hover(&self, x: f32, y: f32, markers: &[f32]) -> Option<usize> {
-        let (mut width, mut height, mut pixel_width, mut pixel_height) = (0, 0, 0, 0);
-        if unsafe { ffi::up_window_size(self.0, &mut width, &mut height) } == 0
-            || unsafe { ffi::up_window_pixel_size(self.0, &mut pixel_width, &mut pixel_height) }
-                == 0
-        {
-            return None;
-        }
-        geometry::WindowGeometry::new(width, height, pixel_width, pixel_height)?.chapter_hover(
-            f64::from(x),
-            f64::from(y),
-            markers,
-        )
+        self.geometry()?
+            .chapter_hover(f64::from(x), f64::from(y), markers)
     }
 }
 
@@ -292,6 +270,20 @@ pub(crate) struct WaylandInput<'window> {
 }
 
 impl<'window> WaylandInput<'window> {
+    pub(crate) fn set_region(&self, rectangles: &[[i32; 4]], radius: f32) -> Result<()> {
+        if !unsafe {
+            ffi::up_wayland_input_set_region(
+                self.native,
+                rectangles.as_ptr().cast(),
+                rectangles.len(),
+                radius,
+            )
+        } {
+            return Err("could not update the Wayland input region".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn create(window: &'window Window) -> Result<Self> {
         let input = unsafe { ffi::up_wayland_input_create(window.0.cast()) };
         if input.is_null() {

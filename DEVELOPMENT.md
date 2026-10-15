@@ -66,6 +66,7 @@ responsibility:
 | `artwork.rs` | Embedded cover extraction and temporary file lifetime for MPRIS |
 | `media.rs`, `decoder.rs`, `worker.rs` | Demuxing, owned FFmpeg frames, and decoder worker |
 | `read_ahead.rs` | Bounded local-file buffering, background reads, and byte seeking |
+| `config.rs` | Validated XDG preferences and atomic saves from the command palette |
 | `source.rs` | Local-path and HTTP(S) input classification |
 | `audio.rs` | Conversion, bounded audio queues, and timestamp scheduling |
 | `window.rs`, `geometry.rs` | Window lifetime, actions, and shared control hit regions |

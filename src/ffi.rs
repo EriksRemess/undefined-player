@@ -437,6 +437,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn up_platform_show_cursor(visible: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
     pub fn up_window_can_hide_cursor(window: *mut UpWindow) -> ::std::os::raw::c_int;
+    pub fn up_window_corner_scale(window: *mut UpWindow) -> f32;
+    pub fn up_window_corner_radius(window: *mut UpWindow) -> f32;
 }
 unsafe extern "C" {
     pub fn up_platform_start_text_input(started: ::std::os::raw::c_int);
@@ -538,6 +540,8 @@ unsafe extern "C" {
         subtitle_width: ::std::os::raw::c_int,
         subtitle_height: ::std::os::raw::c_int,
         subtitle_serial: u64,
+        corner_radius: f32,
+        corner_shader: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -565,6 +569,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_wayland_input_ready(input: *const UpWaylandInput) -> bool;
+    pub fn up_wayland_input_set_region(
+        input: *mut UpWaylandInput,
+        rectangles: *const i32,
+        count: usize,
+        radius: f32,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn up_wayland_input_error(input: *const UpWaylandInput) -> *const ::std::os::raw::c_char;

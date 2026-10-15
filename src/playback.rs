@@ -38,6 +38,7 @@ enum PaletteCommand {
     Action(Action),
     Seek(PaletteSeek),
     Input(&'static str),
+    CornerRadius(u16),
 }
 
 struct PaletteRow {
@@ -182,6 +183,7 @@ impl Palette {
         .collect::<Vec<_>>();
         rows.insert(1, PaletteRow::input("seek ", "Seek..."));
         rows.insert(2, PaletteRow::input("jump ", "Jump to time..."));
+        rows.push(PaletteRow::input("corners ", "Rounded corners..."));
         if audio {
             rows.push(PaletteRow {
                 command: PaletteCommand::Action(Action::CycleAudio),
@@ -227,6 +229,38 @@ impl Palette {
     }
 
     fn rows(&self, audio: bool, subtitles: bool) -> Vec<PaletteRow> {
+        let query = self.query_words();
+        if query == "corners" || query.starts_with("corners ") {
+            let values = if query == "corners" {
+                vec![0, 15]
+            } else {
+                let value = query.strip_prefix("corners ").unwrap();
+                let value = value.strip_prefix("custom ").unwrap_or(value);
+                crate::config::parse_radius(value)
+                    .ok()
+                    .into_iter()
+                    .collect()
+            };
+            let mut rows: Vec<_> = values
+                .into_iter()
+                .map(|radius| PaletteRow {
+                    command: PaletteCommand::CornerRadius(radius),
+                    label: if radius == 0 {
+                        "Off (square corners)".into()
+                    } else {
+                        format!("{radius} pixels")
+                    },
+                    shortcut: "ENTER",
+                })
+                .collect();
+            if query == "corners" {
+                rows.push(PaletteRow::input(
+                    "corners custom ",
+                    "Enter custom radius...",
+                ));
+            }
+            return rows;
+        }
         // Parsed commands are matches without applying the label search again.
         if let Some((action, amount, label)) = self.seek_argument() {
             let offset = if action == Action::SeekForward {
@@ -307,7 +341,11 @@ impl Palette {
             .unwrap_or(0);
         let query = self.query_words();
         let command = query.split_whitespace().next().unwrap_or("");
-        let hint = if command == "jump" && self.jump_argument().is_none() {
+        let hint = if query == "corners" {
+            Some("CHOOSE OFF, 15 PX, OR A CUSTOM RADIUS")
+        } else if command == "corners" {
+            Some("ENTER A WHOLE NUMBER FROM 0 TO 32")
+        } else if command == "jump" && self.jump_argument().is_none() {
             Some("ENTER TIME: jump 123 OR jump 2:03")
         } else if self.direction_step().is_some() {
             Some("CHOOSE SECONDS OR TYPE AN AMOUNT")
@@ -435,20 +473,24 @@ pub(crate) unsafe fn seek_to(
 }
 
 pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
+    let mut config = crate::config::Config::load();
     let _sdl = unsafe { Sdl::init()? };
     let metadata_title = CString::new(source_title(&source))
         .map_err(|_| "media title contains a NUL byte".to_string())?;
     let title = CString::new(source_display_title(&source))
         .map_err(|_| "media title contains a NUL byte".to_string())?;
     let window = unsafe { Window::create(&title)? };
-    let _wayland_input = match WaylandInput::create(&window) {
+    let wayland_input = match WaylandInput::create(&window) {
         Ok(input) => Some(input),
         Err(error) => {
-            eprintln!("warning: {error}; drag-anywhere is unavailable");
+            eprintln!(
+                "warning: {error}; window dragging, the window menu, and rounded corners are unavailable"
+            );
             None
         }
     };
     let mut renderer = Renderer::create(&window)?;
+    renderer.set_corner_radius(config.corner_radius);
     let mut media = unsafe { Media::open(&source, Some(renderer.device()), perf_log)? };
 
     if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
@@ -588,6 +630,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut redraw = true;
     let mut new_frame_pending = true;
     let mut top_bar = TopBar::new();
+    let mut mouse_position = None;
     let mut cursor = IdleCursor::new();
     let mut chapter_heading = ChapterHeading::default();
     let mut position_notice = PositionNotice::new();
@@ -623,6 +666,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_WINDOW_FOCUS_LOST => {
+                    mouse_position = None;
                     cursor.activity();
                     top_bar.set_focused(false);
                     chapter_heading.hovered = None;
@@ -634,11 +678,13 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_LEAVE => {
+                    mouse_position = None;
                     cursor.activity();
                     chapter_heading.hovered = None;
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_MOTION => {
+                    mouse_position = Some((event.x, event.y));
                     cursor.activity();
                     top_bar.mouse_activity();
                     chapter_heading.hovered =
@@ -653,6 +699,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                     redraw = true;
                 }
                 ffi::UpEventType_UP_EVENT_MOUSE_BUTTON_DOWN => {
+                    mouse_position = Some((event.x, event.y));
                     cursor.activity();
                     top_bar.mouse_activity();
                     redraw = true;
@@ -755,6 +802,23 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                         };
                         redraw = true;
                         match selection {
+                            Some(PaletteCommand::CornerRadius(radius)) => {
+                                match config.set_corner_radius(radius) {
+                                    Ok(()) => {
+                                        renderer.set_corner_radius(radius);
+                                        position_notice.show_text(
+                                            CString::new(format!("CORNER RADIUS: {radius} PX"))
+                                                .unwrap(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        eprintln!("warning: {error}");
+                                        position_notice
+                                            .show_text(c"COULD NOT SAVE SETTINGS".to_owned());
+                                    }
+                                }
+                                continue;
+                            }
                             Some(PaletteCommand::Action(action)) => (Some(action), None),
                             Some(PaletteCommand::Seek(argument)) => {
                                 (Some(Action::SeekForward), Some(argument))
@@ -1027,6 +1091,10 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
             }
         }
         cursor.update(&window);
+        redraw |= renderer.update_window_shape(wayland_input.as_ref())?;
+        redraw |= renderer.set_close_hovered(
+            mouse_position.is_some_and(|(x, y)| window.close_button_contains(x, y)),
+        );
         if !running {
             break;
         }

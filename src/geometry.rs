@@ -6,6 +6,11 @@ pub(crate) const SCRUBBER_HIT_HEIGHT: f32 = 42.0;
 pub(crate) const SCRUBBER_MARGIN: f32 = 14.0;
 const RESIZE_BORDER: f64 = 10.0;
 
+// The inset square fits wholly inside the rounded outline, including at HiDPI.
+pub(crate) fn corner_inset(radius: f32) -> i32 {
+    (radius.max(0.0) * (1.0 - std::f32::consts::FRAC_1_SQRT_2)).ceil() as i32
+}
+
 // Return zero to retain normal aspect fitting. Limit automatic integer scaling
 // to square-pixel SD sources, including portrait video, and never crop to fit.
 #[unsafe(no_mangle)]
@@ -65,6 +70,7 @@ pub(crate) struct WindowGeometry {
     height: f64,
     scale_x: f64,
     scale_y: f64,
+    radius: f64,
 }
 impl WindowGeometry {
     pub(crate) fn new(
@@ -81,7 +87,60 @@ impl WindowGeometry {
             height: f64::from(height),
             scale_x: f64::from(width) / f64::from(pixel_width),
             scale_y: f64::from(height) / f64::from(pixel_height),
+            radius: 0.0,
         })
+    }
+
+    pub(crate) fn with_radius(mut self, radius: f32) -> Self {
+        self.radius = if radius.is_finite() {
+            f64::from(radius.max(0.0))
+                .min((self.width / self.scale_x).min(self.height / self.scale_y) * 0.5)
+        } else {
+            0.0
+        };
+        self
+    }
+
+    fn inset(self) -> f64 {
+        f64::from(corner_inset(self.radius as f32))
+    }
+
+    fn contains(self, x: f64, y: f64) -> bool {
+        let px = x / self.scale_x;
+        let py = y / self.scale_y;
+        let width = self.width / self.scale_x;
+        let height = self.height / self.scale_y;
+        let dx = (self.radius - px.min(width - px)).max(0.0);
+        let dy = (self.radius - py.min(height - py)).max(0.0);
+        dx.hypot(dy) <= self.radius
+    }
+
+    // Wayland regions use logical integer coordinates. Merge identical rows to
+    // keep the region small; all corner geometry is calculated here in Rust.
+    pub(crate) fn input_rectangles(self) -> Vec<[i32; 4]> {
+        let mut rectangles: Vec<[i32; 4]> = Vec::new();
+        let width = self.width as i32;
+        for y in 0..self.height as i32 {
+            let edge_y = (f64::from(y) + 0.5).min(self.height - f64::from(y) - 0.5) / self.scale_y;
+            let dy = (self.radius - edge_y).max(0.0);
+            let inset = ((self.radius - (self.radius * self.radius - dy * dy).max(0.0).sqrt())
+                * self.scale_x)
+                .ceil() as i32;
+            let span = width - 2 * inset;
+            if span <= 0 {
+                continue;
+            }
+            if let Some(last) = rectangles.last_mut()
+                && last[0] == inset
+                && last[2] == span
+                && last[1] + last[3] == y
+            {
+                last[3] += 1;
+            } else {
+                rectangles.push([inset, y, span, 1]);
+            }
+        }
+        rectangles
     }
 
     pub(crate) fn hit(self, x: f64, y: f64) -> HitRegion {
@@ -91,11 +150,15 @@ impl WindowGeometry {
             || y < 0.0
             || x >= self.width
             || y >= self.height
+            || !self.contains(x, y)
         {
             return HitRegion::Outside;
         }
-        if x >= self.width - f64::from(TOP_BAR_HEIGHT) * self.scale_x
-            && y < f64::from(TOP_BAR_HEIGHT) * self.scale_y
+        let inset = self.inset();
+        if x >= self.width - (inset + f64::from(TOP_BAR_HEIGHT)) * self.scale_x
+            && x < self.width - inset * self.scale_x
+            && y >= inset * self.scale_y
+            && y < (inset + f64::from(TOP_BAR_HEIGHT)) * self.scale_y
         {
             return HitRegion::Close;
         }
@@ -112,7 +175,9 @@ impl WindowGeometry {
             (_, _, _, true) => HitRegion::Bottom,
             (true, _, _, _) => HitRegion::Left,
             (_, true, _, _) => HitRegion::Right,
-            _ if y >= self.height - f64::from(SCRUBBER_HIT_HEIGHT) * self.scale_y => {
+            _ if y >= self.height - (inset + f64::from(SCRUBBER_HIT_HEIGHT)) * self.scale_y
+                && y < self.height - inset * self.scale_y =>
+            {
                 HitRegion::Scrubber
             }
             _ => HitRegion::Content,
@@ -123,9 +188,10 @@ impl WindowGeometry {
         if self.hit(x, y) == HitRegion::Outside {
             return None;
         }
-        let (x, y) = (x / self.scale_x, y / self.scale_y);
-        let width = self.width / self.scale_x;
-        let height = self.height / self.scale_y;
+        let inset = self.inset();
+        let (x, y) = (x / self.scale_x - inset, y / self.scale_y - inset);
+        let width = self.width / self.scale_x - 2.0 * inset;
+        let height = self.height / self.scale_y - 2.0 * inset;
         if (y - (height - 18.0)).abs() > 8.0 {
             return None;
         }
@@ -144,7 +210,7 @@ impl WindowGeometry {
         if !duration.is_finite() || duration <= 0.0 || self.hit(x, y) != HitRegion::Scrubber {
             return None;
         }
-        let margin = f64::from(SCRUBBER_MARGIN) * self.scale_x;
+        let margin = (f64::from(SCRUBBER_MARGIN) + self.inset()) * self.scale_x;
         let track_width = self.width - 2.0 * margin;
         (track_width > 0.0).then(|| ((x - margin) / track_width).clamp(0.0, 1.0) * duration)
     }
@@ -162,6 +228,20 @@ pub extern "C" fn up_input_hit_test(
 ) -> u32 {
     WindowGeometry::new(width, height, pixel_width, pixel_height)
         .map_or(HitRegion::Outside, |geometry| geometry.hit(x, y)) as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn up_input_hit_test_rounded(
+    x: f64,
+    y: f64,
+    width: i32,
+    height: i32,
+    pixel_width: i32,
+    pixel_height: i32,
+    radius: f32,
+) -> u32 {
+    WindowGeometry::new(width, height, pixel_width, pixel_height)
+        .map_or(HitRegion::Outside, |g| g.with_radius(radius).hit(x, y)) as u32
 }
 
 #[cfg(test)]

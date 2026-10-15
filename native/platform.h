@@ -85,6 +85,8 @@ int up_window_size(UpWindow *window, int *width, int *height);
 int up_window_pixel_size(UpWindow *window, int *width, int *height);
 int up_window_set_minimum_size(UpWindow *window, int width, int height);
 int up_window_set_fullscreen(UpWindow *window, int fullscreen);
+float up_window_corner_scale(UpWindow *window);
+float up_window_corner_radius(UpWindow *window);
 
 UpAudioStream *up_audio_stream_create(int rate, int channels);
 void up_audio_stream_destroy(UpAudioStream *stream);
