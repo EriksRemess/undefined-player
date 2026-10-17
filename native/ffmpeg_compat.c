@@ -12,6 +12,10 @@
 #include <libavutil/sha.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+#ifdef __APPLE__
+#include <VideoToolbox/VideoToolbox.h>
+#include "macos_logging.h"
+#endif
 
 #if LIBAVFORMAT_VERSION_MAJOR < 62 || LIBAVCODEC_VERSION_MAJOR < 62 || \
     LIBAVUTIL_VERSION_MAJOR < 60
@@ -28,7 +32,7 @@ struct UpAvDecoder {
     AVCodecContext *context;
     int stream_index;
     AVRational time_base;
-    int uses_vulkan;
+    int uses_hardware;
     double frame_duration;
 };
 
@@ -67,59 +71,16 @@ UpAvFrame *up_av_frame_clone(const UpAvFrame *frame)
     return (UpAvFrame *) av_frame_clone((const AVFrame *) frame);
 }
 
-// Expose the luma plane without conversion. Readback runs in the crop/decode
-// workers; the presentation thread keeps its original frame.
-int up_av_frame_luma(const UpAvFrame *pointer, UpLumaView *view)
+#include "ffmpeg_luma.h"
+
+int up_av_frame_luma(const UpAvFrame *frame, UpLumaView *view)
 {
-    const AVFrame *source = (const AVFrame *) pointer;
-    *view = (UpLumaView) {0};
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(source->format);
-    if (!desc)
-        return 0;
-    AVFrame *frame = NULL;
-    if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
-        frame = av_frame_alloc();
-        if (!frame || av_hwframe_transfer_data(frame, source, 0) < 0)
-            goto fail;
-        desc = av_pix_fmt_desc_get(frame->format);
-    } else {
-        frame = av_frame_clone(source);
-    }
-    if (!frame || !desc || !desc->nb_components ||
-        (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL |
-                       AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_HWACCEL)))
-        goto fail;
-    const AVComponentDescriptor *luma = &desc->comp[0];
-    if (frame->width <= 0 || frame->height <= 0 ||
-        frame->width > 32768 || frame->height > 32768 ||
-        luma->depth < 8 || luma->depth > 16 || luma->shift < 0 ||
-        luma->depth + luma->shift > 16 || luma->step < 1 || luma->step > 8 ||
-        luma->offset < 0 || !frame->data[luma->plane])
-        goto fail;
-    const int bytes = (luma->depth + luma->shift + 7) / 8;
-    const int64_t row_size = (int64_t) (frame->width - 1) * luma->step + luma->offset + bytes;
-    if (llabs((int64_t) frame->linesize[luma->plane]) < row_size)
-        goto fail;
-    *view = (UpLumaView) {
-        .frame = (UpAvFrame *) frame,
-        .data = frame->data[luma->plane] + luma->offset,
-        .width = frame->width, .height = frame->height,
-        .stride = frame->linesize[luma->plane], .step = luma->step,
-        .depth = luma->depth, .shift = luma->shift,
-        .big_endian = !!(desc->flags & AV_PIX_FMT_FLAG_BE),
-        .full_range = source->color_range == AVCOL_RANGE_JPEG,
-    };
-    return 1;
-fail:
-    av_frame_free(&frame);
-    return 0;
+    return up_luma_view((const AVFrame *) frame, view);
 }
 
 void up_av_frame_luma_free(UpLumaView *view)
 {
-    AVFrame *frame = (AVFrame *) view->frame;
-    av_frame_free(&frame);
-    *view = (UpLumaView) {0};
+    up_luma_view_free(view);
 }
 
 #define FORMAT(value) ((AVFormatContext *) (value))
@@ -128,8 +89,9 @@ void up_av_frame_luma_free(UpLumaView *view)
 
 static const AVCodec *preferred_decoder(enum AVCodecID id)
 {
-    const AVCodec *codec = avcodec_find_decoder_by_name(avcodec_get_name(id));
-    return codec ? codec : avcodec_find_decoder(id);
+    // FFmpeg's default can be a software implementation such as libdav1d.
+    // The decoder named "av1" can be hardware-only, so it is not a fallback.
+    return avcodec_find_decoder(id);
 }
 
 static AVStream *stream_at(const UpAvFormat *format, unsigned int index)
@@ -274,26 +236,50 @@ static enum UpMediaType up_media_type(enum AVMediaType type)
     }
 }
 
-static enum AVPixelFormat choose_vulkan_format(AVCodecContext *context,
+static enum AVPixelFormat choose_hardware_format(AVCodecContext *context,
                                                 const enum AVPixelFormat *formats)
 {
-    (void) context;
     for (const enum AVPixelFormat *format = formats;
          format && *format != AV_PIX_FMT_NONE; format++) {
-        if (*format == AV_PIX_FMT_VULKAN)
+        const AVHWDeviceContext *device = (const AVHWDeviceContext *) context->hw_device_ctx->data;
+        if ((device->type == AV_HWDEVICE_TYPE_VULKAN && *format == AV_PIX_FMT_VULKAN) ||
+            (device->type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX && *format == AV_PIX_FMT_VIDEOTOOLBOX))
             return *format;
     }
     return AV_PIX_FMT_NONE;
 }
 
-static int decoder_supports_vulkan(const AVCodec *codec)
+static int decoder_supports_hardware(const AVCodec *codec, const AVBufferRef *reference,
+                                     const AVCodecParameters *parameters)
 {
+    (void) parameters;
+    const AVHWDeviceContext *device = (const AVHWDeviceContext *) reference->data;
+#ifdef __APPLE__
+    if (device->type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+        if (codec->id == AV_CODEC_ID_HEVC && parameters->profile != AV_PROFILE_UNKNOWN &&
+            parameters->profile != AV_PROFILE_HEVC_MAIN && parameters->profile != AV_PROFILE_HEVC_MAIN_10 &&
+            parameters->profile != AV_PROFILE_HEVC_MAIN_STILL_PICTURE)
+            return 0;
+        CMVideoCodecType type = 0;
+        switch (codec->id) {
+        case AV_CODEC_ID_H264: type = kCMVideoCodecType_H264; break;
+        case AV_CODEC_ID_HEVC: type = kCMVideoCodecType_HEVC; break;
+        case AV_CODEC_ID_VP9: type = kCMVideoCodecType_VP9; break;
+        case AV_CODEC_ID_AV1: type = kCMVideoCodecType_AV1; break;
+        default: return 0;
+        }
+        if (__builtin_available(macOS 11.0, *))
+            VTRegisterSupplementalVideoDecoderIfAvailable(type);
+        // In particular, VideoToolbox can silently use software for HEVC.
+        // Do not label that path hardware accelerated on unsupported Macs.
+        if (!VTIsHardwareDecodeSupported(type)) return 0;
+    }
+#endif
     for (int index = 0;; index++) {
         const AVCodecHWConfig *config = avcodec_get_hw_config(codec, index);
         if (!config)
             return 0;
-        if (config->device_type == AV_HWDEVICE_TYPE_VULKAN &&
-            config->pix_fmt == AV_PIX_FMT_VULKAN &&
+        if (config->device_type == device->type &&
             (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
             return 1;
     }
@@ -429,6 +415,9 @@ static int select_hls_video(AVFormatContext *native, unsigned int rank)
 
 void up_av_set_debug(int enabled)
 {
+#ifdef __APPLE__
+    up_macos_configure_logging(enabled);
+#endif
     av_log_set_level(enabled ? AV_LOG_DEBUG : AV_LOG_QUIET);
 }
 
@@ -675,7 +664,7 @@ int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
 }
 
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
-                                void *vulkan_device, int prefer_vulkan)
+                                void *hardware_device, int prefer_hardware)
 {
     decoder_error[0] = '\0';
     AVStream *stream = stream_at(format, (unsigned int) stream_index);
@@ -685,6 +674,11 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
     }
     AVCodecParameters *parameters = stream->codecpar;
     const AVCodec *codec = preferred_decoder(parameters->codec_id);
+    if (prefer_hardware && hardware_device) {
+        const AVCodec *native = avcodec_find_decoder_by_name(avcodec_get_name(parameters->codec_id));
+        if (native && decoder_supports_hardware(native, hardware_device, parameters))
+            codec = native;
+    }
     if (!codec) {
         snprintf(decoder_error, sizeof(decoder_error),
                  "no decoder is available for the selected stream");
@@ -713,15 +707,19 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
         goto fail;
     }
     decoder->context->pkt_timebase = stream->time_base;
-    decoder->uses_vulkan = prefer_vulkan && vulkan_device &&
-        decoder_supports_vulkan(codec);
-    if (decoder->uses_vulkan) {
-        decoder->context->get_format = choose_vulkan_format;
-        decoder->context->hw_device_ctx = av_buffer_ref(vulkan_device);
+    decoder->uses_hardware = prefer_hardware && hardware_device &&
+        decoder_supports_hardware(codec, hardware_device, parameters);
+    if (decoder->uses_hardware) {
+        decoder->context->get_format = choose_hardware_format;
+        decoder->context->hw_device_ctx = av_buffer_ref(hardware_device);
+#ifdef __APPLE__
+        decoder->context->extra_hw_frames = 4;
+#else
         decoder->context->extra_hw_frames = 16;
+#endif
         if (!decoder->context->hw_device_ctx) {
             snprintf(decoder_error, sizeof(decoder_error),
-                     "could not retain the Vulkan decoder device");
+                     "could not retain the hardware decoder device");
             goto fail;
         }
     }
@@ -771,9 +769,9 @@ double up_av_decoder_frame_duration(const UpAvDecoder *decoder)
     return decoder->frame_duration;
 }
 
-int up_av_decoder_uses_vulkan(const UpAvDecoder *decoder)
+int up_av_decoder_uses_hardware(const UpAvDecoder *decoder)
 {
-    return decoder->uses_vulkan;
+    return decoder->uses_hardware;
 }
 
 int up_av_decoder_width(const UpAvDecoder *decoder)
@@ -810,9 +808,29 @@ void up_av_decoder_flush(UpAvDecoder *decoder)
     avcodec_flush_buffers(decoder->context);
 }
 
+void up_av_decoder_skip_nonkey(UpAvDecoder *decoder, int skip)
+{
+    decoder->context->skip_frame = skip ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
+}
+
 UpAvPacket *up_av_packet_alloc(void)
 {
     return (UpAvPacket *) av_packet_alloc();
+}
+
+UpAvPacket *up_av_packet_clone(const UpAvPacket *packet)
+{
+    return (UpAvPacket *) av_packet_clone(PACKET(packet));
+}
+
+int up_av_packet_size(const UpAvPacket *packet)
+{
+    return PACKET(packet)->size;
+}
+
+int up_av_packet_is_key(const UpAvPacket *packet)
+{
+    return !!(PACKET(packet)->flags & AV_PKT_FLAG_KEY);
 }
 
 void up_av_packet_free(UpAvPacket **packet)
@@ -849,9 +867,10 @@ void up_av_frame_free(UpAvFrame **frame)
     *frame = (UpAvFrame *) native;
 }
 
-int up_av_frame_is_vulkan(const UpAvFrame *frame)
+int up_av_frame_is_hardware(const UpAvFrame *frame)
 {
-    return FRAME(frame)->format == AV_PIX_FMT_VULKAN;
+    const AVPixFmtDescriptor *description = av_pix_fmt_desc_get(FRAME(frame)->format);
+    return description && (description->flags & AV_PIX_FMT_FLAG_HWACCEL);
 }
 
 int64_t up_av_frame_timestamp(const UpAvFrame *frame)

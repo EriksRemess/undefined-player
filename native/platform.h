@@ -48,6 +48,7 @@ enum UpKey {
     UP_KEY_BACKSPACE,
     UP_KEY_Y,
     UP_KEY_N,
+    UP_KEY_U,
 };
 
 typedef struct UpEvent {
@@ -72,6 +73,7 @@ enum UpModifier {
 int up_platform_init(void);
 void up_platform_quit(void);
 const char *up_platform_error(void);
+const char *up_platform_audio_driver(void);
 void up_platform_delay(uint32_t milliseconds);
 int up_platform_poll_event(UpEvent *event);
 void up_platform_capture_mouse(int captured);
@@ -87,6 +89,9 @@ int up_window_set_minimum_size(UpWindow *window, int width, int height);
 int up_window_set_fullscreen(UpWindow *window, int fullscreen);
 float up_window_corner_scale(UpWindow *window);
 float up_window_corner_radius(UpWindow *window);
+#ifdef __APPLE__
+int up_window_set_corner_radius(UpWindow *window, float radius);
+#endif
 
 UpAudioStream *up_audio_stream_create(int rate, int channels);
 void up_audio_stream_destroy(UpAudioStream *stream);

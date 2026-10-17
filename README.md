@@ -1,23 +1,20 @@
 # undefined-player
 
-A focused Wayland video player. It uses FFmpeg 8 or newer, decodes supported
-codecs directly with Vulkan Video when available, renders with libplacebo to a
-Vulkan Wayland swapchain, and plays audio through PipeWire.
+A minimal video player for Linux/Wayland and macOS, with hardware decoding,
+HDR, embedded subtitles, and keyboard controls.
 
 ## Installation
 
-Prebuilt Debian packages and binary tarballs are available from the
-[GitHub releases](https://github.com/EriksRemess/undefined-player/releases).
+### Linux
 
-Install a downloaded Debian package with `apt` so its declared runtime
-dependencies are resolved automatically:
+Debian packages and binary tarballs are available from
+[GitHub releases](https://github.com/EriksRemess/undefined-player/releases).
 
 ```sh
 sudo apt install ./undefined-player_*.deb
 ```
 
-The binary tarball is dynamically linked and requires compatible shared
-libraries on the system. Extract it and run its user-local installer:
+For the binary tarball:
 
 ```sh
 tar -xzf undefined-player-*-linux-*.tar.gz
@@ -25,19 +22,30 @@ cd undefined-player-*-linux-*
 ./install.sh
 ```
 
-## Runtime requirements
+Requires Wayland, Vulkan, and PipeWire. Debian packages resolve library
+dependencies through `apt`; tarball users need compatible FFmpeg 8+, SDL3,
+libplacebo, Wayland, Pango/Cairo, and GIO libraries.
 
-Running requires a Wayland session, the Vulkan loader and a working Vulkan
-driver, SDL3 with its Wayland and PipeWire backends, libplacebo, the Wayland
-client library, Pango/Cairo, GIO, and compatible FFmpeg 8 or newer shared
-libraries. Vulkan Video support enables hardware decoding; unsupported codecs
-fall back to software decoding but still use Vulkan for presentation.
+### macOS
 
-Wayland and PipeWire are the only supported display and audio backends.
-The Debian package declares its shared-library dependencies; binary tarball
-users must provide compatible libraries and their GPU's Vulkan driver.
+Open the DMG and drag **Undefined Player** to **Applications**. Choose a package
+compatible with your processor and macOS version. FFmpeg and the other required
+libraries are bundled.
 
-## Quick start
+Launch the app to choose a video, or use Finder’s **Open With → Undefined Player**.
+**Command+O** opens another video. The app does not change your default player.
+
+Hardware decoding supports H.264, HEVC, VP9, and AV1 where available. HDR10 and
+HLG are supported; Dolby Vision dynamic metadata is not. On macOS 26+, supported
+low-resolution SDR videos can use Apple ML 2× upscaling. Press **U** to compare.
+
+## Playback
+
+**Space** pauses, **F** toggles fullscreen, **Left/Right** seeks, **S** toggles
+subtitles, and **Q** quits. **Ctrl+Shift+P** opens the command palette;
+**Command+Shift+P** also works on macOS.
+
+The command-line player accepts a local file or HTTP(S) URL:
 
 ```sh
 undefined-player ~/Videos/example.mp4
@@ -45,24 +53,14 @@ undefined-player 'https://example.com/video.m3u8'
 undefined-player yt:dQw4w9WgXcQ
 ```
 
-Accepts one local file or HTTP(S) URL. YouTube links and `yt:ID` require
-`yt-dlp` on `PATH`. There is no playlist queue.
-
-Use **Space** to pause, **F** for fullscreen, **Left/Right** to seek, and **Q**
-to quit. **Ctrl+Shift+P** opens the command palette. Saved playback positions
-prompt you to resume or start over.
-
-Add `--debug` to show FFmpeg diagnostics; playback failures always print an error.
+YouTube playback requires `yt-dlp` on `PATH`. There is no playlist queue.
 
 ## Documentation
 
-- [Playback guide](USAGE.md) — all shortcuts, streams, subtitles, chapters,
-  resume, cropping, and rendering behavior.
-- [Configuration](CONFIGURATION.md) — saved settings, rounded corners, and
-  preferred audio language.
-- [Development](DEVELOPMENT.md) — building, diagnostics, packaging, and releases.
+- [Playback](USAGE.md) — shortcuts, streams, resume, cropping, and subtitles.
+- [Configuration](CONFIGURATION.md) — rounded corners and audio language.
+- [Development](DEVELOPMENT.md) — building, testing, packaging, and signing.
 
 ## License
 
-undefined-player is free software licensed under the GNU General Public License
-version 3 or later. See [`LICENSE`](LICENSE).
+[GNU General Public License, version 3 or later](LICENSE).

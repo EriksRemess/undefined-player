@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 typedef struct UpVideoRenderer UpVideoRenderer;
 
@@ -37,6 +38,8 @@ typedef struct UpOverlayFrame {
 } UpOverlayFrame;
 
 UpVideoRenderer *up_video_renderer_create(void *window);
+int up_video_renderer_ready(const UpVideoRenderer *renderer);
+// Optional borrowed FFmpeg hardware device. NULL selects software decoding.
 void *up_video_renderer_device(UpVideoRenderer *renderer);
 // Returns 0 on success, 1 if corner compositing is unavailable, -1 on failure.
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
@@ -51,3 +54,7 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
 int up_video_renderer_resize(UpVideoRenderer *renderer, int width, int height);
 const char *up_video_renderer_error(const UpVideoRenderer *renderer);
 void up_video_renderer_destroy(UpVideoRenderer *renderer);
+#ifdef __APPLE__
+void up_video_renderer_set_upscaling(UpVideoRenderer *renderer, bool enabled);
+const char *up_video_renderer_upscaling_status(const UpVideoRenderer *renderer);
+#endif

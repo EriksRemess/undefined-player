@@ -157,6 +157,54 @@ fn content(title: &str) -> Content<'_> {
 }
 
 #[test]
+fn rounded_top_bar_centers_title_close_glyph_and_hover_circle() {
+    for radius in [0.0, 15.0, 30.0, 64.0] {
+        let mut overlays = Overlays::default();
+        overlays.set_corner_inset(crate::geometry::corner_inset(radius));
+        overlays.set_close_hovered(true);
+        let prepared = overlays
+            .prepare(
+                content("TITLE"),
+                Visibility {
+                    top_bar: 1.0,
+                    info: 0.0,
+                    position: 0.0,
+                    scrubber: None,
+                    chapter_markers: &[],
+                },
+                2560,
+                1440,
+            )
+            .unwrap();
+        let background = &prepared.parts[0];
+        assert_eq!(background.dst[1], 0.0);
+        let center = (background.dst[1] + background.dst[3]) * 0.5;
+        let title = prepared
+            .parts
+            .iter()
+            .find(|part| part.texture == 2 && part.color[0] == 1.0)
+            .unwrap();
+        let hover = prepared
+            .parts
+            .iter()
+            .find(|part| part.texture == 1 && part.src == CLOSE_HOVER_SRC)
+            .unwrap();
+        let close = prepared
+            .parts
+            .iter()
+            .find(|part| part.texture == 1 && part.color == [1.0; 4])
+            .unwrap();
+        for part in [title, hover, close] {
+            assert_eq!(
+                (part.dst[1] + part.dst[3]) * 0.5,
+                center,
+                "top-bar control is off-center at radius {radius}"
+            );
+        }
+    }
+}
+
+#[test]
 fn title_truncation_and_invisible_names_are_safe() {
     let mut overlays = Overlays::default();
     let long = "日本語".repeat(300);
