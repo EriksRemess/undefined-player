@@ -11,9 +11,7 @@ use crate::presentation::{
 use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
 use crate::source::MediaSource;
 use crate::subtitles::SubtitleCue;
-use crate::window::{
-    Action, IdleCursor, Sdl, Window, WindowShape, action_for_key, action_shortcut,
-};
+use crate::window::{Action, IdleCursor, Window, WindowShape, action_for_key, action_shortcut};
 use crate::worker::DecodeWorker;
 use crate::{Result, ffi};
 use std::collections::VecDeque;
@@ -508,9 +506,10 @@ pub(crate) unsafe fn seek_to(
     Ok(position)
 }
 
-pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
+// SDL remains alive across Finder requests while each playback session drops
+// its decoder, audio stream, GPU resources and saved resume state normally.
+pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<MediaSource>> {
     let mut config = crate::config::Config::load();
-    let _sdl = unsafe { Sdl::init()? };
     let metadata_title = CString::new(source_title(&source))
         .map_err(|_| "media title contains a NUL byte".to_string())?;
     let title = CString::new(source_display_title(&source))
@@ -692,6 +691,10 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut report_display_time = Duration::ZERO;
     let mut report_display_calls = 0_u64;
     while running {
+        #[cfg(target_os = "macos")]
+        if let Some(source) = crate::macos_app::take_source()? {
+            return Ok(Some(source));
+        }
         let mut presented_this_iteration = false;
         let mut event: ffi::UpEvent = unsafe { std::mem::zeroed() };
         while unsafe { ffi::up_platform_poll_event(&mut event) } != 0 {
@@ -1541,7 +1544,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]

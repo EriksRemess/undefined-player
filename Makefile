@@ -1,5 +1,6 @@
 PREFIX ?= $(HOME)/.local
 CARGO ?= cargo
+CODESIGN_IDENTITY ?= -
 
 BINARY := undefined-player
 DESKTOP_FILE := data/undefined-player.desktop
@@ -7,14 +8,35 @@ VERSION := $(shell awk -F'"' '/^version = / { print $$2; exit }' Cargo.toml)
 ARCH ?= $(shell uname -m)
 TARBALL_NAME := $(BINARY)-$(VERSION)-linux-$(ARCH)
 TARBALL_BINARY ?= target/release/$(BINARY)
+DMG_NAME := $(BINARY)-$(VERSION)-macos-$(ARCH).dmg
 HOST_OS := $(shell uname -s)
 
-.PHONY: all build check check-native check-metal check-upscale deb tarball install uninstall clean
+.PHONY: all build check check-native check-metal check-upscale app dmg deb tarball install uninstall clean
 
 all: build
 
 build:
 	$(CARGO) build --release
+
+app: build
+	python3 packaging/macos/bundle.py --identity "$(CODESIGN_IDENTITY)"
+
+dmg: app
+	@set -eu; \
+	stage=$$(mktemp -d target/dist/dmg.XXXXXX); \
+	trap 'rm -rf "$$stage"' EXIT HUP INT TERM; \
+	mkdir "$$stage/root"; \
+	ditto "target/dist/Undefined Player.app" "$$stage/root/Undefined Player.app"; \
+	ln -s /Applications "$$stage/root/Applications"; \
+	hdiutil create -volname "Undefined Player" -srcfolder "$$stage/root" \
+		-fs HFS+ -format UDZO "$$stage/image.dmg"; \
+	hdiutil verify "$$stage/image.dmg"; \
+	if [ "$(CODESIGN_IDENTITY)" != "-" ]; then \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" --timestamp "$$stage/image.dmg"; \
+		codesign --verify --strict "$$stage/image.dmg"; \
+	fi; \
+	mv -f "$$stage/image.dmg" "target/dist/$(DMG_NAME)"; \
+	echo "Built target/dist/$(DMG_NAME)"
 
 check: check-native
 	$(CARGO) test

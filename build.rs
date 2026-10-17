@@ -267,6 +267,7 @@ fn main() {
 // The macOS path needs neither Wayland protocols, libplacebo nor D-Bus/GIO.
 fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Path>) {
     let sources = [
+        "native/app_macos.m",
         "native/video_renderer_macos.c",
         "native/video_color_macos.m",
         "native/video_upscaler_macos.m",
@@ -276,6 +277,7 @@ fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Pat
         "native/platform.c",
     ];
     for header in [
+        "native/app_macos.h",
         "native/video_renderer.h",
         "native/video_color_macos.h",
         "native/video_upscaler_macos.h",

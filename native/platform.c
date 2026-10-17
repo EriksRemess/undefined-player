@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
 #include "window_shape.h"
+#include "app_macos.h"
 #endif
 
 #include <stdlib.h>
@@ -150,13 +151,18 @@ int up_platform_init(void)
     // temporarily. Desktop fullscreen keeps their physical size stable.
     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
 #endif
-    return SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+    const bool initialized = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+#ifdef __APPLE__
+    if (initialized) up_mac_app_init();
+#endif
+    return initialized;
 }
 
 void up_platform_quit(void)
 {
 #ifdef __APPLE__
     cancel_window_drag();
+    up_mac_app_quit();
 #endif
     SDL_Quit();
 }
