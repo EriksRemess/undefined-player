@@ -2,6 +2,9 @@
 #include "input_geometry.h"
 
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include "window_shape.h"
+#endif
 
 #include <stdlib.h>
 
@@ -51,6 +54,7 @@ static enum UpKey translate_key(SDL_Keycode key)
     case SDLK_BACKSPACE: return UP_KEY_BACKSPACE;
     case SDLK_Y: return UP_KEY_Y;
     case SDLK_N: return UP_KEY_N;
+    case SDLK_U: return UP_KEY_U;
     default:
         return UP_KEY_OTHER;
     }
@@ -64,8 +68,9 @@ static SDL_HitTestResult resize_hit_test(SDL_Window *window,
     if (!SDL_GetWindowSize(window, &width, &height) ||
         !SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height))
         return SDL_HITTEST_NORMAL;
-    switch (up_input_hit_test_rounded(point->x, point->y, width, height, pixel_width, pixel_height,
-            SDL_GetFloatProperty(SDL_GetWindowProperties(window), UP_CORNER_RADIUS_PROPERTY, 0.0f))) {
+    const uint32_t hit = up_input_hit_test_rounded(point->x, point->y, width, height, pixel_width, pixel_height,
+            SDL_GetFloatProperty(SDL_GetWindowProperties(window), UP_CORNER_RADIUS_PROPERTY, 0.0f));
+    switch (hit) {
     case UP_HIT_TOP_LEFT: return SDL_HITTEST_RESIZE_TOPLEFT;
     case UP_HIT_TOP_RIGHT: return SDL_HITTEST_RESIZE_TOPRIGHT;
     case UP_HIT_BOTTOM_LEFT: return SDL_HITTEST_RESIZE_BOTTOMLEFT;
@@ -78,19 +83,93 @@ static SDL_HitTestResult resize_hit_test(SDL_Window *window,
     }
 }
 
+#ifdef __APPLE__
+static struct {
+    SDL_WindowID window;
+    float mouse_x, mouse_y;
+    int window_x, window_y;
+    bool moving;
+} window_drag;
+
+static void cancel_window_drag(void)
+{
+    if (window_drag.window) SDL_CaptureMouse(false);
+    window_drag.window = 0;
+    window_drag.moving = false;
+}
+
+static void update_window_drag(const SDL_Event *event)
+{
+    // Cocoa consumes both clicks and mouse motion in SDL_HITTEST_DRAGGABLE
+    // regions. Move the borderless window from ordinary SDL mouse events so
+    // double-click fullscreen, hover controls and cursor activity still work.
+    if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && event->button.button == SDL_BUTTON_LEFT) {
+        cancel_window_drag();
+        SDL_Window *window = SDL_GetWindowFromID(event->button.windowID);
+        int w, h, pw, ph;
+        if (!window || event->button.clicks != 1 ||
+            (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)) ||
+            !SDL_GetWindowSize(window, &w, &h) || !SDL_GetWindowSizeInPixels(window, &pw, &ph) ||
+            up_input_hit_test_rounded(event->button.x, event->button.y, w, h, pw, ph,
+                SDL_GetFloatProperty(SDL_GetWindowProperties(window), UP_CORNER_RADIUS_PROPERTY, 0)) != UP_HIT_CONTENT)
+            return;
+        if (!SDL_GetWindowPosition(window, &window_drag.window_x, &window_drag.window_y)) return;
+        // Anchor to the press event, not the current pointer position: an
+        // entire quick drag may already be queued by the time SDL polls it.
+        window_drag.mouse_x = window_drag.window_x + event->button.x;
+        window_drag.mouse_y = window_drag.window_y + event->button.y;
+        window_drag.window = event->button.windowID;
+        SDL_CaptureMouse(true);
+    } else if (event->type == SDL_EVENT_MOUSE_MOTION && event->motion.windowID == window_drag.window) {
+        SDL_Window *window = SDL_GetWindowFromID(window_drag.window);
+        float x, y;
+        SDL_GetGlobalMouseState(&x, &y);
+        if (!window || !(event->motion.state & SDL_BUTTON_LMASK) ||
+            (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))) {
+            cancel_window_drag();
+            return;
+        }
+        const float dx = x - window_drag.mouse_x, dy = y - window_drag.mouse_y;
+        window_drag.moving |= hypotf(dx, dy) >= 4;
+        if (window_drag.moving)
+            SDL_SetWindowPosition(window, window_drag.window_x + (int) lroundf(dx),
+                                  window_drag.window_y + (int) lroundf(dy));
+    } else if ((event->type == SDL_EVENT_MOUSE_BUTTON_UP && event->button.button == SDL_BUTTON_LEFT) ||
+               (event->type == SDL_EVENT_WINDOW_FOCUS_LOST && event->window.windowID == window_drag.window) ||
+               event->type == SDL_EVENT_QUIT) {
+        cancel_window_drag();
+    }
+}
+#endif
+
 int up_platform_init(void)
 {
+#ifdef __APPLE__
+    // Cocoa caches this during SDL's video initialization. Native fullscreen
+    // Spaces scale a snapshot of the window, enlarging pixel-font controls
+    // temporarily. Desktop fullscreen keeps their physical size stable.
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
     return SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
 }
 
 void up_platform_quit(void)
 {
+#ifdef __APPLE__
+    cancel_window_drag();
+#endif
     SDL_Quit();
 }
 
 const char *up_platform_error(void)
 {
     return SDL_GetError();
+}
+
+const char *up_platform_audio_driver(void)
+{
+    const char *driver = SDL_GetCurrentAudioDriver();
+    return driver ? driver : "unknown";
 }
 
 void up_platform_delay(uint32_t milliseconds)
@@ -103,6 +182,9 @@ int up_platform_poll_event(UpEvent *event)
     SDL_Event native;
     if (!SDL_PollEvent(&native))
         return 0;
+#ifdef __APPLE__
+    update_window_drag(&native);
+#endif
     *event = (UpEvent) {0};
     switch (native.type) {
     case SDL_EVENT_QUIT:
@@ -113,6 +195,7 @@ int up_platform_poll_event(UpEvent *event)
         break;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+    case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
         event->type = UP_EVENT_WINDOW_RESIZED;
         break;
     case SDL_EVENT_WINDOW_EXPOSED:
@@ -147,6 +230,9 @@ int up_platform_poll_event(UpEvent *event)
         event->repeat = native.key.repeat;
         if (native.key.mod & SDL_KMOD_SHIFT) event->modifiers |= UP_MOD_SHIFT;
         if (native.key.mod & SDL_KMOD_CTRL) event->modifiers |= UP_MOD_CTRL;
+#ifdef __APPLE__
+        if (native.key.mod & SDL_KMOD_GUI) event->modifiers |= UP_MOD_CTRL;
+#endif
         break;
     case SDL_EVENT_TEXT_INPUT:
         event->type = UP_EVENT_TEXT_INPUT;
@@ -186,10 +272,14 @@ void up_platform_start_text_input(int started)
 
 UpWindow *up_window_create(const char *title, int width, int height)
 {
+#ifdef __APPLE__
+    const SDL_WindowFlags backend = SDL_WINDOW_METAL | SDL_WINDOW_TRANSPARENT;
+#else
+    const SDL_WindowFlags backend = SDL_WINDOW_VULKAN | SDL_WINDOW_TRANSPARENT;
+#endif
     SDL_Window *window = SDL_CreateWindow(
-        title, width, height,
-        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
-        SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT);
+        title, width, height, backend | SDL_WINDOW_RESIZABLE |
+        SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS);
     if (!window)
         return NULL;
     if (!SDL_SetWindowHitTest(window, resize_hit_test, NULL)) {
@@ -201,6 +291,9 @@ UpWindow *up_window_create(const char *title, int width, int height)
 
 void up_window_destroy(UpWindow *window)
 {
+#ifdef __APPLE__
+    if (window_drag.window == SDL_GetWindowID(WINDOW(window))) cancel_window_drag();
+#endif
     SDL_DestroyWindow(WINDOW(window));
 }
 
@@ -236,6 +329,26 @@ float up_window_corner_radius(UpWindow *window)
     return SDL_GetFloatProperty(SDL_GetWindowProperties(WINDOW(window)),
                                 UP_CORNER_RADIUS_PROPERTY, 0.0f);
 }
+
+#ifdef __APPLE__
+int up_window_set_corner_radius(UpWindow *window, float radius)
+{
+    if (!isfinite(radius) || radius < 0)
+        return SDL_SetError("invalid window corner radius");
+    SDL_Window *native = WINDOW(window);
+    int width, height;
+    if (!SDL_GetWindowSizeInPixels(native, &width, &height))
+        return 0;
+    SDL_Surface *shape = radius > 0 ? up_corner_shape(width, height, radius) : NULL;
+    if (radius > 0 && !shape)
+        return 0;
+    const bool success = SDL_SetWindowShape(native, shape);
+    SDL_DestroySurface(shape);
+    if (!success)
+        return 0;
+    return SDL_SetFloatProperty(SDL_GetWindowProperties(native), UP_CORNER_RADIUS_PROPERTY, radius);
+}
+#endif
 
 UpAudioStream *up_audio_stream_create(int rate, int channels)
 {

@@ -21,6 +21,7 @@ mod language;
 mod luma;
 mod media;
 mod metadata;
+#[cfg_attr(target_os = "macos", path = "mpris_macos.rs")]
 mod mpris;
 mod overlay;
 mod pixel_font;

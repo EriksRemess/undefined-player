@@ -1,8 +1,10 @@
 # undefined-player
 
-A focused Wayland video player. It uses FFmpeg 8 or newer, decodes supported
-codecs directly with Vulkan Video when available, renders with libplacebo to a
-Vulkan Wayland swapchain, and plays audio through PipeWire.
+A focused FFmpeg video player for Linux/Wayland, with an initial macOS port.
+On Linux, it decodes supported codecs directly with Vulkan Video when available,
+renders with libplacebo to a Vulkan Wayland swapchain, and plays audio through
+PipeWire. The macOS backend uses VideoToolbox decoding, Metal HDR presentation,
+native audio through SDL3, and software decoding for unsupported codecs.
 
 ## Installation
 
@@ -27,15 +29,43 @@ cd undefined-player-*-linux-*
 
 ## Runtime requirements
 
-Running requires a Wayland session, the Vulkan loader and a working Vulkan
+On Linux, running requires a Wayland session, the Vulkan loader and a working Vulkan
 driver, SDL3 with its Wayland and PipeWire backends, libplacebo, the Wayland
 client library, Pango/Cairo, GIO, and compatible FFmpeg 8 or newer shared
 libraries. Vulkan Video support enables hardware decoding; unsupported codecs
 fall back to software decoding but still use Vulkan for presentation.
 
-Wayland and PipeWire are the only supported display and audio backends.
+Wayland and PipeWire are the supported Linux display and audio backends.
 The Debian package declares its shared-library dependencies; binary tarball
 users must provide compatible libraries and their GPU's Vulkan driver.
+
+## macOS preview
+
+Build from source with Rust 1.93.1 or newer, Apple's command-line developer
+tools, and Homebrew dependencies:
+
+```sh
+brew install pkgconf sdl3 ffmpeg pango
+cargo build --release --locked
+target/release/undefined-player ~/Movies/example.mp4
+```
+
+The macOS backend supports VideoToolbox hardware decoding (H.264, HEVC Main/Main10,
+VP9 and AV1, subject to the Mac's capabilities), with software fallback for
+unsupported codecs/profiles. PQ/HDR10 and HLG are converted on Metal into
+floating-point, extended-linear RGB. HDR displays use EDR headroom; highlights
+are tone-mapped to the available headroom, including SDR displays. HDR metadata
+sets the content peak, with a 1000-nit default when absent. Normal NV12/P010
+hardware surfaces stay on the GPU through presentation.
+
+Audio, seeking, fullscreen, text/bitmap subtitles, overlays, crop/zoom,
+rounded transparent corners, spatial deinterlacing, and native Now Playing/media
+keys are supported. On macOS 26+, supported low-resolution SDR videos can use
+Apple ML 2× upscaling during playback; `U` toggles it for comparison. 4K and HDR
+sources bypass the upscaler. Dolby Vision dynamic metadata, temporal deinterlacing, and
+distributable app packaging are pending. The binary uses the installed Homebrew
+libraries.
+`Command+Shift+P` or `Ctrl+Shift+P` opens the command palette.
 
 ## Quick start
 

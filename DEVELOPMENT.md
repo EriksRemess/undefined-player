@@ -6,6 +6,162 @@ dependency setups for undefined-player. See [README.md](README.md) for installat
 
 ## Build requirements
 
+### macOS
+
+Install Apple's command-line developer tools and Rust 1.93.1 or newer, then:
+
+```sh
+brew install pkgconf sdl3 ffmpeg pango
+cargo build --release --locked
+target/release/undefined-player ~/Movies/example.mp4
+make check
+```
+
+The macOS build selects `native/video_renderer_macos.c` and creates an optional
+FFmpeg VideoToolbox device. H.264, HEVC Main/Main10, VP9 and AV1 use hardware
+decoding when supported. Apple supplemental decoders are registered before
+querying support; unavailable codecs/profiles and failed startup decoding
+fall back to software. SDL3 provides native windows, input, Retina backing sizes, and
+CoreAudio. Text masks and subtitle wrapping retain Pango/Cairo. No Wayland,
+Vulkan, libplacebo, or D-Bus/GIO development packages are required on macOS.
+
+`native/video_color_macos.m` maps NV12/P010 hardware buffers directly into Metal.
+The embedded Metal shader decodes PQ (ST 2084) and HLG (BT.2100) and converts
+BT.2020/P3 primaries to extended-linear BT.709/scRGB. Hardware NV12/P010 surfaces
+are sampled directly in the final video drawing pass, including crop, rotation
+and spatial bob. This avoids an intermediate RGBA16Float IOSurface and a CPU
+wait for a separate compute queue on every frame.
+SDR reference white is 203 nits for HDR. MaxCLL takes precedence over mastering
+display peak; absent/invalid metadata defaults to 1000 nits. The HLG OOTF uses
+the reference peak and system gamma. SDL's linear Metal swapchain enables EDR
+and content is tone-mapped to the current display headroom, including SDR output.
+The direct drawing shader uses the same headroom curve as SDL. Metal fences and
+a completion handler retain the decoded frame and CoreVideo texture wrappers
+until the drawing pass finishes; decoder pools cannot recycle surfaces early.
+Software HDR and uncommon hardware surfaces retain the compute conversion path,
+whose resolution follows crop/zoom and drawable size and caches paused frames.
+Autocrop locks the CPU-addressable decoder luma plane read-only and samples it
+without downloading a full frame. Metal vsync presentation does not add another
+fixed sleep. Desktop fullscreen avoids macOS Spaces' scaled-window animation,
+which otherwise makes overlay text temporarily grow and snap back.
+
+The decode worker publishes after an 8 ms packet-work budget rather than waiting
+for a complete frame batch. Decoded-frame capacity follows a 256 MiB estimate
+(four bytes per source pixel), bounded to 4–24 retained frames across handoff
+queues; this prevents dozens of 8K surfaces accumulating under backpressure.
+The minimum preserves the current frame, a temporal reference and presentation
+lead. A single packet may exceed the work budget, and codec reference pictures
+are additional to the queue estimate.
+Seek completion counts both the decoder queue and frames handed to playback;
+otherwise a delayed audio track can deadlock a seek while the shared video
+capacity is full. The worker delayed-audio regression covers this handoff.
+
+Demuxing prioritizes a 250 ms audio lead even when decoded video is blocked.
+Compressed video is retained separately (at most 256 packets or 32 MiB, plus
+one packet) and released on seeks. If video falls more than 250 ms behind the
+audio clock, the decoder skips non-keyframes until a current keyframe restores
+its reference pictures. This preserves continuous audio, but a source with long
+GOPs can show pronounced video freezes when decode throughput is insufficient.
+`--perf` also reports queued audio and observed stream underruns.
+
+Local validation reached 4K60 AV1 HDR without reported drops. An 8K60 10-bit AV1
+sample reached roughly 32–36 displayed fps on the A18 Pro test machine; FFmpeg's
+VideoToolbox-only benchmark, with no CPU readback or rendering, also reached
+about 35 fps. With Low Power Mode confirmed off, a direct native VideoToolbox
+benchmark reached about 43–44 fps using asynchronous submission, including
+lossless compressed ten-bit output. This is a diagnostic path, not the player's
+current decoder. Reduced-resolution and reduced-frame-delivery properties were
+unsupported on this decoder. Suppressing alternate outputs did not improve
+input throughput. Consequently this sample still does not play smoothly at
+native 8K60; keyframe catch-up preserves sound but cannot supply missing decode
+capacity. A separately encoded 4K60 HDR copy is a lower-resolution alternative.
+The twelve-second Main10 HEVC/PQ test copy sustained 60 fps with no steady-state
+presentation drops; the user confirmed smooth video and continuous audio.
+Hardware decoding support does not guarantee real-time throughput at every
+resolution, frame rate and codec profile.
+
+Software HDR and uncommon hardware layouts use a ten-bit P010 conversion/upload;
+software SDR keeps the simpler libswscale RGBA8 path. The initial gamut support
+targets BT.709, BT.2020 and Display P3 with non-constant-luminance YUV. Dolby
+Vision dynamic metadata, temporal deinterlacing, and signed app bundles are
+pending. `make install` installs the CLI binary; it still depends on the
+Homebrew libraries.
+Config and resume files currently retain the same XDG paths as Linux.
+
+`mpris_macos.rs` replaces the Linux transport with native MediaPlayer framework
+integration in `native/media_controls_macos.m`. MPRemoteCommandCenter handlers
+queue bounded commands for the existing playback loop, including play/pause,
+stop, chapter navigation, interval seeking and absolute positioning. Without
+an available chapter, the previous/next keys seek ten seconds on seekable media.
+MPNowPlayingInfoCenter publishes metadata, optional artwork, elapsed time and
+playback state. Position updates use the system's playback-rate extrapolation
+instead of publishing a new metadata dictionary every frame. State changes and
+seeks re-anchor the elapsed time. Dropping the session unregisters its handlers
+and clears Now Playing metadata. `make check-native` checks registration,
+command routing, queue bounds, state transitions and cleanup. Hardware play/pause
+was also confirmed using the running app's native media-key handler.
+
+`native/video_upscaler_macos.m` provides optional live 2× enhancement using
+`VTLowLatencySuperResolutionScalerConfiguration` on macOS 26+. A background job
+starts the ML session and requests a redraw when ready. The main renderer
+continues drawing ordinary frames during warm-up. Eligible software YUV frames
+are uploaded as limited-range NV12; compatible decoder NV12 surfaces can be
+used directly. Pools follow the processor's buffer requirements. Output is
+cached for paused redraws, with AVFrame-owned pixel buffers retained through
+Metal completion.
+
+Before initializing the platform, `up_av_set_debug` configures Foundation's
+`CFLOG_FORCE_DISABLE_STDERR` default on macOS. This prevents Espresso's repeated
+`Resolved compile flags` NSLog messages from flooding the terminal. `--debug`
+leaves framework console diagnostics enabled; explicit environment settings are
+respected. Player errors still print directly to stderr.
+
+Rendering keeps the original frame's crop, SAR, rotation and subtitle geometry;
+only video sampling coordinates are scaled. DVD YUV matrix inference happens
+before increasing dimensions, so PAL/NTSC video does not become BT.709 merely
+because its enhanced frame is HD. U and the palette toggle Auto/Off. HDR,
+interlaced/unsupported formats, sources above 1920×1080, shrinking windows and
+the existing integer-scaling path bypass enhancement. `make check-upscale`
+checks actual ML processing, metadata/aspect retention, cache/toggle and buffer
+lifetime on supported hardware. Policy tests run in `make check-native`;
+existing HDR checks remain in `make check-metal`. Local Taken.mkv playback
+sustained 25 fps without steady-state drops or audio underruns. The isolated
+720×576 → 1440×1152 test measured about 1.2 ms/frame over 50 frames on the A18 Pro;
+the user preferred the enhanced picture.
+
+ML input compatibility includes declared extended pixels, not just row stride.
+For Puggo Grande's 696×480 H.264 video, the decoder provides stride 704 with zero
+declared right padding; Apple's configuration requires eight extended pixels.
+Incompatible low-resolution decoder surfaces are copied into the processor's
+pool and their edge pixels replicated. Compatible buffers keep the direct path.
+The 696×480 → 1392×960 regression checks actual ML processing, unmodified decoder
+storage, replicated padding and retained pixel-aspect/color metadata.
+
+macOS windows use SDL's transparent Metal buffer and window alpha shape for
+rounded corners. A cached, antialiased mask is shared by presentation and mouse
+hit testing, while control hit regions use the same radius in physical pixels.
+The mask is rebuilt on size, scale, or radius changes and removed in fullscreen
+or maximized mode. It multiplies the completed floating-point HDR composition
+without converting the interior to an SDR surface.
+Content dragging uses ordinary SDL mouse events with a small movement threshold.
+Cocoa's `SDL_HITTEST_DRAGGABLE` consumes content mouse motion and button events,
+which prevents double-click fullscreen and hover/cursor activity from reaching
+playback. Resize, close, scrubber, and fullscreen regions cannot start a move.
+
+On macOS, `make check-native` uses an SDL software surface to test conversion,
+alpha composition, crop/aspect geometry, rotation, Unicode subtitles, texture
+revisions, and spatial bob filtering without a desktop or GPU. Native Metal
+validation is separate: `make check-metal` requires a desktop/Metal GPU and
+checks actual PQ limited/full-range luminance, HLG reference white, conversion
+caching/downscaling and SDR highlight mapping using floating-point render-target
+readback. Independent black/white fields verify bob reconstruction at half,
+native, and double size so scaling cannot blend the discarded field back in.
+Also smoke-test pause, seek, subtitles, fullscreen, resizing, and
+`Command+Shift+P` with local SDR and HDR files. Startup diagnostics distinguish
+VideoToolbox from software decoding and report EDR versus SDR tone mapping.
+
+### Linux
+
 - Rust 1.93.1 or newer and Cargo (the crate uses Rust 2024 edition)
 - a C compiler, `ar`, and `pkg-config`
 - `wayland-scanner` and the stable Wayland protocol definitions
@@ -219,8 +375,8 @@ cargo build --release --locked
 git diff --check
 ```
 
-`make check` runs the native renderer logic tests, Rust tests, strict Clippy checks,
-and desktop-file validation. The Rust overlay tests cover printable symbols,
+`make check` runs the native renderer tests, Rust tests, strict Clippy checks,
+and Linux desktop-file validation. The Rust overlay tests cover printable symbols,
 Unicode accents, mask bounds, title truncation, caching, and control placement.
 Geometry and MPRIS state tests run without a desktop or D-Bus session.
 The text rendering tests run on the CPU and need the

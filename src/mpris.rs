@@ -8,28 +8,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{self, NonNull};
 
+include!("mpris_types.rs");
+
 const TRACK_ID: &CStr = c"/com/github/undefined_player/track/1";
 const COMMAND_CAPACITY: usize = 16;
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum MprisCommand {
-    Quit,
-    Play,
-    Pause,
-    PlayPause,
-    Stop,
-    Seek(i64),
-    SetPosition(i64),
-    NextChapter,
-    PreviousChapter,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlaybackStatus {
-    Playing,
-    Paused,
-    Stopped,
-}
 impl PlaybackStatus {
     fn name(self) -> &'static CStr {
         match self {
@@ -331,14 +314,6 @@ impl Drop for Mpris {
     fn drop(&mut self) {
         // Unregister callbacks before Rust drops their state and string storage.
         unsafe { ffi::up_mpris_destroy(self.native.as_ptr()) };
-    }
-}
-
-pub(crate) fn seconds_to_microseconds(seconds: f64) -> i64 {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        0
-    } else {
-        (seconds * 1_000_000.0).min(i64::MAX as f64) as i64
     }
 }
 

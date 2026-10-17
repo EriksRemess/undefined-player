@@ -10,7 +10,8 @@ Open a video from the command line:
 undefined-player ~/Videos/example.mp4
 ```
 
-FFmpeg diagnostics are hidden by default. Add `--debug` to show them:
+FFmpeg diagnostics and macOS framework console chatter are hidden by default.
+Add `--debug` to show them:
 
 ```sh
 undefined-player --debug ~/Videos/example.mp4
@@ -45,6 +46,17 @@ quality fixed during playback.
 
 ## Keyboard shortcuts
 
+On macOS, `Command+Shift+P` also opens the command palette. The macOS preview
+supports VideoToolbox decoding and Metal SDR/PQ/HLG presentation;
+see [the macOS preview notes](README.md#macos-preview) for remaining work.
+
+The Mac keyboard's media keys also work through native Now Playing integration,
+including while another app has focus. Play/pause toggles playback. Previous
+and next navigate available chapters, falling back to a 10-second backward or
+forward seek for seekable videos. macOS Now Playing receives the title, artist,
+available cover artwork, duration, playback position, and pause/play state;
+its playback and seeking commands control the same player session.
+
 Playback starts immediately unless a saved position requires a resume choice.
 During playback, the focused video window accepts:
 
@@ -63,6 +75,9 @@ During playback, the focused video window accepts:
 - `J` — switch to the next embedded subtitle track
 - `Q` — quit
 - `Ctrl+Shift+P` — open the command palette
+
+On macOS, `U` toggles automatic Apple ML upscaling. The same action is available
+as **Toggle Apple ML upscaling** in the command palette.
 
 ## Desktop interaction
 
@@ -107,6 +122,25 @@ and falls back to the flags when analysis is unavailable. Progressive hardware
 video keeps its fast path without readback. Press `D` to cycle Auto, On, and Off;
 On assumes top-field-first when the frame has no interlacing flag. Changes also
 apply while paused. Filtering runs on the GPU at the source frame rate.
+
+## Apple ML video upscaling (macOS)
+
+On macOS 26 or later, automatic upscaling uses VideoToolbox's low-latency
+super-resolution processor for supported progressive, 8-bit SDR video when
+the window is larger than the source. The initial mode uses 2× scaling where
+Apple's runtime reports support. For example, a 720×576 PAL DVD becomes
+1440×1152 while retaining its anamorphic pixel aspect ratio and 16:9 display
+shape. MPEG-2 can still use software decoding; the enhancement stage uses
+Apple's ML processor.
+
+Press `U` to compare automatic upscaling with the original resolution, including
+while paused. `I` shows the upscaler status alongside deinterlacing and zoom;
+the source resolution remains listed separately. Model startup runs in the
+background while ordinary frames continue playing. Unsupported formats,
+interlaced pictures, HDR, and sources larger than 1920×1080 bypass the effect.
+Small sources using the player's integer-scaling policy retain that policy.
+The effect also bypasses processing when the video is being reduced in size.
+Upscaling runs during playback and does not create or modify a video file.
 
 ## Chapters and media metadata
 

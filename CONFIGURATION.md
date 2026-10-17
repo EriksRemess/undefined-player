@@ -31,7 +31,8 @@ remain square.
 Transparent corners let clicks reach the windows beneath. Controls and their
 clickable areas are inset together to stay inside the rounded outline.
 If the Vulkan surface cannot composite transparent corners, the player warns
-and keeps square corners.
+and keeps square corners. On macOS, SDL's Metal window shape applies the same
+alpha mask to the rendered window and its mouse input area.
 
 ## Preferred audio language
 

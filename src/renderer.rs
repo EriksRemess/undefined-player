@@ -1,6 +1,6 @@
 use crate::decoder::VideoFrame;
 use crate::subtitles::{SubtitleContent, SubtitleCue};
-use crate::window::{WaylandInput, Window};
+use crate::window::{Window, WindowShape};
 use crate::{Result, ffi, overlay};
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
@@ -11,6 +11,8 @@ pub(crate) struct Renderer<'window> {
     autocrop: crate::autocrop::AutoCrop,
     deinterlace: crate::deinterlace::Mode,
     zoom: crate::zoom::Zoom,
+    #[cfg(target_os = "macos")]
+    upscaling: bool,
     corner_radius: u16,
     corner_pixels: f32,
     corner_disabled: bool,
@@ -39,6 +41,7 @@ fn processing_details(
     details: &str,
     deinterlace: &str,
     zoom: &str,
+    upscale: Option<&str>,
     crop: Option<&ffi::UpVideoCrop>,
 ) -> String {
     let mut text = String::new();
@@ -62,6 +65,10 @@ fn processing_details(
             text.push_str(deinterlace);
             text.push_str("\nZOOM: ");
             text.push_str(zoom);
+            if let Some(upscale) = upscale {
+                text.push_str("\nUPSCALE: ");
+                text.push_str(upscale);
+            }
         }
     }
     text
@@ -71,9 +78,9 @@ impl<'window> Renderer<'window> {
     pub(crate) fn create(window: &'window Window) -> Result<Self> {
         let renderer = unsafe { ffi::up_video_renderer_create(window.as_ptr().cast()) };
         if renderer.is_null() {
-            return Err("out of memory while creating the Vulkan renderer".into());
+            return Err("out of memory while creating the video renderer".into());
         }
-        if unsafe { ffi::up_video_renderer_device(renderer) }.is_null() {
+        if unsafe { ffi::up_video_renderer_ready(renderer) } == 0 {
             let message = unsafe { CStr::from_ptr(ffi::up_video_renderer_error(renderer)) }
                 .to_string_lossy()
                 .into_owned();
@@ -86,6 +93,8 @@ impl<'window> Renderer<'window> {
             autocrop: crate::autocrop::AutoCrop::default(),
             deinterlace: crate::deinterlace::Mode::default(),
             zoom: crate::zoom::Zoom::default(),
+            #[cfg(target_os = "macos")]
+            upscaling: true,
             corner_radius: 0,
             corner_pixels: 0.0,
             corner_disabled: false,
@@ -94,15 +103,16 @@ impl<'window> Renderer<'window> {
         })
     }
 
-    pub(crate) unsafe fn device(&self) -> *mut c_void {
-        unsafe { ffi::up_video_renderer_device(self.context) }
+    pub(crate) unsafe fn device(&self) -> Option<*mut c_void> {
+        ptr::NonNull::new(unsafe { ffi::up_video_renderer_device(self.context) })
+            .map(|p| p.as_ptr())
     }
 
     pub(crate) fn set_corner_radius(&mut self, radius: u16) {
         self.corner_radius = radius;
     }
 
-    pub(crate) fn update_window_shape(&mut self, input: Option<&WaylandInput<'_>>) -> Result<bool> {
+    pub(crate) fn update_window_shape(&mut self, input: Option<&WindowShape<'_>>) -> Result<bool> {
         let (width, height, pw, ph) = self._window.dimensions()?;
         if width <= 0 || height <= 0 || pw <= 0 || ph <= 0 {
             return Ok(false);
@@ -142,6 +152,13 @@ impl<'window> Renderer<'window> {
 
     pub(crate) fn toggle_autocrop(&mut self) -> bool {
         self.autocrop.toggle()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn toggle_upscaling(&mut self) -> bool {
+        self.upscaling = !self.upscaling;
+        unsafe { ffi::up_video_renderer_set_upscaling(self.context, self.upscaling) };
+        self.upscaling
     }
 
     pub(crate) fn toggle_zoom(&mut self) -> bool {
@@ -199,10 +216,24 @@ impl<'window> Renderer<'window> {
             .map_or(c"", |(text, _)| text)
             .to_string_lossy();
         let details = overlays.details.map_or_else(String::new, |details| {
+            #[cfg(target_os = "macos")]
+            let upscale =
+                unsafe { CStr::from_ptr(ffi::up_video_renderer_upscaling_status(self.context)) }
+                    .to_string_lossy();
             processing_details(
                 &details.to_string_lossy(),
                 self.deinterlace.status(field != 0),
                 self.zoom.status(fill),
+                {
+                    #[cfg(target_os = "macos")]
+                    {
+                        Some(upscale.as_ref())
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        None
+                    }
+                },
                 crop.as_ref(),
             )
         });

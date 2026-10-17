@@ -81,7 +81,7 @@ impl Detector {
     pub(crate) fn analyze(&mut self, frame: &VideoFrame) -> Option<i32> {
         // Preserve the fast path for progressive hardware video. Only flagged
         // interlaced hardware frames need readback, on the decode worker.
-        if unsafe { ffi::up_av_frame_is_vulkan(frame.as_ptr()) } != 0
+        if unsafe { ffi::up_av_frame_is_hardware(frame.as_ptr()) } != 0
             && unsafe { ffi::up_av_frame_field(frame.as_ptr()) } == 0
         {
             *self = Self::default();
