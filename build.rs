@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FFMPEG_PACKAGES: &[&str] = &[
@@ -50,6 +50,37 @@ fn pkg_config_path(variable: &str, package: &str) -> PathBuf {
         "pkg-config returned an invalid {variable} for {package}"
     );
     PathBuf::from(&values[0])
+}
+
+fn link_packages(packages: &[&str]) {
+    let arguments = pkg_config("--libs", packages);
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "-framework" {
+            println!(
+                "cargo:rustc-link-lib=framework={}",
+                arguments.next().expect("framework name")
+            );
+        } else if let Some(library) = argument.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib=dylib={library}");
+        } else if let Some(directory) = argument.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={directory}");
+        } else {
+            println!("cargo:rustc-link-arg={argument}");
+        }
+    }
+}
+
+fn link_local_ffmpeg(directory: &Path) {
+    for package in FFMPEG_PACKAGES {
+        let library = package.strip_prefix("lib").expect("FFmpeg library prefix");
+        println!("cargo:rustc-link-lib=dylib={library}");
+    }
+    for package in FFMPEG_PACKAGES {
+        let path = directory.join(package);
+        println!("cargo:rustc-link-search=native={}", path.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
+    }
 }
 
 fn main() {
@@ -227,40 +258,14 @@ fn main() {
     if ffmpeg_dir.is_none() {
         system_packages.extend_from_slice(FFMPEG_PACKAGES);
     }
-    for argument in pkg_config("--libs", &system_packages) {
-        if let Some(library) = argument.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={library}");
-        } else if let Some(directory) = argument.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={directory}");
-        } else {
-            println!("cargo:rustc-link-arg={argument}");
-        }
-    }
-
+    link_packages(&system_packages);
     if let Some(ffmpeg_dir) = ffmpeg_dir {
-        for library in ["avformat", "avcodec", "swresample", "swscale", "avutil"] {
-            println!("cargo:rustc-link-lib=dylib={library}");
-        }
-        for directory in [
-            "libavformat",
-            "libavcodec",
-            "libswresample",
-            "libswscale",
-            "libavutil",
-        ] {
-            let path = ffmpeg_dir.join(directory);
-            println!("cargo:rustc-link-search=native={}", path.display());
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
-        }
+        link_local_ffmpeg(&ffmpeg_dir);
     }
 }
 
 // The macOS path needs neither Wayland protocols, libplacebo nor D-Bus/GIO.
-fn build_macos(
-    out_dir: &std::path::Path,
-    ffmpeg_cflags: &[String],
-    ffmpeg_dir: Option<&std::path::Path>,
-) {
+fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Path>) {
     let sources = [
         "native/video_renderer_macos.c",
         "native/video_color_macos.m",
@@ -300,7 +305,7 @@ fn build_macos(
     for source in sources {
         println!("cargo:rerun-if-changed={source}");
         let object = out_dir
-            .join(std::path::Path::new(source).file_stem().unwrap())
+            .join(Path::new(source).file_stem().unwrap())
             .with_extension("o");
         let mut cc = Command::new("cc");
         cc.args(["-std=c11", "-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
@@ -341,28 +346,8 @@ fn build_macos(
     if ffmpeg_dir.is_none() {
         packages.extend_from_slice(FFMPEG_PACKAGES);
     }
-    let libraries = pkg_config("--libs", &packages);
-    let mut libraries = libraries.iter();
-    while let Some(argument) = libraries.next() {
-        if argument == "-framework" {
-            println!(
-                "cargo:rustc-link-lib=framework={}",
-                libraries.next().expect("framework name")
-            );
-        } else if let Some(library) = argument.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={library}");
-        } else if let Some(directory) = argument.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={directory}");
-        } else {
-            println!("cargo:rustc-link-arg={argument}");
-        }
-    }
+    link_packages(&packages);
     if let Some(directory) = ffmpeg_dir {
-        for library in ["avformat", "avcodec", "swresample", "swscale", "avutil"] {
-            println!("cargo:rustc-link-lib=dylib={library}");
-            let path = directory.join(format!("lib{library}"));
-            println!("cargo:rustc-link-search=native={}", path.display());
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
-        }
+        link_local_ffmpeg(directory);
     }
 }

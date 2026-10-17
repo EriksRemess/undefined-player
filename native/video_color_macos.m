@@ -35,6 +35,33 @@ typedef struct ColorParams {
     uint32_t field, padding0, padding1, padding2;
 } ColorParams;
 
+static bool is_hdr(const AVFrame *frame)
+{
+    return frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+}
+
+// Compute conversion and direct drawing must use identical color interpretation.
+static ColorParams color_params(const AVFrame *frame, bool ten, int field, float peak_nits)
+{
+    const bool hdr = is_hdr(frame);
+    uint32_t primaries = frame->color_primaries;
+    if (primaries == AVCOL_PRI_UNSPECIFIED)
+        primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
+    float kr = 0.2126f, kb = 0.0722f;
+    if (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+        (frame->colorspace == AVCOL_SPC_UNSPECIFIED && hdr)) {
+        kr = 0.2627f; kb = 0.0593f;
+    } else if (frame->colorspace == AVCOL_SPC_SMPTE170M || frame->colorspace == AVCOL_SPC_BT470BG ||
+        (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->width < 1280 && frame->height <= 576)) {
+        kr = 0.299f; kb = 0.114f;
+    }
+    return (ColorParams) {
+        .depth = ten ? 10 : 8, .full_range = frame->color_range == AVCOL_RANGE_JPEG,
+        .transfer = frame->color_trc, .primaries = primaries, .kr = kr, .kb = kb,
+        .peak_nits = peak_nits, .white_nits = 203.0f, .field = field,
+    };
+}
+
 static void color_error(char *error, size_t size, const char *message)
 {
     snprintf(error, size, "Metal color conversion: %s", message);
@@ -167,19 +194,7 @@ SDL_Texture *up_metal_color_convert(UpMetalColor *color, SDL_Renderer *renderer,
         if (!y || !uv || !rgba) {
             color_error(error, size, "could not map the GPU planes");
         } else {
-            const bool hdr = frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
-            uint32_t primaries = frame->color_primaries;
-            if (primaries == AVCOL_PRI_UNSPECIFIED) primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
-            float kr = 0.2126f, kb = 0.0722f;
-            if (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
-                (frame->colorspace == AVCOL_SPC_UNSPECIFIED && hdr)) { kr = 0.2627f; kb = 0.0593f; }
-            else if (frame->colorspace == AVCOL_SPC_SMPTE170M || frame->colorspace == AVCOL_SPC_BT470BG ||
-                (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->width < 1280 && frame->height <= 576)) {
-                kr = 0.299f; kb = 0.114f;
-            }
-            ColorParams params = {.depth = ten ? 10 : 8, .full_range = frame->color_range == AVCOL_RANGE_JPEG,
-                .transfer = frame->color_trc, .primaries = primaries, .kr = kr, .kb = kb,
-                .peak_nits = peak_nits, .white_nits = 203.0f, .field = field};
+            const ColorParams params = color_params(frame, ten, field, peak_nits);
             id<MTLCommandBuffer> command = [state.queue commandBuffer];
             id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
             [encoder setComputePipelineState:state.pipeline];
@@ -204,7 +219,7 @@ SDL_Texture *up_metal_color_convert(UpMetalColor *color, SDL_Renderer *renderer,
                 SDL_SetNumberProperty(properties, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, height);
                 SDL_SetFloatProperty(properties, SDL_PROP_TEXTURE_CREATE_SDR_WHITE_POINT_FLOAT, 1.0f);
                 SDL_SetFloatProperty(properties, SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT,
-                                      hdr ? fmaxf(1, peak_nits / 203.0f) : 1.0f);
+                                      is_hdr(frame) ? fmaxf(1, peak_nits / params.white_nits) : 1.0f);
                 SDL_SetPointerProperty(properties, SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER, output);
                 texture = SDL_CreateTextureWithProperties(renderer, properties);
                 SDL_DestroyProperties(properties);
@@ -272,20 +287,8 @@ bool up_metal_color_draw(UpMetalColor *color, SDL_Renderer *renderer,
             CFRelease(y); CFRelease(uv); av_frame_free(&held);
             color_error(error, size, "could not synchronize the decoder surface"); return false;
         }
-        const bool hdr = frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
-        uint32_t primaries = frame->color_primaries;
-        if (primaries == AVCOL_PRI_UNSPECIFIED) primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
-        float kr = 0.2126f, kb = 0.0722f;
-        if (frame->colorspace == AVCOL_SPC_BT2020_NCL || (frame->colorspace == AVCOL_SPC_UNSPECIFIED && hdr)) {
-            kr = 0.2627f; kb = 0.0593f;
-        } else if (frame->colorspace == AVCOL_SPC_SMPTE170M || frame->colorspace == AVCOL_SPC_BT470BG ||
-            (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->width < 1280 && frame->height <= 576)) {
-            kr = 0.299f; kb = 0.114f;
-        }
-        ColorParams params = {.depth = ten ? 10 : 8, .full_range = frame->color_range == AVCOL_RANGE_JPEG,
-            .transfer = frame->color_trc, .primaries = primaries, .kr = kr, .kb = kb,
-            .peak_nits = peak_nits, .white_nits = 203, .field = field};
-        const float input_headroom = hdr ? fmaxf(1, peak_nits / 203) : 1;
+        const ColorParams params = color_params(frame, ten, field, peak_nits);
+        const float input_headroom = is_hdr(frame) ? fmaxf(1, peak_nits / params.white_nits) : 1;
         const float output_headroom = SDL_GetFloatProperty(target ? SDL_GetTextureProperties(target) : SDL_GetRendererProperties(renderer),
             target ? SDL_PROP_TEXTURE_HDR_HEADROOM_FLOAT : SDL_PROP_RENDERER_HDR_HEADROOM_FLOAT, 1);
         const float tone[2] = {output_headroom / (input_headroom * input_headroom),

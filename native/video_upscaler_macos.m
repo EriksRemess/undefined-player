@@ -35,6 +35,13 @@ struct UpVideoUpscaler {
     char status[96];
 };
 
+static void clear_cached_frames(UpVideoUpscaler *upscaler)
+{
+    av_frame_free(&upscaler->source);
+    av_frame_free(&upscaler->base);
+    av_frame_free(&upscaler->scaled);
+}
+
 static bool eligible(const AVFrame *frame, int field)
 {
     if (!frame || field || (frame->flags & AV_FRAME_FLAG_INTERLACED) ||
@@ -70,6 +77,12 @@ static void retire_session(UpVideoUpscaler *upscaler)
     @synchronized(session) { session.active = false; }
     CFRelease(upscaler->session);
     upscaler->session = NULL;
+}
+
+static int session_readiness(UpUpscaleSession *session)
+{
+    if (!session) return 0;
+    @synchronized(session) { return session.readiness; }
 }
 
 static UpUpscaleSession *session_for(UpVideoUpscaler *upscaler, int width, int height)
@@ -234,6 +247,34 @@ static AVFrame *prepare_frame(UpVideoUpscaler *upscaler, UpUpscaleSession *sessi
     return frame;
 }
 
+static AVFrame *scale_frame(UpUpscaleSession *session, const AVFrame *frame, CVPixelBufferRef input)
+{
+    if (@available(macOS 26.0, *)) {
+        CVPixelBufferRef output = NULL;
+        if (CVPixelBufferPoolCreatePixelBuffer(NULL, session.destinationPool, &output) != kCVReturnSuccess)
+            return NULL;
+        CVBufferPropagateAttachments(input, output);
+        const double seconds = frame->pts != AV_NOPTS_VALUE && frame->time_base.num > 0 && frame->time_base.den > 0 ?
+            frame->pts * av_q2d(frame->time_base) : 0;
+        const CMTime time = CMTimeMakeWithSeconds(seconds, 1000000);
+        VTFrameProcessorFrame *source = [[VTFrameProcessorFrame alloc] initWithBuffer:input presentationTimeStamp:time];
+        VTFrameProcessorFrame *destination = [[VTFrameProcessorFrame alloc] initWithBuffer:output presentationTimeStamp:time];
+        VTLowLatencySuperResolutionScalerParameters *parameters = [[VTLowLatencySuperResolutionScalerParameters alloc]
+            initWithSourceFrame:source destinationFrame:destination];
+        NSError *error = nil;
+        AVFrame *scaled = NULL;
+        if ([session.processor processWithParameters:parameters error:&error]) {
+            scaled = wrap_buffer(frame, output, session.factor);
+        } else {
+            fprintf(stderr, "upscale: processing failed, using original frames: %s\n", error.localizedDescription.UTF8String);
+            @synchronized(session) { session.readiness = -1; }
+        }
+        CVPixelBufferRelease(output);
+        return scaled;
+    }
+    return NULL;
+}
+
 UpVideoUpscaler *up_video_upscaler_create(SDL_WindowID window)
 {
     UpVideoUpscaler *upscaler = calloc(1, sizeof(*upscaler));
@@ -249,7 +290,7 @@ const AVFrame *up_video_upscaler_frame(UpVideoUpscaler *upscaler, const AVFrame 
         if (!eligible(frame, field)) {
             snprintf(upscaler->status, sizeof(upscaler->status), "%s", !enabled ? "OFF" :
                 frame->width > 1920 || frame->height > 1080 ? "BYPASS (HIGH RES)" : "BYPASS (FORMAT/INTERLACE)");
-            av_frame_free(&upscaler->source); av_frame_free(&upscaler->base); av_frame_free(&upscaler->scaled);
+            clear_cached_frames(upscaler);
             return frame;
         }
         UpUpscaleSession *session = (__bridge UpUpscaleSession *) upscaler->session;
@@ -258,8 +299,7 @@ const AVFrame *up_video_upscaler_frame(UpVideoUpscaler *upscaler, const AVFrame 
             session = nil;
         }
         if (enabled && larger) session = session_for(upscaler, frame->width, frame->height);
-        int ready = 0;
-        if (session) { @synchronized(session) { ready = session.readiness; } }
+        int ready = session_readiness(session);
         const AVFrame *previous = upscaler->source;
         const bool same = previous && previous->pts == frame->pts && previous->format == frame->format &&
             previous->width == frame->width && previous->height == frame->height &&
@@ -267,35 +307,13 @@ const AVFrame *up_video_upscaler_frame(UpVideoUpscaler *upscaler, const AVFrame 
             previous->color_range == frame->color_range && previous->colorspace == frame->colorspace &&
             previous->color_trc == frame->color_trc && previous->color_primaries == frame->color_primaries;
         if (!same || enabled != upscaler->cached_enabled || larger != upscaler->cached_larger || ready != upscaler->cached_readiness) {
-            av_frame_free(&upscaler->source); av_frame_free(&upscaler->base); av_frame_free(&upscaler->scaled);
+            clear_cached_frames(upscaler);
             upscaler->source = av_frame_clone(frame);
             upscaler->base = prepare_frame(upscaler, session, ready, frame);
             upscaler->cached_enabled = enabled; upscaler->cached_larger = larger; upscaler->cached_readiness = ready;
             if (enabled && larger && ready == 1 && upscaler->base) {
-                if (@available(macOS 26.0, *)) {
-                    CVPixelBufferRef output = NULL;
-                    CVPixelBufferPoolCreatePixelBuffer(NULL, session.destinationPool, &output);
-                    if (output) {
-                        CVPixelBufferRef input = (CVPixelBufferRef) upscaler->base->data[3];
-                        CVBufferPropagateAttachments(input, output);
-                        const double seconds = frame->pts != AV_NOPTS_VALUE && frame->time_base.num > 0 && frame->time_base.den > 0 ?
-                            frame->pts * av_q2d(frame->time_base) : 0;
-                        const CMTime time = CMTimeMakeWithSeconds(seconds, 1000000);
-                        VTFrameProcessorFrame *source = [[VTFrameProcessorFrame alloc] initWithBuffer:input presentationTimeStamp:time];
-                        VTFrameProcessorFrame *destination = [[VTFrameProcessorFrame alloc] initWithBuffer:output presentationTimeStamp:time];
-                        NSError *error = nil;
-                        VTLowLatencySuperResolutionScalerParameters *parameters = [[VTLowLatencySuperResolutionScalerParameters alloc]
-                            initWithSourceFrame:source destinationFrame:destination];
-                        if ([session.processor processWithParameters:parameters error:&error])
-                            upscaler->scaled = wrap_buffer(frame, output, session.factor);
-                        else {
-                            fprintf(stderr, "upscale: processing failed, using original frames: %s\n", error.localizedDescription.UTF8String);
-                            @synchronized(session) { session.readiness = -1; }
-                            ready = -1;
-                        }
-                        CVPixelBufferRelease(output);
-                    }
-                }
+                upscaler->scaled = scale_frame(session, frame, (CVPixelBufferRef) upscaler->base->data[3]);
+                ready = session_readiness(session);
             }
         }
         if (!enabled) snprintf(upscaler->status, sizeof(upscaler->status), "OFF");
@@ -315,7 +333,7 @@ void up_video_upscaler_destroy(UpVideoUpscaler *upscaler)
 {
     if (!upscaler) return;
     retire_session(upscaler);
-    av_frame_free(&upscaler->source); av_frame_free(&upscaler->base); av_frame_free(&upscaler->scaled);
+    clear_cached_frames(upscaler);
     sws_freeContext(upscaler->conversion);
     free(upscaler);
 }
