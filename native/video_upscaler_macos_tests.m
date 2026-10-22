@@ -31,8 +31,8 @@ static void bypass_policy(void)
     assert(up_video_upscaler_frame(upscaler, frame, 0, true, true) == frame);
     assert(!upscaler->session);
     frame->color_trc = AVCOL_TRC_UNSPECIFIED;
-    assert(up_video_upscaler_frame(upscaler, frame, 1, true, true) == frame);
-    assert(!upscaler->session);
+    frame->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+    assert(eligible(frame)); // Selected fields are reconstructed before ML.
     const AVFrame *base = up_video_upscaler_frame(upscaler, frame, 0, false, true);
     assert(base != frame && base->width == 720 && base->height == 576);
     assert(base->colorspace == AVCOL_SPC_SMPTE170M);
@@ -42,6 +42,97 @@ static void bypass_policy(void)
     assert(base->width == 720 && !upscaler->session); // no enhancement when shrinking
     up_video_upscaler_destroy(upscaler);
     av_frame_free(&frame);
+}
+
+static void bob_fields(void)
+{
+    UpVideoUpscaler *upscaler = up_video_upscaler_create(0);
+    AVFrame *picture = dvd_picture();
+    picture->height = 480;
+    AVFrame *base = prepare_frame(upscaler, nil, 0, picture);
+    assert(base);
+    CVPixelBufferRef input = (CVPixelBufferRef) base->data[3];
+    assert(CVPixelBufferLockBaseAddress(input, 0) == kCVReturnSuccess);
+    for (int plane = 0; plane < 2; plane++) {
+        const size_t height = CVPixelBufferGetHeightOfPlane(input, plane);
+        const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(input, plane);
+        uint8_t *pixels = CVPixelBufferGetBaseAddressOfPlane(input, plane);
+        for (size_t y = 0; y < height; y++) memset(pixels + y * stride, y % 2 ? 235 : 16, stride);
+    }
+    CVPixelBufferUnlockBaseAddress(input, 0);
+    UpUpscaleSession *session = [UpUpscaleSession new];
+    session.width = 720; session.height = 480;
+    session.sourcePool = make_pool(@{}, 720, 480);
+    assert(session.sourcePool);
+    for (int field = 1; field <= 2; field++) {
+        CVPixelBufferRef output = bob_buffer(session, input, field);
+        assert(output && output != input);
+        assert(CVPixelBufferLockBaseAddress(output, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess);
+        assert(CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess);
+        for (int plane = 0; plane < 2; plane++) {
+            const size_t height = CVPixelBufferGetHeightOfPlane(output, plane);
+            const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(output, plane);
+            const size_t source_stride = CVPixelBufferGetBytesPerRowOfPlane(input, plane);
+            const uint8_t *pixels = CVPixelBufferGetBaseAddressOfPlane(output, plane);
+            const uint8_t *source = CVPixelBufferGetBaseAddressOfPlane(input, plane);
+            for (size_t y = 0; y < height; y++) {
+                for (int x = 0; x < 720; x++) {
+                    assert(pixels[y * stride + x] == (field == 1 ? 16 : 235));
+                    assert(source[y * source_stride + x] == (y % 2 ? 235 : 16));
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferUnlockBaseAddress(output, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(output);
+    }
+    av_frame_free(&base); av_frame_free(&picture);
+    up_video_upscaler_destroy(upscaler);
+    puts("Upscale bob: both field orders, luma/chroma edges and original surface preservation passed");
+}
+
+static void apple_ml_interlaced_dvd(void)
+{
+    if (@available(macOS 26.0, *)) {
+        if (!VTLowLatencySuperResolutionScalerConfiguration.isSupported ||
+            ![[VTLowLatencySuperResolutionScalerConfiguration supportedScaleFactorsForFrameWidth:720 frameHeight:480] containsObject:@2]) {
+            puts("Apple ML: skipped, 720x480 2x unsupported on this machine");
+            return;
+        }
+        UpVideoUpscaler *upscaler = up_video_upscaler_create(0);
+        AVFrame *frame = dvd_picture();
+        frame->height = 480;
+        frame->sample_aspect_ratio = (AVRational) {853, 720};
+        frame->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        for (int y = 0; y < frame->height; y++)
+            memset(frame->data[0] + y * frame->linesize[0], y % 2 ? 235 : 16, frame->width);
+        for (int field = 1; field <= 2; field++) {
+            const double deadline = NSProcessInfo.processInfo.systemUptime + 15;
+            const AVFrame *scaled;
+            do {
+                scaled = up_video_upscaler_frame(upscaler, frame, field, true, true);
+                if (scaled->width == 1440) break;
+                SDL_Delay(10);
+            } while (NSProcessInfo.processInfo.systemUptime < deadline);
+            assert(scaled->width == 1440 && scaled->height == 960);
+            assert(!(scaled->flags & (AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST)));
+            assert(scaled->sample_aspect_ratio.num == 853 && scaled->sample_aspect_ratio.den == 720);
+            assert(up_video_upscaler_frame(upscaler, frame, field, true, true) == scaled);
+            CVPixelBufferRef buffer = (CVPixelBufferRef) scaled->data[3];
+            assert(CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess);
+            const uint8_t *pixels = CVPixelBufferGetBaseAddressOfPlane(buffer, 0);
+            const int value = pixels[400 * CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) + 600];
+            assert(field == 1 ? value < 50 : value > 200);
+            CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+        }
+        // A paused D toggle must invalidate the selected-field cache.
+        assert(up_video_upscaler_frame(upscaler, frame, 0, true, true)->width == 1440);
+        assert(upscaler->cached_field == 0);
+        assert(frame->flags & AV_FRAME_FLAG_INTERLACED);
+        up_video_upscaler_destroy(upscaler);
+        av_frame_free(&frame);
+        puts("Apple ML: interlaced NTSC DVD -> 1440x960, field changes and SAR passed");
+    }
 }
 
 static void apple_ml_frames(void)
@@ -150,11 +241,13 @@ int main(int argc, char **argv)
             return 0;
         }
         bypass_policy();
+        bob_fields();
         if (argc > 1 && strcmp(argv[1], "--apple-ml") == 0) {
             apple_ml_frames();
             apple_ml_decoder_padding();
+            apple_ml_interlaced_dvd();
         }
     }
-    puts("Upscale policy: 4K/HDR/interlace and shrinking bypass, no model on U off passed");
+    puts("Upscale policy: 4K/HDR and shrinking bypass, no model on U off passed");
     return 0;
 }

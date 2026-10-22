@@ -138,6 +138,11 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
     renderer.set_corner_radius(config.corner_radius);
     let mut media = unsafe { Media::open(&source, renderer.device(), perf_log)? };
     unsafe { media.prefer_initial_audio_language(&config.preferred_audio_language) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        media.try_native_playback(&source, &mut renderer)?
+    };
+    let native_playback = media.is_native();
 
     if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
         if !media.video.uses_hardware {
@@ -182,7 +187,11 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
         eprintln!(
             "audio: track {} selected via {}",
             selected_audio_track + 1,
-            unsafe { CStr::from_ptr(ffi::up_platform_audio_driver()) }.to_string_lossy()
+            if native_playback {
+                "AVFoundation".into()
+            } else {
+                unsafe { CStr::from_ptr(ffi::up_platform_audio_driver()) }.to_string_lossy()
+            }
         );
     }
     let mut video_details = video_info.overlay_text(
@@ -300,6 +309,9 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
     let mut report_fill_time = Duration::ZERO;
     let mut report_display_time = Duration::ZERO;
     let mut report_display_calls = 0_u64;
+    let mut last_video_presented: Option<Instant> = None;
+    let mut report_max_frame_gap = Duration::ZERO;
+    let mut last_native_overlay = Instant::now();
     while running {
         #[cfg(target_os = "macos")]
         if let Some(source) = crate::macos_app::take_source()? {
@@ -635,6 +647,9 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                         Some(Action::ToggleMute) => {
                             let requested = !muted;
                             audio_control.set_muted(requested)?;
+                            if native_playback {
+                                decoder.lock()?.native_mute(requested);
+                            }
                             muted = requested;
                             if let Some(mpris) = &mpris {
                                 mpris.options(muted, looping);
@@ -896,12 +911,13 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
             unsafe { media.sync_audio(playback_time, paused || pending_seek_anchor.is_some())? };
             if !paused
                 && pending_seek_anchor.is_none()
-                && let Some(audio_pts) = media
-                    .audio
-                    .as_ref()
-                    .and_then(|audio| unsafe { audio.active_clock() })
+                && let Some(audio_pts) = unsafe { media.active_clock() }
             {
-                clock.synchronize(audio_pts);
+                if native_playback {
+                    clock.seek(audio_pts);
+                } else {
+                    clock.synchronize(audio_pts);
+                }
                 playback_time = clock.now();
             }
             if video_info_pending
@@ -955,6 +971,9 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
             }
         }
 
+        if paused {
+            last_video_presented = None;
+        }
         if !paused {
             let mut due_frames = 0;
             if video_queue
@@ -1003,6 +1022,13 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
             new_frame_pending = true;
         }
 
+        if native_playback
+            && top_bar.alpha > 0.001
+            && last_native_overlay.elapsed() >= Duration::from_millis(33)
+        {
+            redraw = true;
+            last_native_overlay = Instant::now();
+        }
         let heading_expired = chapter_heading.update(Instant::now());
         if chapter_heading.index().is_some() || heading_expired {
             top_bar.mouse_activity();
@@ -1026,7 +1052,13 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                 // clears while audio plays ahead of the first video frame.
                 .or(resume_background.as_ref())
         {
-            let stats_info = info_visible.then(|| stats.text(video_info.frame_rate));
+            let stats_info = info_visible.then(|| {
+                if native_playback {
+                    c"PLAYBACK: AVFOUNDATION".to_owned()
+                } else {
+                    stats.text(video_info.frame_rate)
+                }
+            });
             let controls_visible = top_bar.alpha > 0.001;
             let persistent_position = (position_notice.text.is_none()
                 && (info_visible || controls_visible))
@@ -1107,6 +1139,12 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                 report_display_calls += 1;
             }
             if new_frame_pending {
+                if perf_log && !paused {
+                    let now = Instant::now();
+                    if let Some(previous) = last_video_presented.replace(now) {
+                        report_max_frame_gap = report_max_frame_gap.max(now - previous);
+                    }
+                }
                 stats.presented();
                 new_frame_pending = false;
             }
@@ -1114,7 +1152,11 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
             presented_this_iteration = true;
         }
 
-        if perf_log && last_perf_report.elapsed() >= Duration::from_secs(2) {
+        if perf_log && native_playback && last_perf_report.elapsed() >= Duration::from_secs(2) {
+            eprintln!("perf: native playback at {:.3} s", playback_time);
+            last_perf_report = Instant::now();
+        }
+        if perf_log && !native_playback && last_perf_report.elapsed() >= Duration::from_secs(2) {
             let elapsed = last_perf_report.elapsed().as_secs_f64();
             let (total_shown, total_dropped) = stats.counts();
             let shown = total_shown - report_shown;
@@ -1128,6 +1170,17 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                 (total_dropped - report_dropped) as f64 / elapsed,
                 fill_ms,
                 display_ms,
+            );
+            let gap = last_video_presented.map_or(report_max_frame_gap, |last| {
+                report_max_frame_gap.max(last.elapsed())
+            });
+            let video_lag = current_video
+                .as_ref()
+                .map_or(0.0, |frame| (playback_time - frame.frame.pts).max(0.0));
+            eprintln!(
+                "perf: {:.0} ms longest frame gap, {:.0} ms video behind",
+                gap.as_secs_f64() * 1000.0,
+                video_lag * 1000.0
             );
             if let Some(media) = decoder.try_lock()?
                 && let Some(audio) = &media.audio
@@ -1146,18 +1199,26 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
             report_fill_time = Duration::ZERO;
             report_display_time = Duration::ZERO;
             report_display_calls = 0;
+            report_max_frame_gap = Duration::ZERO;
         }
 
         let playback_finished = if let Some(media) = decoder.try_lock()? {
-            media.eof
-                && media.video_queue.is_empty()
-                && video_queue.is_empty()
-                && decoder.pending_frames()
-                    == usize::from(current_video.is_some()) + usize::from(previous_video.is_some())
-                && unsafe { media.audio_empty() }
-                && current_video.as_ref().is_none_or(|frame| {
-                    playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)
-                })
+            if native_playback {
+                // AVPlayer owns the final frame. The geometry placeholder may
+                // be timestamped within 100 ms of EOF after a seek.
+                media.eof
+            } else {
+                media.eof
+                    && media.video_queue.is_empty()
+                    && video_queue.is_empty()
+                    && decoder.pending_frames()
+                        == usize::from(current_video.is_some())
+                            + usize::from(previous_video.is_some())
+                    && unsafe { media.audio_empty() }
+                    && current_video.as_ref().is_none_or(|frame| {
+                        playback_time >= frame.frame.pts + frame.frame.duration.max(0.1)
+                    })
+            }
         } else {
             false
         };

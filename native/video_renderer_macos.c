@@ -3,6 +3,7 @@
 #include "video_renderer.h"
 #include "video_color_macos.h"
 #include "video_upscaler_macos.h"
+#include "playback_macos.h"
 
 #include <SDL3/SDL.h>
 #include <libavutil/display.h>
@@ -25,6 +26,7 @@ typedef struct Image {
 } Image;
 
 struct UpVideoRenderer {
+    UpNativePlayback *native;
     SDL_Renderer *renderer;
     SDL_Texture *video;
     struct SwsContext *conversion;
@@ -432,6 +434,13 @@ void *up_video_renderer_device(UpVideoRenderer *renderer)
     return renderer->hw_device;
 }
 
+void *up_video_renderer_native_begin(UpVideoRenderer *renderer, const char *path)
+{
+    if (!renderer->native)
+        renderer->native = up_native_playback_create(renderer->renderer, path);
+    return renderer->native;
+}
+
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
                               void *previous_pointer, void *next_pointer, int field,
                               int width, int height, const UpOverlayFrame *overlay,
@@ -447,6 +456,12 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     renderer->error[0] = '\0';
     if (!frame || frame->width <= 0 || frame->height <= 0)
         return fail(renderer, "invalid video frame");
+    if (renderer->native) {
+        up_native_playback_layout(renderer->native, fill, corner_radius);
+        bool visible = (overlay && overlay->count) || (subtitle_text && *subtitle_text) || subtitle_pixels;
+        up_native_playback_overlay(renderer->native, visible);
+        if (!visible) return 0;
+    }
     const uint32_t rotation = video_rotation(frame);
     SDL_FRect source = video_source_rect(frame, crop);
     if (fill) {
@@ -464,38 +479,42 @@ int up_video_renderer_display(UpVideoRenderer *renderer, void *frame_pointer,
     const float scale = fminf(1, fmaxf(dw / source.w, dh / source.h));
     renderer->render_width = (int) ceilf(frame->width * scale);
     renderer->render_height = (int) ceilf(frame->height * scale);
-    if (!renderer->upscaler)
-        renderer->upscaler = up_video_upscaler_create(SDL_GetWindowID(SDL_GetRenderWindow(renderer->renderer)));
-    const float sar = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0 ?
-        av_q2d(frame->sample_aspect_ratio) : 1;
-    const bool larger = !integer_scale && dw > source.w * sar * 1.05f && dh > source.h * 1.05f;
-    const AVFrame *draw_frame = integer_scale ? frame : up_video_upscaler_frame(renderer->upscaler, frame,
-        field, renderer->upscale_enabled, larger);
-    const bool direct = !integer_scale && up_metal_color_can_draw(draw_frame);
-    if (direct && !renderer->color)
-        renderer->color = up_metal_color_create(renderer->renderer, renderer->error, sizeof(renderer->error));
-    if ((direct && !renderer->color) || (!direct && !upload_video(renderer, frame, field))) {
-        if (!renderer->error[0]) fail(renderer, "could not convert or upload the video frame for Metal");
-        return -1;
-    }
-    if (!SDL_SetRenderDrawColor(renderer->renderer, 0, 0, 0, 255) ||
+    if (!SDL_SetRenderDrawColor(renderer->renderer, 0, 0, 0, renderer->native ? 0 : 255) ||
         !SDL_RenderClear(renderer->renderer))
         return fail(renderer, SDL_GetError());
-    if (direct) {
-        report_hdr(renderer, frame);
-        SDL_FRect draw_source = {source.x * draw_frame->width / frame->width,
-            source.y * draw_frame->height / frame->height, source.w * draw_frame->width / frame->width,
-            source.h * draw_frame->height / frame->height};
-        if (!up_metal_color_draw(renderer->color, renderer->renderer, draw_frame, field, hdr_peak(frame),
-                draw_source, destination, rotation, width, height, renderer->error, sizeof(renderer->error)))
+    if (!renderer->native) {
+        if (!renderer->upscaler)
+            renderer->upscaler = up_video_upscaler_create(SDL_GetWindowID(SDL_GetRenderWindow(renderer->renderer)));
+        const float sar = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0 ?
+            av_q2d(frame->sample_aspect_ratio) : 1;
+        const bool larger = !integer_scale && dw > source.w * sar * 1.05f && dh > source.h * 1.05f;
+        const AVFrame *draw_frame = integer_scale ? frame : up_video_upscaler_frame(renderer->upscaler, frame,
+            field, renderer->upscale_enabled, larger);
+        const bool direct = !integer_scale && up_metal_color_can_draw(draw_frame);
+        if (direct && !renderer->color)
+            renderer->color = up_metal_color_create(renderer->renderer, renderer->error, sizeof(renderer->error));
+        if ((direct && !renderer->color) || (!direct && !upload_video(renderer, frame, field))) {
+            if (!renderer->error[0]) fail(renderer, "could not convert or upload the video frame for Metal");
             return -1;
-    } else {
-        const SDL_FRect sampled_source = {source.x * renderer->video->w / frame->width,
-            source.y * renderer->video->h / frame->height, source.w * renderer->video->w / frame->width,
-            source.h * renderer->video->h / frame->height};
-        if (!SDL_SetTextureScaleMode(renderer->video, integer_scale ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR) ||
-            !draw_rotated(renderer, renderer->video, &sampled_source, destination, rotation))
-            return fail(renderer, SDL_GetError());
+        }
+        if (direct) {
+            report_hdr(renderer, frame);
+            SDL_FRect draw_source = {source.x * draw_frame->width / frame->width,
+                source.y * draw_frame->height / frame->height, source.w * draw_frame->width / frame->width,
+                source.h * draw_frame->height / frame->height};
+            // ML enlargement has already reconstructed the selected field.
+            const int draw_field = draw_frame->height != frame->height ? 0 : field;
+            if (!up_metal_color_draw(renderer->color, renderer->renderer, draw_frame, draw_field, hdr_peak(frame),
+                    draw_source, destination, rotation, width, height, renderer->error, sizeof(renderer->error)))
+                return -1;
+        } else {
+            const SDL_FRect sampled_source = {source.x * renderer->video->w / frame->width,
+                source.y * renderer->video->h / frame->height, source.w * renderer->video->w / frame->width,
+                source.h * renderer->video->h / frame->height};
+            if (!SDL_SetTextureScaleMode(renderer->video, integer_scale ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR) ||
+                !draw_rotated(renderer, renderer->video, &sampled_source, destination, rotation))
+                return fail(renderer, SDL_GetError());
+        }
     }
     if (subtitle_pixels && subtitle_width > 0 && subtitle_height > 0) {
         // Fit the entire authored canvas within the visible video; encoded
@@ -580,6 +599,7 @@ void up_video_renderer_destroy(UpVideoRenderer *renderer)
 {
     if (!renderer)
         return;
+    up_native_playback_destroy(renderer->native);
     SDL_DestroyTexture(renderer->video);
     for (size_t i = 0; i < 2; i++)
         SDL_DestroyTexture(renderer->overlays[i].texture);

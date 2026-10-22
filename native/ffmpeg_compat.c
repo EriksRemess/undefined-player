@@ -15,6 +15,7 @@
 #ifdef __APPLE__
 #include <VideoToolbox/VideoToolbox.h>
 #include "macos_logging.h"
+#include "video_decoder_macos.h"
 #endif
 
 #if LIBAVFORMAT_VERSION_MAJOR < 62 || LIBAVCODEC_VERSION_MAJOR < 62 || \
@@ -30,6 +31,9 @@
 
 struct UpAvDecoder {
     AVCodecContext *context;
+#ifdef __APPLE__
+    UpAsyncDecoder *async;
+#endif
     int stream_index;
     AVRational time_base;
     int uses_hardware;
@@ -723,6 +727,12 @@ UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
             goto fail;
         }
     }
+#ifdef __APPLE__
+    if (decoder->uses_hardware)
+        decoder->async = up_async_decoder_create(parameters, decoder->time_base);
+    if (decoder->async)
+        return decoder;
+#endif
     result = avcodec_open2(decoder->context, codec, NULL);
     if (result < 0) {
         set_decoder_error("could not open decoder", result);
@@ -749,6 +759,9 @@ void up_av_decoder_free(UpAvDecoder **decoder)
 {
     if (!decoder || !*decoder)
         return;
+#ifdef __APPLE__
+    up_async_decoder_destroy((*decoder)->async);
+#endif
     avcodec_free_context(&(*decoder)->context);
     free(*decoder);
     *decoder = NULL;
@@ -786,11 +799,26 @@ int up_av_decoder_height(const UpAvDecoder *decoder)
 
 int up_av_decoder_send_packet(UpAvDecoder *decoder, const UpAvPacket *packet)
 {
+#ifdef __APPLE__
+    if (decoder->async) {
+        if (packet && decoder->context->skip_frame == AVDISCARD_NONKEY &&
+            !(PACKET(packet)->flags & AV_PKT_FLAG_KEY)) return 0;
+        return up_async_decoder_send(decoder->async, PACKET(packet));
+    }
+#endif
     return avcodec_send_packet(decoder->context, PACKET(packet));
 }
 
 int up_av_decoder_receive_frame(UpAvDecoder *decoder, UpAvFrame **frame)
 {
+#ifdef __APPLE__
+    if (decoder->async) {
+        AVFrame *native = NULL;
+        int result = up_async_decoder_receive(decoder->async, &native);
+        if (!result) *frame = (UpAvFrame *)native;
+        return result;
+    }
+#endif
     AVFrame *native = av_frame_alloc();
     if (!native)
         return AVERROR(ENOMEM);
@@ -805,6 +833,9 @@ int up_av_decoder_receive_frame(UpAvDecoder *decoder, UpAvFrame **frame)
 
 void up_av_decoder_flush(UpAvDecoder *decoder)
 {
+#ifdef __APPLE__
+    if (decoder->async) { up_async_decoder_flush(decoder->async); return; }
+#endif
     avcodec_flush_buffers(decoder->context);
 }
 
@@ -1215,6 +1246,21 @@ UpAvFrame *up_av_frame_black(void)
     }
     memset(frame->data[0], 0, (size_t) frame->linesize[0] * frame->height);
     return (UpAvFrame *) frame;
+}
+
+UpAvFrame *up_av_decoder_placeholder(const UpAvDecoder *decoder)
+{
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) return NULL;
+    const AVCodecContext *context = decoder->context;
+    frame->width = context->width;
+    frame->height = context->height;
+    frame->sample_aspect_ratio = context->sample_aspect_ratio;
+    frame->colorspace = context->colorspace;
+    frame->color_primaries = context->color_primaries;
+    frame->color_trc = context->color_trc;
+    frame->color_range = context->color_range;
+    return (UpAvFrame *)frame;
 }
 
 int up_av_sha256(const uint8_t *data, size_t length, uint8_t *digest)

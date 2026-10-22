@@ -273,8 +273,14 @@ impl AutoCrop {
                 .last_sample
                 .is_none_or(|time| time.elapsed() >= SAMPLE_INTERVAL)
             && !(paused && self.sampled_pts == Some((frame.pts, true)))
-            && let Some(sample) = frame.clone_reference()
-            && worker
+        {
+            let Some(sample) = frame.clone_reference() else {
+                // Native presentation supplies geometry without pixel buffers.
+                // Stop probing so fill can fall back to the viewport aspect.
+                self.unavailable = true;
+                return false;
+            };
+            if worker
                 .sender
                 .as_ref()
                 .unwrap()
@@ -284,9 +290,10 @@ impl AutoCrop {
                     paused,
                 })
                 .is_ok()
-        {
-            self.last_sample = Some(Instant::now());
-            self.sampled_pts = Some((frame.pts, paused));
+            {
+                self.last_sample = Some(Instant::now());
+                self.sampled_pts = Some((frame.pts, paused));
+            }
         }
         let changed = previous != self.crop();
         if changed && let Some(crop) = self.crop() {

@@ -268,9 +268,11 @@ fn main() {
 fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Path>) {
     let sources = [
         "native/app_macos.m",
+        "native/playback_macos.m",
         "native/video_renderer_macos.c",
         "native/video_color_macos.m",
         "native/video_upscaler_macos.m",
+        "native/video_decoder_macos.m",
         "native/media_controls_macos.m",
         "native/text_raster.c",
         "native/ffmpeg_compat.c",
@@ -278,9 +280,11 @@ fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Pat
     ];
     for header in [
         "native/app_macos.h",
+        "native/playback_macos.h",
         "native/video_renderer.h",
         "native/video_color_macos.h",
         "native/video_upscaler_macos.h",
+        "native/video_decoder_macos.h",
         "native/macos_logging.h",
         "native/media_controls_macos.h",
         "native/text_raster.h",
@@ -333,6 +337,7 @@ fn build_macos(out_dir: &Path, ffmpeg_cflags: &[String], ffmpeg_dir: Option<&Pat
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=video_renderer");
     for framework in [
+        "AVFoundation",
         "VideoToolbox",
         "CoreVideo",
         "CoreMedia",

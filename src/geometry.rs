@@ -2,6 +2,7 @@
 //! Wayland window dragging, and the playback event handler. Also owns the
 //! integer-scaling policy for small video frames.
 pub(crate) const TOP_BAR_HEIGHT: f32 = 42.0;
+pub(crate) const CLOSE_ON_LEFT: bool = cfg!(target_os = "macos");
 pub(crate) const SCRUBBER_HIT_HEIGHT: f32 = 42.0;
 pub(crate) const SCRUBBER_MARGIN: f32 = 14.0;
 const RESIZE_BORDER: f64 = 10.0;
@@ -155,8 +156,13 @@ impl WindowGeometry {
             return HitRegion::Outside;
         }
         let inset = self.inset();
-        if x >= self.width - (inset + f64::from(TOP_BAR_HEIGHT)) * self.scale_x
-            && x < self.width - inset * self.scale_x
+        let close_left = if CLOSE_ON_LEFT {
+            inset * self.scale_x
+        } else {
+            self.width - (inset + f64::from(TOP_BAR_HEIGHT)) * self.scale_x
+        };
+        if x >= close_left
+            && x < close_left + f64::from(TOP_BAR_HEIGHT) * self.scale_x
             && y >= inset * self.scale_y
             && y < (inset + f64::from(TOP_BAR_HEIGHT)) * self.scale_y
         {
@@ -340,7 +346,8 @@ mod tests {
                     geometry.hit(x, y) as u32
                 );
             }
-            assert_eq!(geometry.hit(1279.0, 0.0), HitRegion::Close);
+            let close_x = if CLOSE_ON_LEFT { 1.0 } else { 1279.0 };
+            assert_eq!(geometry.hit(close_x, 0.0), HitRegion::Close);
             assert_eq!(geometry.hit(640.0, 719.0), HitRegion::Bottom);
             assert_eq!(geometry.hit(640.0, 701.0), HitRegion::Scrubber);
             assert_eq!(geometry.scrubber_target(640.0, 701.0, 100.0), Some(50.0));
@@ -352,8 +359,24 @@ mod tests {
     fn close_button_and_resize_edges_have_consistent_precedence() {
         let geometry = WindowGeometry::new(1280, 720, 1280, 720).unwrap();
         for (x, y, expected) in [
-            (5.0, 5.0, HitRegion::TopLeft),
-            (1275.0, 5.0, HitRegion::Close),
+            (
+                5.0,
+                5.0,
+                if CLOSE_ON_LEFT {
+                    HitRegion::Close
+                } else {
+                    HitRegion::TopLeft
+                },
+            ),
+            (
+                1275.0,
+                5.0,
+                if CLOSE_ON_LEFT {
+                    HitRegion::TopRight
+                } else {
+                    HitRegion::Close
+                },
+            ),
             (1275.0, 50.0, HitRegion::Right),
             (5.0, 715.0, HitRegion::BottomLeft),
             (1275.0, 715.0, HitRegion::BottomRight),
@@ -364,8 +387,9 @@ mod tests {
             assert_eq!(geometry.hit(x, y), expected);
         }
         let hidpi = WindowGeometry::new(1280, 720, 2560, 1440).unwrap();
-        assert_eq!(hidpi.hit(1265.0, 15.0), HitRegion::Close);
-        assert_eq!(hidpi.hit(1265.0, 25.0), HitRegion::Content);
+        let close_x = if CLOSE_ON_LEFT { 15.0 } else { 1265.0 };
+        assert_eq!(hidpi.hit(close_x, 15.0), HitRegion::Close);
+        assert_eq!(hidpi.hit(close_x, 25.0), HitRegion::Content);
     }
 
     #[test]

@@ -146,6 +146,8 @@ int up_av_frame_field(const UpAvFrame *frame);
 void up_av_frame_dimensions(const UpAvFrame *frame, int *width, int *height);
 UpAvFrame *up_av_frame_clone(const UpAvFrame *frame);
 UpAvFrame *up_av_frame_black(void);
+// Geometry/colour metadata only, for an external presentation engine. No pixels.
+UpAvFrame *up_av_decoder_placeholder(const UpAvDecoder *decoder);
 typedef struct UpLumaView {
     UpAvFrame *frame;
     const uint8_t *data;

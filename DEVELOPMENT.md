@@ -174,6 +174,10 @@ Do not redistribute builds using FFmpeg’s `--enable-nonfree` configuration.
 Linux uses `native/video_renderer.c` with Vulkan/libplacebo. macOS uses
 `native/video_renderer_macos.c` with SDL/Metal and optional VideoToolbox decoding.
 Unsupported hardware decode falls back to software.
+Local AV1 video above 4K in MP4/MOV uses AVFoundation when it has no embedded
+subtitles and at most one AAC audio track. Native startup failure retains FFmpeg.
+High-resolution 8-bit SDR AV1 with av1C configuration uses a bounded, four-frame
+asynchronous VideoToolbox queue on the FFmpeg path.
 
 The macOS color shader samples NV12/P010 surfaces directly, decoding PQ/HLG and
 mapping BT.2020/P3 into linear BT.709. HDR reference white is 203 nits; MaxCLL
@@ -187,7 +191,8 @@ temporal references. Progressive hardware frames bypass interlace analysis.
 
 Apple ML sessions initialize asynchronously. Enhancement preserves source SAR,
 crop, rotation, and color metadata. Incompatible decoder padding is copied into
-Apple’s required pixel-buffer pool. Paused results are cached.
+Apple’s required pixel-buffer pool. Interlaced frames use NV12 bob before ML;
+enlarged output bypasses the renderer’s bob. Paused results are cached.
 
 Shared hit regions keep controls and resizing aligned. macOS content dragging
 uses ordinary SDL events because Cocoa draggable hit regions consume clicks

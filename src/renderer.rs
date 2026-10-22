@@ -122,6 +122,13 @@ impl<'window> Renderer<'window> {
             .map(|p| p.as_ptr())
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_playback(&mut self, path: &CStr) -> Option<ptr::NonNull<c_void>> {
+        ptr::NonNull::new(unsafe {
+            ffi::up_video_renderer_native_begin(self.context, path.as_ptr())
+        })
+    }
+
     pub(crate) fn set_corner_radius(&mut self, radius: u16) {
         self.corner_radius = radius;
     }

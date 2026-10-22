@@ -31,7 +31,7 @@ struct UpVideoUpscaler {
     struct SwsContext *conversion;
     AVFrame *source, *base, *scaled;
     bool cached_enabled, cached_larger;
-    int cached_readiness;
+    int cached_readiness, cached_field;
     char status[96];
 };
 
@@ -42,9 +42,9 @@ static void clear_cached_frames(UpVideoUpscaler *upscaler)
     av_frame_free(&upscaler->scaled);
 }
 
-static bool eligible(const AVFrame *frame, int field)
+static bool eligible(const AVFrame *frame)
 {
-    if (!frame || field || (frame->flags & AV_FRAME_FLAG_INTERLACED) ||
+    if (!frame ||
         frame->width < 16 || frame->height < 16 ||
         frame->width > 1920 || frame->height > 1080 ||
         frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
@@ -247,12 +247,59 @@ static AVFrame *prepare_frame(UpVideoUpscaler *upscaler, UpUpscaleSession *sessi
     return frame;
 }
 
-static AVFrame *scale_frame(UpUpscaleSession *session, const AVFrame *frame, CVPixelBufferRef input)
+// Reconstruct one field into a progressive NV12 buffer before ML processing.
+// Decoder-owned surfaces and the ordinary rendering fallback stay untouched.
+static CVPixelBufferRef bob_buffer(UpUpscaleSession *session, CVPixelBufferRef input, int field)
+{
+    CVPixelBufferRef output = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(NULL, session.sourcePool, &output) != kCVReturnSuccess)
+        return NULL;
+    if (CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        CVPixelBufferRelease(output); return NULL;
+    }
+    if (CVPixelBufferLockBaseAddress(output, 0) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(output); return NULL;
+    }
+    const int parity = field == 2 ? 1 : 0;
+    for (int plane = 0; plane < 2; plane++) {
+        const int height = plane ? (session.height + 1) / 2 : session.height;
+        const int bytes = plane ? ((session.width + 1) / 2) * 2 : session.width;
+        const size_t src_stride = CVPixelBufferGetBytesPerRowOfPlane(input, plane);
+        const size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(output, plane);
+        const uint8_t *source = CVPixelBufferGetBaseAddressOfPlane(input, plane);
+        uint8_t *destination = CVPixelBufferGetBaseAddressOfPlane(output, plane);
+        for (int y = 0; y < height; y++) {
+            uint8_t *row = destination + y * dst_stride;
+            if (y % 2 == parity) {
+                memcpy(row, source + y * src_stride, bytes);
+            } else {
+                const uint8_t *above = source + (y > 0 ? y - 1 : y + 1) * src_stride;
+                const uint8_t *below = source + (y + 1 < height ? y + 1 : y - 1) * src_stride;
+                for (int x = 0; x < bytes; x++)
+                    row[x] = ((unsigned int) above[x] + below[x] + 1) / 2;
+            }
+        }
+    }
+    CVBufferPropagateAttachments(input, output);
+    CVBufferRemoveAttachment(output, kCVImageBufferFieldCountKey);
+    CVBufferRemoveAttachment(output, kCVImageBufferFieldDetailKey);
+    const CVReturn filled = CVPixelBufferFillExtendedPixels(output);
+    CVPixelBufferUnlockBaseAddress(output, 0);
+    CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
+    if (filled != kCVReturnSuccess) { CVPixelBufferRelease(output); return NULL; }
+    return output;
+}
+
+static AVFrame *scale_frame(UpUpscaleSession *session, const AVFrame *frame, CVPixelBufferRef input, int field)
 {
     if (@available(macOS 26.0, *)) {
         CVPixelBufferRef output = NULL;
         if (CVPixelBufferPoolCreatePixelBuffer(NULL, session.destinationPool, &output) != kCVReturnSuccess)
             return NULL;
+        CVPixelBufferRef progressive = field ? bob_buffer(session, input, field) : NULL;
+        if (field && !progressive) { CVPixelBufferRelease(output); return NULL; }
+        if (progressive) input = progressive;
         CVBufferPropagateAttachments(input, output);
         const double seconds = frame->pts != AV_NOPTS_VALUE && frame->time_base.num > 0 && frame->time_base.den > 0 ?
             frame->pts * av_q2d(frame->time_base) : 0;
@@ -265,11 +312,16 @@ static AVFrame *scale_frame(UpUpscaleSession *session, const AVFrame *frame, CVP
         AVFrame *scaled = NULL;
         if ([session.processor processWithParameters:parameters error:&error]) {
             scaled = wrap_buffer(frame, output, session.factor);
+            if (scaled) {
+                scaled->flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST);
+                scaled->repeat_pict = 0;
+            }
         } else {
             fprintf(stderr, "upscale: processing failed, using original frames: %s\n", error.localizedDescription.UTF8String);
             @synchronized(session) { session.readiness = -1; }
         }
         CVPixelBufferRelease(output);
+        if (progressive) CVPixelBufferRelease(progressive);
         return scaled;
     }
     return NULL;
@@ -285,11 +337,11 @@ UpVideoUpscaler *up_video_upscaler_create(SDL_WindowID window)
 const AVFrame *up_video_upscaler_frame(UpVideoUpscaler *upscaler, const AVFrame *frame,
                                      int field, bool enabled, bool larger)
 {
-    if (!upscaler) return frame;
+    if (!upscaler || !frame) return frame;
     @autoreleasepool {
-        if (!eligible(frame, field)) {
+        if (!eligible(frame)) {
             snprintf(upscaler->status, sizeof(upscaler->status), "%s", !enabled ? "OFF" :
-                frame->width > 1920 || frame->height > 1080 ? "BYPASS (HIGH RES)" : "BYPASS (FORMAT/INTERLACE)");
+                frame->width > 1920 || frame->height > 1080 ? "BYPASS (HIGH RES)" : "BYPASS (FORMAT)");
             clear_cached_frames(upscaler);
             return frame;
         }
@@ -306,13 +358,15 @@ const AVFrame *up_video_upscaler_frame(UpVideoUpscaler *upscaler, const AVFrame 
             previous->data[0] == frame->data[0] && previous->data[3] == frame->data[3] &&
             previous->color_range == frame->color_range && previous->colorspace == frame->colorspace &&
             previous->color_trc == frame->color_trc && previous->color_primaries == frame->color_primaries;
-        if (!same || enabled != upscaler->cached_enabled || larger != upscaler->cached_larger || ready != upscaler->cached_readiness) {
+        if (!same || field != upscaler->cached_field || enabled != upscaler->cached_enabled ||
+            larger != upscaler->cached_larger || ready != upscaler->cached_readiness) {
             clear_cached_frames(upscaler);
             upscaler->source = av_frame_clone(frame);
             upscaler->base = prepare_frame(upscaler, session, ready, frame);
             upscaler->cached_enabled = enabled; upscaler->cached_larger = larger; upscaler->cached_readiness = ready;
+            upscaler->cached_field = field;
             if (enabled && larger && ready == 1 && upscaler->base) {
-                upscaler->scaled = scale_frame(session, frame, (CVPixelBufferRef) upscaler->base->data[3]);
+                upscaler->scaled = scale_frame(session, frame, (CVPixelBufferRef) upscaler->base->data[3], field);
                 ready = session_readiness(session);
             }
         }

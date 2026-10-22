@@ -453,7 +453,12 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
     assert_eq!(parts.parts[6].dst[1] + ACCENT_PAD as f32, INSET);
     assert_eq!(parts.parts[8].dst[1] + ACCENT_PAD as f32, 674.0);
     assert_eq!(parts.parts[10].dst[1] + ACCENT_PAD as f32, 674.0);
-    assert_eq!(parts.parts[4].dst, [1254.0, 14.0, 1264.0, 28.0]);
+    let expected_close = if cfg!(target_os = "macos") {
+        [16.0, 14.0, 26.0, 28.0]
+    } else {
+        [1254.0, 14.0, 1264.0, 28.0]
+    };
+    assert_eq!(parts.parts[4].dst, expected_close);
     assert_eq!(
         parts.parts.last().unwrap().dst,
         [637.0, 696.0, 643.0, 708.0]

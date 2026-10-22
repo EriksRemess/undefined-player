@@ -117,9 +117,10 @@ On Linux, other sources up to 1080p use libplacebo’s Lanczos-sharp upscaler.
 HDR output requires an HDR-enabled compositor. On macOS, HDR10 and HLG use the
 display’s available HDR brightness, with tone mapping for SDR displays.
 
-On macOS 26+, Apple ML can enlarge supported progressive, 8-bit SDR video by 2×
+On macOS 26+, Apple ML can enlarge supported 8-bit SDR video by 2×
 while preserving its display aspect ratio. **U** toggles it; **I** shows its status.
-Initialization runs in the background. HDR, interlaced or unsupported formats,
+Interlaced video is deinterlaced before enhancement according to the **D** setting.
+Initialization runs in the background. HDR or unsupported formats,
 sources above 1920×1080, integer-scaled video, and shrinking windows bypass it.
 Some dimensions within that limit are also unsupported by Apple’s runtime.
 

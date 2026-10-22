@@ -249,14 +249,56 @@ fn media_tracks_cycle_and_report_available_metadata() {
 
 #[test]
 fn close_button_uses_physical_top_bar_size() {
-    assert!(close_button_contains(1270.0, 10.0, 1280, 720, 1280, 720));
-    assert!(!close_button_contains(1200.0, 10.0, 1280, 720, 1280, 720));
-    assert!(!close_button_contains(1270.0, 60.0, 1280, 720, 1280, 720));
+    let x = |right| {
+        if cfg!(target_os = "macos") {
+            1280.0 - right
+        } else {
+            right
+        }
+    };
+    assert!(close_button_contains(x(1270.0), 10.0, 1280, 720, 1280, 720));
+    assert!(!close_button_contains(
+        x(1200.0),
+        10.0,
+        1280,
+        720,
+        1280,
+        720
+    ));
+    assert!(!close_button_contains(
+        x(1270.0),
+        60.0,
+        1280,
+        720,
+        1280,
+        720
+    ));
 
     // A 42-pixel button is 21 logical units at 2x scaling.
-    assert!(close_button_contains(1265.0, 15.0, 1280, 720, 2560, 1440));
-    assert!(!close_button_contains(1250.0, 15.0, 1280, 720, 2560, 1440));
-    assert!(!close_button_contains(1265.0, 25.0, 1280, 720, 2560, 1440));
+    assert!(close_button_contains(
+        x(1265.0),
+        15.0,
+        1280,
+        720,
+        2560,
+        1440
+    ));
+    assert!(!close_button_contains(
+        x(1250.0),
+        15.0,
+        1280,
+        720,
+        2560,
+        1440
+    ));
+    assert!(!close_button_contains(
+        x(1265.0),
+        25.0,
+        1280,
+        720,
+        2560,
+        1440
+    ));
 }
 
 #[test]

@@ -60,13 +60,18 @@ target/tests/video-upscaler.o: native/video_upscaler_macos.m native/video_upscal
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc \
 		$(shell pkg-config --cflags sdl3 libavutil libswscale) -c $< -o $@
 
-target/tests/video-renderer: native/video_renderer_macos_tests.c native/video_renderer_macos.c native/video_renderer.h native/window_shape.h native/ffmpeg_luma.h native/ffmpeg_compat.h target/tests/video-color.o target/tests/video-upscaler.o
+target/tests/playback-macos.o: native/playback_macos.m native/playback_macos.h
+	mkdir -p target/tests
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc \
+		$(shell pkg-config --cflags sdl3) -c $< -o $@
+
+target/tests/video-renderer: native/video_renderer_macos_tests.c native/video_renderer_macos.c native/video_renderer.h native/window_shape.h native/ffmpeg_luma.h native/ffmpeg_compat.h target/tests/video-color.o target/tests/video-upscaler.o target/tests/playback-macos.o
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
 		$(shell pkg-config --cflags sdl3 pangocairo libavutil libswscale) \
-		native/video_renderer_macos_tests.c target/tests/video-color.o target/tests/video-upscaler.o -o $@ \
+		native/video_renderer_macos_tests.c target/tests/video-color.o target/tests/video-upscaler.o target/tests/playback-macos.o -o $@ \
 		$(shell pkg-config --libs sdl3 pangocairo libavutil libswscale) \
 		-framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework Metal \
-		-framework QuartzCore -framework Foundation -Wl,-dead_strip
+		-framework QuartzCore -framework Foundation -framework AVFoundation -framework AppKit -Wl,-dead_strip
 
 target/tests/media-controls: native/media_controls_macos_tests.m native/media_controls_macos.m native/media_controls_macos.h
 	mkdir -p target/tests
@@ -80,14 +85,35 @@ target/tests/video-upscaler: native/video_upscaler_macos_tests.m native/video_up
 		$(shell pkg-config --libs sdl3 libavutil libswscale) \
 		-framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia
 
-check-native: target/tests/video-renderer target/tests/media-controls target/tests/video-upscaler
+target/tests/video-decoder: native/video_decoder_macos_tests.m native/video_decoder_macos.m native/video_decoder_macos.h
+	mkdir -p target/tests
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc \
+		$(shell pkg-config --cflags libavformat libavcodec libavutil) $< -o $@ \
+		$(shell pkg-config --libs libavformat libavcodec libavutil) \
+		-framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia
+
+check-native: target/tests/video-renderer target/tests/media-controls target/tests/video-upscaler target/tests/video-decoder
 	target/tests/video-renderer
 	target/tests/media-controls
 	target/tests/video-upscaler
+	target/tests/video-decoder
 
 # Requires a desktop/Metal GPU. Kept separate from CPU-only CI checks.
-check-metal: target/tests/video-renderer
+target/tests/playback-macos: native/playback_macos_tests.m native/playback_macos.m native/playback_macos.h
+	mkdir -p target/tests
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc \
+		$(shell pkg-config --cflags sdl3) $< -o $@ \
+		$(shell pkg-config --libs sdl3) \
+		-framework AVFoundation -framework AppKit -framework QuartzCore -framework CoreMedia
+
+target/tests/native-playback.mp4:
+	mkdir -p target/tests
+	ffmpeg -v error -f lavfi -i testsrc2=size=160x90:rate=30 -t 2 \
+		-c:v libx264 -pix_fmt yuv420p -y $@
+
+check-metal: target/tests/video-renderer target/tests/playback-macos target/tests/native-playback.mp4
 	target/tests/video-renderer --metal
+	target/tests/playback-macos target/tests/native-playback.mp4
 
 check-upscale: target/tests/video-upscaler
 	target/tests/video-upscaler --apple-ml

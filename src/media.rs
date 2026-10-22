@@ -70,6 +70,10 @@ impl std::error::Error for AudioTrackError {}
 /// SDL and the renderer's shared hardware device must outlive the session and
 /// any frames transferred out of it.
 pub(crate) struct Media {
+    // Borrowed from the renderer, which outlives Media. The worker only checks
+    // presence; every AVPlayer operation is performed by the main event loop.
+    #[cfg(target_os = "macos")]
+    native: Option<ptr::NonNull<c_void>>,
     pub(crate) format: *mut ffi::UpAvFormat,
     interrupt: Arc<AtomicBool>,
     audio_control: AudioControl,
@@ -98,6 +102,79 @@ pub(crate) struct Media {
 }
 
 impl Media {
+    pub(crate) fn is_native(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.native.is_some();
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe fn try_native_playback(
+        &mut self,
+        source: &crate::source::MediaSource,
+        renderer: &mut crate::renderer::Renderer<'_>,
+    ) -> Result<()> {
+        let Some(path) = source.local_path() else {
+            return Ok(());
+        };
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let width = unsafe { ffi::up_av_decoder_width(self.video.as_ptr()) };
+        let height = unsafe { ffi::up_av_decoder_height(self.video.as_ptr()) };
+        let codec = unsafe {
+            CStr::from_ptr(ffi::up_av_stream_codec_name(
+                self.format,
+                self.video.stream_index as u32,
+            ))
+        };
+        if i64::from(width) * i64::from(height) <= 3840 * 2160
+            || codec != c"av1"
+            || !["mp4", "mov", "m4v"]
+                .iter()
+                .any(|ext| extension.eq_ignore_ascii_case(ext))
+            || !self.subtitle_tracks.is_empty()
+            || self.audio_tracks.len() > 1
+            || self
+                .audio_tracks
+                .first()
+                .is_some_and(|track| track.label.codec != "AAC")
+        {
+            return Ok(());
+        }
+        let frame = unsafe { ffi::up_av_decoder_placeholder(self.video.as_ptr()) };
+        if frame.is_null() {
+            return Err("could not allocate native playback geometry".into());
+        }
+        let placeholder = unsafe { VideoFrame::from_raw(frame, 0.0, self.video.frame_duration) };
+        let path = CString::new(source.as_bytes()).map_err(|_| "video path contains a NUL byte")?;
+        if let Some(native) = renderer.native_playback(&path) {
+            self.native = Some(native);
+            self.audio = None;
+            self.video_queue.clear();
+            self.video_queue.push_back(placeholder);
+            self.first_video_pts = Some(0.0);
+            eprintln!("video: native AVFoundation playback");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_mute(&self, muted: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(native) = self.native {
+            unsafe { ffi::up_native_playback_mute(native.as_ptr(), i32::from(muted)) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = muted;
+    }
+
+    pub(crate) unsafe fn active_clock(&self) -> Option<f64> {
+        if self.is_native() {
+            return unsafe { self.audio_clock() };
+        }
+        self.audio
+            .as_ref()
+            .and_then(|audio| unsafe { audio.active_clock() })
+    }
     /// # Safety
     /// SDL must remain initialized until this session is dropped. Any supplied
     /// hardware device must be valid, support synchronized decoder access, and
@@ -366,6 +443,8 @@ impl Media {
             }
 
             Ok(Self {
+                #[cfg(target_os = "macos")]
+                native: None,
                 format,
                 interrupt,
                 audio_control,
@@ -805,6 +884,9 @@ impl Media {
         budget: Option<std::time::Duration>,
         capacity: usize,
     ) -> Result<()> {
+        if self.is_native() {
+            return Ok(());
+        }
         let started = std::time::Instant::now();
         unsafe { self.sync_audio_selection() };
         if let Some(audio) = self.audio.as_mut() {
@@ -901,6 +983,20 @@ impl Media {
     /// # Safety
     /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn sync_audio(&mut self, playback_time: f64, paused: bool) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(native) = self.native {
+            let status = unsafe { ffi::up_native_playback_status(native.as_ptr()) };
+            if status < 0 {
+                return Err(unsafe {
+                    CStr::from_ptr(ffi::up_native_playback_error(native.as_ptr()))
+                }
+                .to_string_lossy()
+                .into_owned());
+            }
+            self.eof = status == 2;
+            unsafe { ffi::up_native_playback_pause(native.as_ptr(), i32::from(paused)) };
+            return Ok(());
+        }
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.pump()? };
             // A delayed track may be buffered well before its first timestamp.
@@ -919,6 +1015,20 @@ impl Media {
     /// # Safety
     /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
+        #[cfg(target_os = "macos")]
+        if let Some(native) = self.native {
+            let frame = unsafe { ffi::up_av_decoder_placeholder(self.video.as_ptr()) };
+            if frame.is_null() {
+                return Err("could not allocate native playback geometry".into());
+            }
+            self.video_queue.clear();
+            self.video_queue.push_back(unsafe {
+                VideoFrame::from_raw(frame, requested_target, self.video.frame_duration)
+            });
+            self.eof = false;
+            unsafe { ffi::up_native_playback_seek(native.as_ptr(), requested_target) };
+            return Ok(requested_target);
+        }
         unsafe { self.seek_input(requested_target)? };
         unsafe { self.reset_after_seek(requested_target) }
     }
@@ -1025,6 +1135,10 @@ impl Media {
     /// # Safety
     /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn audio_clock(&self) -> Option<f64> {
+        #[cfg(target_os = "macos")]
+        if let Some(native) = self.native {
+            return Some(unsafe { ffi::up_native_playback_time(native.as_ptr()) });
+        }
         self.audio
             .as_ref()
             .and_then(|audio| unsafe { audio.clock() })
@@ -1038,6 +1152,11 @@ impl Media {
         outstanding_video: usize,
         fallback: f64,
     ) -> Option<f64> {
+        #[cfg(target_os = "macos")]
+        if let Some(native) = self.native {
+            return (unsafe { ffi::up_native_playback_status(native.as_ptr()) } > 0)
+                .then(|| unsafe { ffi::up_native_playback_time(native.as_ptr()) });
+        }
         let audio_clock = unsafe { self.audio_clock() };
         completed_seek_anchor(
             video_pts,

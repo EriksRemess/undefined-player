@@ -41,6 +41,10 @@ UpVideoRenderer *up_video_renderer_create(void *window);
 int up_video_renderer_ready(const UpVideoRenderer *renderer);
 // Optional borrowed FFmpeg hardware device. NULL selects software decoding.
 void *up_video_renderer_device(UpVideoRenderer *renderer);
+#ifdef __APPLE__
+// The renderer owns the returned playback object; callers borrow it on the main thread.
+void *up_video_renderer_native_begin(UpVideoRenderer *renderer, const char *path);
+#endif
 // Returns 0 on success, 1 if corner compositing is unavailable, -1 on failure.
 int up_video_renderer_display(UpVideoRenderer *renderer, void *frame,
                               void *previous_pointer, void *next_pointer, int field,

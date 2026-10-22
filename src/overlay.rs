@@ -684,11 +684,16 @@ impl Overlays {
                     white(top_alpha),
                 );
             }
+            let close_left = if crate::geometry::CLOSE_ON_LEFT {
+                0.0
+            } else {
+                width - TOP_BAR_HEIGHT
+            };
             if self.close_hovered {
                 add(
                     1,
                     CLOSE_HOVER_SRC,
-                    [width - 37.0, 5.0, width - 5.0, 37.0],
+                    [close_left + 5.0, 5.0, close_left + 37.0, 37.0],
                     [1.0, 1.0, 1.0, 0.18 * top_alpha],
                 );
             }
@@ -700,7 +705,7 @@ impl Overlays {
                     (CLOSE_X + 10) as f32,
                     (CLOSE_Y + ACCENT_PAD + BASE_HEIGHT) as f32,
                 ],
-                [width - 26.0, 14.0, width - 16.0, 28.0],
+                [close_left + 16.0, 14.0, close_left + 26.0, 28.0],
                 white(top_alpha),
             );
         }

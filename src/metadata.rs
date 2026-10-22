@@ -143,6 +143,11 @@ impl VideoInfo {
     /// Preserve [`Media`]'s native resource invariants. A non-null `frame` must be
     /// a live decoded video frame that is neither modified nor freed during the call.
     pub(crate) unsafe fn inspect(media: &Media, frame: *const ffi::UpAvFrame) -> Self {
+        let frame = if media.is_native() {
+            std::ptr::null()
+        } else {
+            frame
+        };
         let mut info: ffi::UpVideoInfo = unsafe { std::mem::zeroed() };
         assert_ne!(
             unsafe { ffi::up_av_video_info(media.format, media.video.as_ptr(), frame, &mut info) },
@@ -162,7 +167,9 @@ impl VideoInfo {
         );
         let pixel_format = unsafe { ffmpeg_name(info.pixel_format) }
             .unwrap_or_else(|| "UNKNOWN PIXEL FORMAT".to_owned());
-        let decode_path = if media.video.uses_hardware {
+        let decode_path = if media.is_native() {
+            "AVFOUNDATION"
+        } else if media.video.uses_hardware {
             if cfg!(target_os = "macos") {
                 "VIDEOTOOLBOX HW"
             } else {

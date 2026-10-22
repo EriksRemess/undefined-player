@@ -129,6 +129,11 @@ fn changing_audio_format_preserves_resampler_tail() {
     child("resampler-tail");
 }
 
+#[test]
+fn native_geometry_does_not_leave_zoom_waiting_for_pixels() {
+    child("native-geometry");
+}
+
 fn decode_one_audio_packet(media: &mut Media) {
     let stream = media.audio_tracks[media.selected_audio_track]
         .decoder
@@ -185,6 +190,34 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "native-geometry" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=1:d=1",
+                    "-c:v",
+                    "ffv1",
+                ],
+                "geometry.mkv",
+            );
+            let media = unsafe { Media::open(&path, None, false) }.unwrap();
+            let raw = unsafe { ffi::up_av_decoder_placeholder(media.video.as_ptr()) };
+            assert!(!raw.is_null());
+            let frame = unsafe { crate::decoder::VideoFrame::from_raw(raw, 0.0, 1.0) };
+            assert_eq!(frame.dimensions(), (64, 64));
+            let mut crop = crate::autocrop::AutoCrop::default();
+            assert!(crop.toggle());
+            crop.update(&frame, false);
+            assert!(crop.unavailable());
+            let mut zoom = crate::zoom::Zoom::default();
+            zoom.toggle(crop.enabled());
+            assert!(zoom.fill(crop.enabled(), crop.crop().is_some(), crop.unavailable()));
+            crop.reset();
+            crop.update(&frame, true);
+            assert!(crop.unavailable());
+        }
         "worker-delayed-audio-seek" => {
             let path = fixture.generate(
                 &[

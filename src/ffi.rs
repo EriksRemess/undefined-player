@@ -735,10 +735,25 @@ unsafe extern "C" {
     pub fn up_av_frame_dimensions(frame: *const UpAvFrame, width: *mut i32, height: *mut i32);
     pub fn up_av_frame_clone(frame: *const UpAvFrame) -> *mut UpAvFrame;
     pub fn up_av_frame_black() -> *mut UpAvFrame;
+    pub fn up_av_decoder_placeholder(decoder: *const UpAvDecoder) -> *mut UpAvFrame;
     pub fn up_av_frame_luma(frame: *const UpAvFrame, view: *mut UpLumaView) -> i32;
     pub fn up_av_frame_luma_free(view: *mut UpLumaView);
 }
 
 unsafe extern "C" {
     pub fn up_av_sha256(data: *const u8, length: usize, digest: *mut u8) -> ::std::os::raw::c_int;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    pub fn up_video_renderer_native_begin(
+        renderer: *mut UpVideoRenderer,
+        path: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
+    pub fn up_native_playback_pause(playback: *mut std::ffi::c_void, paused: i32);
+    pub fn up_native_playback_mute(playback: *mut std::ffi::c_void, muted: i32);
+    pub fn up_native_playback_seek(playback: *mut std::ffi::c_void, seconds: f64);
+    pub fn up_native_playback_time(playback: *mut std::ffi::c_void) -> f64;
+    pub fn up_native_playback_status(playback: *mut std::ffi::c_void) -> i32;
+    pub fn up_native_playback_error(playback: *mut std::ffi::c_void) -> *const std::ffi::c_char;
 }
