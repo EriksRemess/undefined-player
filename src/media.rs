@@ -777,6 +777,15 @@ impl Media {
     }
 
     pub(crate) fn video_queue_capacity(&self) -> usize {
+        // Keep the Vulkan decode pipeline supplied at high resolutions. The
+        // 256 MiB policy reduces 8K to four frames, two of which can already be
+        // held as the current/previous presentation frames. That leaves only
+        // two slots to absorb decode and presentation scheduling delays.
+        // Retain the established Linux hardware frame limit; software frames
+        // and VideoToolbox surfaces still use the resolution-based budget.
+        if cfg!(target_os = "linux") && self.video.uses_hardware {
+            return VIDEO_QUEUE_MAX;
+        }
         queue_capacity(
             unsafe { ffi::up_av_decoder_width(self.video.as_ptr()) },
             unsafe { ffi::up_av_decoder_height(self.video.as_ptr()) },

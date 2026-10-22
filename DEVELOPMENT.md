@@ -197,10 +197,12 @@ its decoder, audio, and renderer resources.
 
 ### Buffering and synchronization
 
-The decode worker yields after an 8 ms work budget. Frame capacity uses a
-256 MiB estimate, bounded to 4–24 frames across decoder and handoff queues;
-codec reference pictures are additional. Seek completion counts both queues
-to avoid deadlocking when audio starts later than video.
+The decode worker yields after an 8 ms work budget. Linux Vulkan decoding allows
+24 frames across decoder and handoff queues to retain decode-ahead at 4K/8K.
+Software decoding and VideoToolbox use a 256 MiB estimate, bounded to 4–24 frames.
+These limits include the current and previous presentation frames; codec
+reference pictures are additional. Seek completion counts both queues to avoid
+deadlocking when audio starts later than video.
 
 Demuxing targets a 250 ms audio lead. Compressed video read-ahead is bounded to
 256 packets or 32 MiB, plus one packet. When video is over 250 ms late, catch-up
