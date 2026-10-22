@@ -423,7 +423,10 @@ fn overlay_geometry_matches_controls_and_pixel_buffers() {
                 top_bar: 1.0,
                 info: 0.5,
                 position: 1.0,
-                scrubber: Some((0.5, 1.0)),
+                scrubber: Some(Scrubber {
+                    progress: 0.5,
+                    alpha: 1.0,
+                }),
                 chapter_markers: &[],
             },
             1280,
@@ -503,7 +506,10 @@ fn chapter_dots_are_bounded_cached_and_follow_the_timeline() {
             top_bar: 0.0,
             info: 0.0,
             position: 0.0,
-            scrubber: Some((0.5, 0.75)),
+            scrubber: Some(Scrubber {
+                progress: 0.5,
+                alpha: 0.75,
+            }),
             chapter_markers: &markers,
         };
         let prepared = overlays
@@ -567,7 +573,10 @@ fn chapter_dots_are_bounded_cached_and_follow_the_timeline() {
                 top_bar: 0.0,
                 info: 0.0,
                 position: 0.0,
-                scrubber: Some((0.5, 0.0)),
+                scrubber: Some(Scrubber {
+                    progress: 0.5,
+                    alpha: 0.0,
+                }),
                 chapter_markers: &markers,
             },
             1280,
@@ -787,7 +796,10 @@ fn text_shadows_follow_glyphs_and_fade_with_the_foreground() {
                 top_bar: 0.5,
                 info: 0.25,
                 position: 0.75,
-                scrubber: Some((0.5, 1.0)),
+                scrubber: Some(Scrubber {
+                    progress: 0.5,
+                    alpha: 1.0,
+                }),
                 chapter_markers: &[0.25, 0.75],
             },
             1280,

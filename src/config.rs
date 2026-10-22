@@ -56,7 +56,21 @@ fn setting(line: &str) -> Result<Option<(&str, &str)>> {
     Ok(Some((key, value)))
 }
 
-fn parse(text: &str) -> Result<(u16, String)> {
+struct Settings {
+    corner_radius: u16,
+    preferred_audio_language: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            corner_radius: 0,
+            preferred_audio_language: "en-US".into(),
+        }
+    }
+}
+
+fn parse(text: &str) -> Result<Settings> {
     let mut radius = None;
     let mut language = None;
     for (index, line) in text.lines().enumerate() {
@@ -82,10 +96,11 @@ fn parse(text: &str) -> Result<(u16, String)> {
         })();
         result.map_err(|error: String| format!("line {}: {error}", index + 1))?;
     }
-    Ok((
-        radius.unwrap_or(0),
-        language.unwrap_or_else(|| "en-US".into()),
-    ))
+    let defaults = Settings::default();
+    Ok(Settings {
+        corner_radius: radius.unwrap_or(defaults.corner_radius),
+        preferred_audio_language: language.unwrap_or(defaults.preferred_audio_language),
+    })
 }
 
 pub(crate) struct Config {
@@ -97,23 +112,22 @@ pub(crate) struct Config {
 impl Config {
     pub(crate) fn load() -> Self {
         let path = config_path();
-        let (corner_radius, preferred_audio_language) = path.as_deref().map_or_else(
-            || (0, "en-US".into()),
-            |path| match read(path).and_then(|text| parse(&text)) {
+        let settings = path.as_deref().map_or_else(Settings::default, |path| {
+            match read(path).and_then(|text| parse(&text)) {
                 Ok(settings) => settings,
                 Err(error) => {
                     eprintln!(
                         "warning: invalid config {}: {error}; using defaults",
                         path.display()
                     );
-                    (0, "en-US".into())
+                    Settings::default()
                 }
-            },
-        );
+            }
+        });
         Self {
             path,
-            corner_radius,
-            preferred_audio_language,
+            corner_radius: settings.corner_radius,
+            preferred_audio_language: settings.preferred_audio_language,
         }
     }
 

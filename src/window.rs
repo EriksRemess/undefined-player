@@ -118,7 +118,8 @@ pub(crate) fn action_for_key(key: u32) -> Option<Action> {
     }
 }
 
-pub(crate) unsafe fn sdl_error() -> String {
+pub(crate) fn sdl_error() -> String {
+    // SAFETY: SDL exposes a thread-local error string; copy it before another call.
     let error = unsafe { ffi::up_platform_error() };
     if error.is_null() {
         "unknown SDL error".into()
@@ -161,6 +162,9 @@ pub(crate) fn scrubber_target(
 pub(crate) struct Sdl;
 
 impl Sdl {
+    /// # Safety
+    /// Call once on the main thread, before spawning threads that may read the
+    /// environment. Drop this guard on that thread after all SDL resources.
     pub(crate) unsafe fn init() -> Result<Self> {
         // Keep Linux backend selection explicit; SDL selects native macOS drivers.
         #[cfg(target_os = "linux")]
@@ -169,9 +173,7 @@ impl Sdl {
             env::set_var("SDL_AUDIODRIVER", "pipewire");
         }
         if unsafe { ffi::up_platform_init() } == 0 {
-            return Err(format!("SDL initialization failed: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("SDL initialization failed: {}", sdl_error()));
         }
         Ok(Self)
     }
@@ -185,6 +187,14 @@ impl Drop for Sdl {
 
 pub(crate) struct Window(*mut ffi::UpWindow);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowDimensions {
+    pub(crate) logical_width: i32,
+    pub(crate) logical_height: i32,
+    pub(crate) pixel_width: i32,
+    pub(crate) pixel_height: i32,
+}
+
 impl Window {
     pub(crate) fn as_ptr(&self) -> *mut ffi::UpWindow {
         self.0
@@ -192,19 +202,21 @@ impl Window {
 
     pub(crate) fn set_fullscreen(&self, fullscreen: bool) -> Result<()> {
         if unsafe { ffi::up_window_set_fullscreen(self.0, i32::from(fullscreen)) } == 0 {
-            return Err(format!("could not toggle fullscreen: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("could not toggle fullscreen: {}", sdl_error()));
         }
         Ok(())
     }
 
+    /// # Safety
+    /// SDL must be initialized on this main thread and remain alive until the
+    /// window and its dependent resources have been dropped.
     pub(crate) unsafe fn create(title: &CStr) -> Result<Self> {
         let window = unsafe { ffi::up_window_create(title.as_ptr(), 1280, 720) };
         if window.is_null() {
-            return Err(format!("could not create the video window: {}", unsafe {
+            return Err(format!(
+                "could not create the video window: {}",
                 sdl_error()
-            }));
+            ));
         }
         Ok(Self(window))
     }
@@ -213,15 +225,18 @@ impl Window {
         let mut width = 0;
         let mut height = 0;
         if unsafe { ffi::up_window_pixel_size(self.0, &mut width, &mut height) } == 0 {
-            return Err(format!("could not query window size: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("could not query window size: {}", sdl_error()));
         }
         Ok((width, height))
     }
 
     fn geometry(&self) -> Option<geometry::WindowGeometry> {
-        let (width, height, pixel_width, pixel_height) = self.dimensions().ok()?;
+        let WindowDimensions {
+            logical_width: width,
+            logical_height: height,
+            pixel_width,
+            pixel_height,
+        } = self.dimensions().ok()?;
         let radius = unsafe { ffi::up_window_corner_radius(self.0) };
         Some(
             geometry::WindowGeometry::new(width, height, pixel_width, pixel_height)?
@@ -229,15 +244,18 @@ impl Window {
         )
     }
 
-    pub(crate) fn dimensions(&self) -> Result<(i32, i32, i32, i32)> {
+    pub(crate) fn dimensions(&self) -> Result<WindowDimensions> {
         let (mut width, mut height) = (0, 0);
         if unsafe { ffi::up_window_size(self.0, &mut width, &mut height) } == 0 {
-            return Err(format!("could not query window size: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("could not query window size: {}", sdl_error()));
         }
         let (pw, ph) = self.pixel_size()?;
-        Ok((width, height, pw, ph))
+        Ok(WindowDimensions {
+            logical_width: width,
+            logical_height: height,
+            pixel_width: pw,
+            pixel_height: ph,
+        })
     }
 
     pub(crate) fn close_button_contains(&self, x: f32, y: f32) -> bool {
@@ -254,7 +272,7 @@ impl Window {
         if unsafe { ffi::up_window_set_minimum_size(self.0, 320, 180) } == 0 {
             return Err(format!(
                 "could not set the minimum window size: {}",
-                unsafe { sdl_error() }
+                sdl_error()
             ));
         }
         Ok(())
@@ -324,7 +342,7 @@ impl<'window> WindowShape<'window> {
         if unsafe { ffi::up_window_set_corner_radius(self._window.as_ptr(), radius) } == 0 {
             return Err(format!(
                 "could not update the macOS window shape: {}",
-                unsafe { sdl_error() }
+                sdl_error()
             ));
         }
         Ok(())

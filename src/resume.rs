@@ -340,7 +340,8 @@ impl Prompt {
     pub(crate) fn text(&self) -> CString {
         let question = format!("Resume from {}?", format_position(self.position));
         let indent = " ".repeat(question.len().saturating_sub(5) / 2);
-        CString::new(format!("{question}\n{indent}Y / N")).unwrap()
+        CString::new(format!("{question}\n{indent}Y / N"))
+            .expect("formatted resume prompt contains no NUL bytes")
     }
 }
 

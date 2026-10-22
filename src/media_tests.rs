@@ -181,9 +181,7 @@ fn playback_child() {
     let Ok(case) = env::var("UP_REGRESSION_CASE") else {
         return;
     };
-    assert_ne!(unsafe { ffi::up_platform_init() }, 0, "{}", unsafe {
-        sdl_error()
-    });
+    assert_ne!(unsafe { ffi::up_platform_init() }, 0, "{}", sdl_error());
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
@@ -465,7 +463,7 @@ fn playback_child() {
                 loop {
                     let result = unsafe { ffi::up_av_read_frame(media.format, media.packet) };
                     if result < 0 {
-                        assert!(unsafe { crate::decoder::ffmpeg_error_is_eof(result) });
+                        assert!(crate::decoder::ffmpeg_error_is_eof(result));
                         break;
                     }
                     let index = unsafe { ffi::up_av_packet_stream_index(media.packet) };

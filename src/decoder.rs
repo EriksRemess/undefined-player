@@ -2,24 +2,31 @@ use crate::{Result, ffi};
 use std::ffi::{CStr, c_void};
 use std::ptr;
 
-pub(crate) unsafe fn ffmpeg_error(code: i32) -> String {
+pub(crate) fn ffmpeg_error(code: i32) -> String {
     let mut buffer = [0_i8; 128];
+    // SAFETY: the writable buffer and its capacity belong to this call.
     if unsafe { ffi::up_av_error_string(code, buffer.as_mut_ptr(), buffer.len()) } < 0 {
         return format!("FFmpeg error {code}");
     }
+    // SAFETY: a successful up_av_error_string call writes a terminated string.
     unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_string_lossy()
         .into_owned()
 }
 
-pub(crate) unsafe fn ffmpeg_error_is_again(code: i32) -> bool {
+pub(crate) fn ffmpeg_error_is_again(code: i32) -> bool {
+    // SAFETY: this native predicate accepts any integer and retains no state.
     unsafe { ffi::up_av_error_is_again(code) != 0 }
 }
 
-pub(crate) unsafe fn ffmpeg_error_is_eof(code: i32) -> bool {
+pub(crate) fn ffmpeg_error_is_eof(code: i32) -> bool {
+    // SAFETY: this native predicate accepts any integer and retains no state.
     unsafe { ffi::up_av_error_is_eof(code) != 0 }
 }
 
+/// # Safety
+/// A non-null pointer must reference a readable, NUL-terminated string that
+/// remains unchanged for the call.
 pub(crate) unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<String> {
     (!pointer.is_null()).then(|| {
         unsafe { CStr::from_ptr(pointer) }
@@ -28,6 +35,8 @@ pub(crate) unsafe fn ffmpeg_name(pointer: *const std::ffi::c_char) -> Option<Str
     })
 }
 
+/// # Safety
+/// `format` must be a live format context, with no concurrent mutation or close.
 pub(crate) unsafe fn stream_metadata(
     format: *const ffi::UpAvFormat,
     stream_index: u32,
@@ -63,6 +72,10 @@ impl Decoder {
         self.context
     }
 
+    /// # Safety
+    /// `format` must be live and exclusively accessed for this call. The optional
+    /// hardware device must be valid and its renderer must outlive this decoder
+    /// and all frames produced by it.
     pub(crate) unsafe fn open(
         format: *mut ffi::UpAvFormat,
         stream_index: i32,
@@ -123,6 +136,11 @@ impl VideoFrame {
     }
 
     /// Takes ownership of a non-null FFmpeg frame reference.
+    ///
+    /// # Safety
+    /// `frame` must be a live reference allocated by the native frame adapter.
+    /// Ownership of that reference is transferred here: callers must neither
+    /// free it nor mutate it through aliases. Backing buffers may be refcounted.
     pub(crate) unsafe fn from_raw(frame: *mut ffi::UpAvFrame, pts: f64, duration: f64) -> Self {
         Self {
             frame,
@@ -137,7 +155,7 @@ impl VideoFrame {
     }
 }
 
-// The worker transfers exclusive ownership of each reference-counted AVFrame
+// SAFETY: the worker transfers exclusive ownership of each reference-counted AVFrame
 // to the presentation thread; the pointer is never accessed concurrently.
 unsafe impl Send for VideoFrame {}
 

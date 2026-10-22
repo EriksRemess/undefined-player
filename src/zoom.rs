@@ -74,8 +74,11 @@ fn fill_crop(
     ]
 }
 
-// The native adapter passes the libplacebo source rectangle after autocrop.
-// SAFETY: rect must point to four writable floats for the duration of the call.
+/// Adjust the native renderer source rectangle after autocrop.
+///
+/// # Safety
+/// `rect` must point to four initialized, aligned, writable floats with exclusive
+/// access for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn up_video_fill_crop(
     rect: *mut f32,
@@ -85,6 +88,7 @@ pub unsafe extern "C" fn up_video_fill_crop(
     width: i32,
     height: i32,
 ) {
+    // SAFETY: the caller supplies an exclusive, aligned four-float rectangle.
     let rect = unsafe { &mut *rect.cast::<[f32; 4]>() };
     *rect = fill_crop(*rect, sar_num, sar_den, rotation, width, height);
 }

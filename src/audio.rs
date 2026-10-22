@@ -29,7 +29,7 @@ struct AudioControlState {
     muted: bool,
 }
 
-// Stream lifetime is serialized by the mutex, and SDL documents stream gain
+// SAFETY: stream lifetime is serialized by the mutex, and SDL documents stream gain
 // changes as safe from any thread while audio data is being consumed.
 unsafe impl Send for AudioControlState {}
 
@@ -47,7 +47,7 @@ impl AudioControl {
         {
             return Err(format!(
                 "could not initialize audio mute state: {}",
-                unsafe { sdl_error() }
+                sdl_error()
             ));
         }
         state.streams.push(stream);
@@ -55,6 +55,9 @@ impl AudioControl {
     }
 
     fn detach(&self, stream: *mut ffi::UpAudioStream) {
+        // Drop must remove this pointer even after a panic, before freeing the
+        // stream. Ordinary operations reject poison; cleanup only removes an
+        // entry and does not dereference possibly inconsistent stream state.
         let mut state = self
             .0
             .lock()
@@ -70,9 +73,10 @@ impl AudioControl {
         for &stream in &state.streams {
             if unsafe { ffi::up_audio_stream_set_gain(stream, if muted { 0.0 } else { 1.0 }) } == 0
             {
-                return Err(format!("could not change audio mute state: {}", unsafe {
+                return Err(format!(
+                    "could not change audio mute state: {}",
                     sdl_error()
-                }));
+                ));
             }
         }
         state.muted = muted;
@@ -88,6 +92,12 @@ impl AudioControl {
     }
 }
 
+/// Owns an SDL stream and its audio converter.
+///
+/// # Native resource invariants
+/// `stream` must remain the live stream created by this output; aliases must not
+/// destroy it or mutate its queue. SDL must outlive the output. AudioControl gain
+/// changes are synchronized separately and may run concurrently.
 pub(crate) struct AudioOutput {
     pub(crate) stream: *mut ffi::UpAudioStream,
     converter: *mut ffi::UpAvAudioConverter,
@@ -104,12 +114,12 @@ pub(crate) struct AudioOutput {
 }
 
 impl AudioOutput {
+    /// # Safety
+    /// SDL audio must be initialized and remain alive until the output is dropped.
     pub(crate) unsafe fn create(control: AudioControl) -> Result<Self> {
         let stream = unsafe { ffi::up_audio_stream_create(AUDIO_RATE, AUDIO_CHANNELS) };
         if stream.is_null() {
-            return Err(format!("could not open audio output: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("could not open audio output: {}", sdl_error()));
         }
         if let Err(error) = unsafe { control.attach(stream) } {
             unsafe { ffi::up_audio_stream_destroy(stream) };
@@ -132,6 +142,10 @@ impl AudioOutput {
         })
     }
 
+    /// # Safety
+    /// Preserve [`AudioOutput`]'s native resource invariants. `frame` must be a
+    /// live decoded audio frame, with readable sample buffers and channel layout,
+    /// that is neither modified nor freed during this call.
     pub(crate) unsafe fn initialize_converter(
         &mut self,
         frame: *const ffi::UpAvFrame,
@@ -146,12 +160,16 @@ impl AudioOutput {
         if self.converter.is_null() {
             return Err(format!(
                 "could not configure audio conversion: {}",
-                unsafe { ffmpeg_error(error) }
+                ffmpeg_error(error)
             ));
         }
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve [`AudioOutput`]'s native resource invariants. `frame` must be a
+    /// live decoded audio frame, with readable sample buffers and channel layout,
+    /// that is neither modified nor freed during this call.
     pub(crate) unsafe fn push(
         &mut self,
         frame: *const ffi::UpAvFrame,
@@ -187,7 +205,7 @@ impl AudioOutput {
         if capacity < 0 {
             return Err(format!(
                 "could not calculate converted audio size: {}",
-                unsafe { ffmpeg_error(capacity) }
+                ffmpeg_error(capacity)
             ));
         }
         let mut samples = vec![0_f32; capacity as usize * AUDIO_CHANNELS as usize];
@@ -200,9 +218,10 @@ impl AudioOutput {
             )
         };
         if converted < 0 {
-            return Err(format!("audio conversion failed: {}", unsafe {
+            return Err(format!(
+                "audio conversion failed: {}",
                 ffmpeg_error(converted)
-            }));
+            ));
         }
         samples.truncate(converted as usize * AUDIO_CHANNELS as usize);
         let retained = self.append_samples(samples, discard_before);
@@ -234,6 +253,8 @@ impl AudioOutput {
         true
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn drain_converter(&mut self, discard_before: Option<f64>) -> Result<()> {
         if self.converter.is_null() {
             return Ok(());
@@ -241,9 +262,10 @@ impl AudioOutput {
         loop {
             let capacity = unsafe { ffi::up_av_audio_converter_drain_capacity(self.converter) };
             if capacity < 0 {
-                return Err(format!("could not size buffered audio: {}", unsafe {
+                return Err(format!(
+                    "could not size buffered audio: {}",
                     ffmpeg_error(capacity)
-                }));
+                ));
             }
             if capacity == 0 {
                 break;
@@ -253,9 +275,10 @@ impl AudioOutput {
                 ffi::up_av_audio_converter_drain(self.converter, samples.as_mut_ptr(), capacity)
             };
             if converted < 0 {
-                return Err(format!("could not drain audio conversion: {}", unsafe {
+                return Err(format!(
+                    "could not drain audio conversion: {}",
                     ffmpeg_error(converted)
-                }));
+                ));
             }
             if converted == 0 {
                 break;
@@ -266,6 +289,8 @@ impl AudioOutput {
         unsafe { self.pump() }
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn pump(&mut self) -> Result<()> {
         self.starved |=
             self.resumed && self.submitted_frames > 0 && unsafe { self.queued_bytes() } == 0;
@@ -287,7 +312,10 @@ impl AudioOutput {
                 self.segment_frames = 0;
             }
             let available = (AUDIO_QUEUE_MAX_BYTES - queued).max(0) as usize / size_of::<f32>();
-            let chunk = self.pending.front_mut().unwrap();
+            let chunk = self
+                .pending
+                .front_mut()
+                .expect("the loop has a pending chunk");
             let count = (chunk.samples.len() - chunk.offset).min(available);
             if count == 0 {
                 break;
@@ -306,7 +334,7 @@ impl AudioOutput {
                 )
             } == 0
             {
-                return Err(format!("could not queue audio: {}", unsafe { sdl_error() }));
+                return Err(format!("could not queue audio: {}", sdl_error()));
             }
             chunk.offset += count;
             let frames = (count / AUDIO_CHANNELS as usize) as i64;
@@ -319,10 +347,14 @@ impl AudioOutput {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn full(&self) -> bool {
         !self.pending.is_empty() || unsafe { self.queued_bytes() } >= AUDIO_QUEUE_MAX_BYTES
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn active_clock(&self) -> Option<f64> {
         if self.resumed && unsafe { self.queued_bytes() } > 0 {
             unsafe { self.clock() }
@@ -331,16 +363,22 @@ impl AudioOutput {
         }
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn queued_bytes(&self) -> i32 {
         unsafe { ffi::up_audio_stream_queued(self.stream) }.max(0)
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn clock(&self) -> Option<f64> {
         let base = self.first_pts?;
         let queued_frames = unsafe { self.queued_bytes() } as i64 / AUDIO_BYTES_PER_FRAME;
         Some(base + (self.segment_frames - queued_frames) as f64 / AUDIO_RATE as f64)
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn set_paused(&mut self, paused: bool) -> Result<()> {
         if self.resumed == !paused {
             return Ok(());
@@ -351,9 +389,10 @@ impl AudioOutput {
             unsafe { ffi::up_audio_stream_resume(self.stream) }
         };
         if ok == 0 {
-            return Err(format!("could not change audio pause state: {}", unsafe {
+            return Err(format!(
+                "could not change audio pause state: {}",
                 sdl_error()
-            }));
+            ));
         }
         self.resumed = !paused;
         if paused {
@@ -362,11 +401,11 @@ impl AudioOutput {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`AudioOutput`].
     pub(crate) unsafe fn reset(&mut self) -> Result<()> {
         if unsafe { ffi::up_audio_stream_clear(self.stream) } == 0 {
-            return Err(format!("could not clear queued audio: {}", unsafe {
-                sdl_error()
-            }));
+            return Err(format!("could not clear queued audio: {}", sdl_error()));
         }
         unsafe { ffi::up_av_audio_converter_free(&mut self.converter) };
         self.first_pts = None;

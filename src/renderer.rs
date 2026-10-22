@@ -1,6 +1,6 @@
 use crate::decoder::VideoFrame;
 use crate::subtitles::{SubtitleContent, SubtitleCue};
-use crate::window::{Window, WindowShape};
+use crate::window::{Window, WindowDimensions, WindowShape};
 use crate::{Result, ffi, overlay};
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
@@ -16,8 +16,14 @@ pub(crate) struct Renderer<'window> {
     corner_radius: u16,
     corner_pixels: f32,
     corner_disabled: bool,
-    shape_key: Option<(i32, i32, i32, i32, u32)>,
+    shape_key: Option<WindowShapeKey>,
     _window: &'window Window,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct WindowShapeKey {
+    dimensions: WindowDimensions,
+    radius_bits: u32,
 }
 
 pub(crate) struct VideoFrames<'a> {
@@ -26,12 +32,18 @@ pub(crate) struct VideoFrames<'a> {
     pub(crate) next: Option<&'a VideoFrame>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TextOverlay<'a> {
+    pub(crate) text: &'a CStr,
+    pub(crate) alpha: f32,
+}
+
 pub(crate) struct RendererOverlays<'a> {
-    pub(crate) info: Option<(&'a CStr, f32)>,
+    pub(crate) info: Option<TextOverlay<'a>>,
     pub(crate) details: Option<&'a CStr>,
     pub(crate) metadata: Option<&'a CStr>,
-    pub(crate) position: Option<(&'a CStr, f32)>,
-    pub(crate) scrubber: Option<(f32, f32)>,
+    pub(crate) position: Option<TextOverlay<'a>>,
+    pub(crate) scrubber: Option<overlay::Scrubber>,
     pub(crate) chapter_markers: &'a [f32],
     pub(crate) subtitle: Option<&'a SubtitleCue>,
     pub(crate) palette: &'a CStr,
@@ -103,7 +115,9 @@ impl<'window> Renderer<'window> {
         })
     }
 
-    pub(crate) unsafe fn device(&self) -> Option<*mut c_void> {
+    /// The borrowed device pointer is valid only while this renderer is alive.
+    pub(crate) fn device(&self) -> Option<*mut c_void> {
+        // SAFETY: self owns a live renderer; returning a raw pointer does not dereference it.
         ptr::NonNull::new(unsafe { ffi::up_video_renderer_device(self.context) })
             .map(|p| p.as_ptr())
     }
@@ -113,7 +127,13 @@ impl<'window> Renderer<'window> {
     }
 
     pub(crate) fn update_window_shape(&mut self, input: Option<&WindowShape<'_>>) -> Result<bool> {
-        let (width, height, pw, ph) = self._window.dimensions()?;
+        let dimensions = self._window.dimensions()?;
+        let WindowDimensions {
+            logical_width: width,
+            logical_height: height,
+            pixel_width: pw,
+            pixel_height: ph,
+        } = dimensions;
         if width <= 0 || height <= 0 || pw <= 0 || ph <= 0 {
             return Ok(false);
         }
@@ -124,14 +144,17 @@ impl<'window> Renderer<'window> {
         } else {
             0.0
         };
-        let key = (width, height, pw, ph, pixels.to_bits());
+        let key = WindowShapeKey {
+            dimensions,
+            radius_bits: pixels.to_bits(),
+        };
         if self.shape_key == Some(key) {
             return Ok(false);
         }
         if let Some(input) = input {
             let rectangles = if pixels > 0.0 {
                 crate::geometry::WindowGeometry::new(width, height, pw, ph)
-                    .unwrap()
+                    .expect("positive window dimensions form valid geometry")
                     .with_radius(pixels)
                     .input_rectangles()
             } else {
@@ -213,7 +236,7 @@ impl<'window> Renderer<'window> {
             .filter(|next| field != 0 && crate::deinterlace::adjacent(frame, next));
         let info = overlays
             .info
-            .map_or(c"", |(text, _)| text)
+            .map_or(c"", |overlay| overlay.text)
             .to_string_lossy();
         let details = overlays.details.map_or_else(String::new, |details| {
             #[cfg(target_os = "macos")]
@@ -239,7 +262,7 @@ impl<'window> Renderer<'window> {
         });
         let position = overlays
             .position
-            .map_or(c"", |(text, _)| text)
+            .map_or(c"", |overlay| overlay.text)
             .to_string_lossy();
         let prepared = self.overlays.prepare(
             overlay::Content {
@@ -252,8 +275,8 @@ impl<'window> Renderer<'window> {
             },
             overlay::Visibility {
                 top_bar: top_bar_alpha,
-                info: overlays.info.map_or(0.0, |(_, alpha)| alpha),
-                position: overlays.position.map_or(0.0, |(_, alpha)| alpha),
+                info: overlays.info.map_or(0.0, |overlay| overlay.alpha),
+                position: overlays.position.map_or(0.0, |overlay| overlay.alpha),
                 scrubber: overlays.scrubber,
                 chapter_markers: overlays.chapter_markers,
             },
@@ -271,7 +294,10 @@ impl<'window> Renderer<'window> {
             match overlays.subtitle {
                 Some(cue) => match &cue.content {
                     SubtitleContent::Text(_) => (
-                        rendered_subtitle.as_ref().unwrap().as_ptr(),
+                        rendered_subtitle
+                            .as_ref()
+                            .expect("text cue has a rendered subtitle")
+                            .as_ptr(),
                         ptr::null(),
                         0,
                         0,

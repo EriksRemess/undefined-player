@@ -1,5 +1,3 @@
-#![allow(clippy::missing_safety_doc)]
-
 use cli::{CliAction, parse_cli, usage};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -26,6 +24,7 @@ mod metadata;
 #[cfg_attr(target_os = "macos", path = "mpris_macos.rs")]
 mod mpris;
 mod overlay;
+mod palette;
 mod pixel_font;
 mod playback;
 mod presentation;
@@ -104,6 +103,8 @@ fn main() {
 }
 
 fn run_player(source: Option<source::MediaSource>, perf_log: bool) -> Result<()> {
+    // SAFETY: startup runs on the main thread before player workers are created.
+    // This guard outlives every playback session and its native resources.
     let _sdl = unsafe { window::Sdl::init()? };
     #[cfg(target_os = "macos")]
     let source = match source {
@@ -114,6 +115,7 @@ fn run_player(source: Option<source::MediaSource>, perf_log: bool) -> Result<()>
     while let Some(source) = next {
         let source = youtube::resolve(source)?;
         let is_youtube = matches!(source, source::MediaSource::YouTube { .. });
+        // SAFETY: SDL remains initialized on this main thread for the session.
         next = unsafe { playback::run(source, perf_log) }.map_err(|error| {
             if is_youtube {
                 youtube::playback_error(&error)

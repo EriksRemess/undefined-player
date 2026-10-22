@@ -2,6 +2,12 @@
 //! Keep the selected rendition's track groups and all global playlist tags.
 use std::ffi::CString;
 
+/// Register playlists referenced by a master playlist.
+///
+/// # Safety
+/// `size` must be nonnegative and `buffer` non-null and readable for `size` bytes,
+/// without concurrent mutation. `register` must accept `opaque` and a temporary
+/// NUL-terminated URI, copy any retained URI, and never unwind across the C ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn up_hls_master_playlists(
     buffer: *const u8,
@@ -9,6 +15,7 @@ pub unsafe extern "C" fn up_hls_master_playlists(
     opaque: *mut std::ffi::c_void,
     register: unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_char, i32),
 ) {
+    // SAFETY: the caller guarantees the buffer bounds and lifetime.
     let bytes = unsafe { std::slice::from_raw_parts(buffer, size as usize) };
     let Ok(text) = std::str::from_utf8(bytes) else {
         return;
@@ -37,6 +44,11 @@ pub unsafe extern "C" fn up_hls_master_playlists(
 }
 
 /// Register segment references from a subtitle playlist.
+///
+/// # Safety
+/// `size` must be nonnegative and `buffer` non-null and readable for `size` bytes,
+/// without concurrent mutation. `register` must accept `opaque` and a temporary
+/// NUL-terminated URI, copy any retained URI, and never unwind across the C ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn up_hls_subtitle_segments(
     buffer: *const u8,
@@ -44,6 +56,7 @@ pub unsafe extern "C" fn up_hls_subtitle_segments(
     opaque: *mut std::ffi::c_void,
     register: unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_char),
 ) {
+    // SAFETY: the caller guarantees the buffer bounds and lifetime.
     let bytes = unsafe { std::slice::from_raw_parts(buffer, size as usize) };
     let Ok(text) = std::str::from_utf8(bytes) else {
         return;
@@ -89,7 +102,7 @@ fn supported_codecs(attributes: &str) -> bool {
             // Unknown codec strings and audio codecs must not rule out video.
             _ => return true,
         };
-        let name = CString::new(name).unwrap();
+        let name = CString::new(name).expect("static codec names contain no NUL bytes");
         unsafe { crate::ffi::up_av_video_decoder_available(name.as_ptr()) != 0 }
     })
 }
@@ -153,12 +166,18 @@ fn select(master: &str) -> Option<String> {
 }
 
 /// The native adapter owns the buffer; selection only removes playlist lines.
+///
+/// # Safety
+/// `size` must be nonnegative and `buffer` non-null, readable and writable for
+/// `size` bytes, with exclusive access for the entire call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn up_hls_select_variant(buffer: *mut u8, size: i32) -> i32 {
+    // SAFETY: the caller guarantees the buffer bounds and lifetime.
     let bytes = unsafe { std::slice::from_raw_parts(buffer, size as usize) };
     let Some(filtered) = std::str::from_utf8(bytes).ok().and_then(select) else {
         return size;
     };
+    // SAFETY: selection only shrinks the input; filtered owns a separate allocation.
     unsafe { std::ptr::copy_nonoverlapping(filtered.as_ptr(), buffer, filtered.len()) };
     filtered.len() as i32
 }

@@ -51,6 +51,24 @@ pub(crate) enum AudioTrackError {
     Playback(String),
 }
 
+impl std::fmt::Display for AudioTrackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Playback(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AudioTrackError {}
+
+/// Owns one demux/decode session.
+///
+/// # Native resource invariants
+/// Raw contexts and packets must remain live and owned by this session. Callers
+/// must not replace/free the exposed pointers or access them concurrently through
+/// aliases. After transfer to DecodeWorker, its mutex serializes session access.
+/// SDL and the renderer's shared hardware device must outlive the session and
+/// any frames transferred out of it.
 pub(crate) struct Media {
     pub(crate) format: *mut ffi::UpAvFormat,
     interrupt: Arc<AtomicBool>,
@@ -80,6 +98,10 @@ pub(crate) struct Media {
 }
 
 impl Media {
+    /// # Safety
+    /// SDL must remain initialized until this session is dropped. Any supplied
+    /// hardware device must be valid, support synchronized decoder access, and
+    /// remain alive until this session and its output frames are dropped.
     pub(crate) unsafe fn open<S: MediaInput + ?Sized>(
         source: &S,
         hardware_device: Option<*mut c_void>,
@@ -96,6 +118,10 @@ impl Media {
         }
     }
 
+    /// # Safety
+    /// SDL must remain initialized until this session is dropped. Any supplied
+    /// hardware device must be valid, support synchronized decoder access, and
+    /// remain alive until this session and its output frames are dropped.
     pub(crate) unsafe fn open_with_controls<S: MediaInput + ?Sized>(
         source: &S,
         hardware_device: Option<*mut c_void>,
@@ -157,9 +183,7 @@ impl Media {
             )
         };
         if ret < 0 {
-            return Err(format!("could not open media: {}", unsafe {
-                ffmpeg_error(ret)
-            }));
+            return Err(format!("could not open media: {}", ffmpeg_error(ret)));
         }
 
         if log_subtitles {
@@ -178,9 +202,10 @@ impl Media {
                 );
             }
             if ret < 0 {
-                return Err(format!("could not inspect media streams: {}", unsafe {
+                return Err(format!(
+                    "could not inspect media streams: {}",
                     ffmpeg_error(ret)
-                }));
+                ));
             }
 
             let mut video_rank = 0;
@@ -332,7 +357,7 @@ impl Media {
             if ret < 0 {
                 return Err(format!(
                     "could not restart selected HLS streams: {}",
-                    unsafe { ffmpeg_error(ret) }
+                    ffmpeg_error(ret)
                 ));
             }
             let packet = unsafe { ffi::up_av_packet_alloc() };
@@ -383,17 +408,17 @@ impl Media {
         self.audio_control.clone()
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn receive_video(&mut self) -> Result<()> {
         loop {
             let mut frame = ptr::null_mut();
             let ret = unsafe { ffi::up_av_decoder_receive_frame(self.video.as_ptr(), &mut frame) };
             if ret < 0 {
-                if unsafe { ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) } {
+                if ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) {
                     break;
                 }
-                return Err(format!("video decoding failed: {}", unsafe {
-                    ffmpeg_error(ret)
-                }));
+                return Err(format!("video decoding failed: {}", ffmpeg_error(ret)));
             }
             if self.video.uses_hardware && unsafe { ffi::up_av_frame_is_hardware(frame) } == 0 {
                 unsafe { ffi::up_av_frame_free(&mut frame) };
@@ -431,6 +456,8 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn receive_audio(&mut self) -> Result<()> {
         let Some(track) = self.audio_tracks.get(self.selected_audio_track) else {
             return Ok(());
@@ -442,12 +469,10 @@ impl Media {
             let mut frame = ptr::null_mut();
             let ret = unsafe { ffi::up_av_decoder_receive_frame(context, &mut frame) };
             if ret < 0 {
-                if unsafe { ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) } {
+                if ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) {
                     break;
                 }
-                return Err(format!("audio decoding failed: {}", unsafe {
-                    ffmpeg_error(ret)
-                }));
+                return Err(format!("audio decoding failed: {}", ffmpeg_error(ret)));
             }
             if let Some(audio) = self.audio.as_mut() {
                 let result = unsafe { audio.push(frame, time_base, self.audio_seek_target) };
@@ -462,6 +487,8 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn decode_subtitle_packet(&mut self, track: usize) -> Result<()> {
         let decoder = &self.subtitle_tracks[track].decoder;
         let context = decoder.as_ptr();
@@ -469,9 +496,10 @@ impl Media {
         let mut ret = 0;
         let mut subtitle = unsafe { ffi::up_av_decode_subtitle(context, self.packet, &mut ret) };
         if ret < 0 {
-            return Err(format!("subtitle decoder rejected a packet: {}", unsafe {
+            return Err(format!(
+                "subtitle decoder rejected a packet: {}",
                 ffmpeg_error(ret)
-            }));
+            ));
         }
         if subtitle.is_null() {
             return Ok(());
@@ -634,14 +662,17 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn decode_packet(&mut self) -> Result<()> {
         let stream_index = unsafe { ffi::up_av_packet_stream_index(self.packet) };
         if stream_index == self.video.stream_index {
             let ret = unsafe { ffi::up_av_decoder_send_packet(self.video.as_ptr(), self.packet) };
             if ret < 0 {
-                return Err(format!("video decoder rejected a packet: {}", unsafe {
+                return Err(format!(
+                    "video decoder rejected a packet: {}",
                     ffmpeg_error(ret)
-                }));
+                ));
             }
             unsafe { self.receive_video()? };
         } else if self
@@ -654,9 +685,10 @@ impl Media {
                 .as_ptr();
             let ret = unsafe { ffi::up_av_decoder_send_packet(context, self.packet) };
             if ret < 0 {
-                return Err(format!("audio decoder rejected a packet: {}", unsafe {
+                return Err(format!(
+                    "audio decoder rejected a packet: {}",
                     ffmpeg_error(ret)
-                }));
+                ));
             }
             unsafe { self.receive_audio()? };
         } else if let Some(track) = self
@@ -670,7 +702,10 @@ impl Media {
     }
 
     unsafe fn decode_buffered_video(&mut self) -> Result<()> {
-        let packet = self.video_packets.pop_front().unwrap();
+        let packet = self
+            .video_packets
+            .pop_front()
+            .expect("buffered decode requires a queued packet");
         self.video_packet_bytes -= unsafe { ffi::up_av_packet_size(packet.0) }.max(0) as usize;
         let timestamp = unsafe { ffi::up_av_packet_pts(packet.0) };
         let pts = (timestamp != AV_NOPTS_VALUE).then_some(timestamp as f64 * self.video.time_base);
@@ -697,31 +732,35 @@ impl Media {
         if ret < 0 {
             return Err(format!(
                 "video decoder rejected a buffered packet: {}",
-                unsafe { ffmpeg_error(ret) }
+                ffmpeg_error(ret)
             ));
         }
         unsafe { self.receive_video() }
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn drain(&mut self) -> Result<()> {
         if self.drained {
             return Ok(());
         }
         self.drained = true;
         let video_ret = unsafe { ffi::up_av_decoder_send_packet(self.video.as_ptr(), ptr::null()) };
-        if video_ret < 0 && !unsafe { ffmpeg_error_is_eof(video_ret) } {
-            return Err(format!("could not drain video decoder: {}", unsafe {
+        if video_ret < 0 && !ffmpeg_error_is_eof(video_ret) {
+            return Err(format!(
+                "could not drain video decoder: {}",
                 ffmpeg_error(video_ret)
-            }));
+            ));
         }
         unsafe { self.receive_video()? };
         if let Some(track) = self.audio_tracks.get(self.selected_audio_track) {
             let audio_ret =
                 unsafe { ffi::up_av_decoder_send_packet(track.decoder.as_ptr(), ptr::null()) };
-            if audio_ret < 0 && !unsafe { ffmpeg_error_is_eof(audio_ret) } {
-                return Err(format!("could not drain audio decoder: {}", unsafe {
+            if audio_ret < 0 && !ffmpeg_error_is_eof(audio_ret) {
+                return Err(format!(
+                    "could not drain audio decoder: {}",
                     ffmpeg_error(audio_ret)
-                }));
+                ));
             }
             unsafe { self.receive_audio()? };
         }
@@ -731,6 +770,8 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn fill_queues(&mut self) -> Result<()> {
         unsafe { self.fill_queues_with_budget(None, self.video_queue_capacity()) }
     }
@@ -744,6 +785,8 @@ impl Media {
 
     // Publish frames promptly even when one high-resolution decode is slow.
     // Startup and synchronous callers can still fill their complete buffers.
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn fill_queues_step(&mut self, capacity: usize) -> Result<()> {
         unsafe { self.fill_queues_with_budget(Some(std::time::Duration::from_millis(8)), capacity) }
     }
@@ -791,13 +834,14 @@ impl Media {
                 }
                 let ret = unsafe { ffi::up_av_read_frame(self.format, self.packet) };
                 if ret < 0 {
-                    if unsafe { ffmpeg_error_is_again(ret) } {
+                    if ffmpeg_error_is_again(ret) {
                         break;
                     }
-                    if !unsafe { ffmpeg_error_is_eof(ret) } {
-                        return Err(format!("could not read media packet: {}", unsafe {
+                    if !ffmpeg_error_is_eof(ret) {
+                        return Err(format!(
+                            "could not read media packet: {}",
                             ffmpeg_error(ret)
-                        }));
+                        ));
                     }
                     self.input_eof = true;
                     continue;
@@ -828,6 +872,8 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn fill_initial_queues(&mut self) -> Result<()> {
         while self.video_queue.is_empty() && !self.eof && !unsafe { self.audio_full() } {
             unsafe { self.fill_queues()? };
@@ -835,12 +881,16 @@ impl Media {
         Ok(())
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn audio_full(&self) -> bool {
         self.audio
             .as_ref()
             .is_some_and(|audio| unsafe { audio.full() })
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn sync_audio(&mut self, playback_time: f64, paused: bool) -> Result<()> {
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.pump()? };
@@ -857,6 +907,8 @@ impl Media {
         (duration.is_finite() && duration > 0.0).then_some(duration)
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn seek(&mut self, requested_target: f64) -> Result<f64> {
         unsafe { self.seek_input(requested_target)? };
         unsafe { self.reset_after_seek(requested_target) }
@@ -873,7 +925,7 @@ impl Media {
         let ret =
             unsafe { ffi::up_av_seek(self.format, self.video.stream_index, requested_target) };
         if ret < 0 {
-            return Err(format!("could not seek: {}", unsafe { ffmpeg_error(ret) }));
+            return Err(format!("could not seek: {}", ffmpeg_error(ret)));
         }
         Ok(())
     }
@@ -923,6 +975,8 @@ impl Media {
 
     // Startup selection must happen before any audio is queued. No seek is
     // necessary, including for non-seekable sources.
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn prefer_initial_audio_language(&mut self, language: &str) {
         if let Some(index) = crate::language::preferred_track(
             self.audio_tracks
@@ -935,6 +989,8 @@ impl Media {
         }
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn select_audio_track(
         &mut self,
         track: usize,
@@ -957,12 +1013,16 @@ impl Media {
         Ok(target)
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn audio_clock(&self) -> Option<f64> {
         self.audio
             .as_ref()
             .and_then(|audio| unsafe { audio.clock() })
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn finish_seek(
         &self,
         video_pts: Option<f64>,
@@ -984,6 +1044,8 @@ impl Media {
         )
     }
 
+    /// # Safety
+    /// Preserve the native resource invariants documented on [`Media`].
     pub(crate) unsafe fn audio_empty(&self) -> bool {
         self.audio
             .as_ref()
@@ -1000,7 +1062,7 @@ impl Drop for Media {
     }
 }
 
-// All FFmpeg, resampler, and SDL audio state is exclusively accessed while
+// SAFETY: all FFmpeg, resampler, and SDL audio state is exclusively accessed while
 // holding DecodeWorker's mutex. Vulkan queue access is synchronized by the
 // lock callbacks installed on the shared FFmpeg/libplacebo Vulkan device.
 unsafe impl Send for Media {}

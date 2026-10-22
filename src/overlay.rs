@@ -304,7 +304,7 @@ impl Image {
                     .peek()
                     .is_some_and(|c| PixelGlyph::for_character(*c).is_none())
                 {
-                    run.push(characters.next().unwrap());
+                    run.push(characters.next().expect("peek found another character"));
                     run_cells += 1;
                 }
                 let mask = NativeMask::new(&run)?;
@@ -350,11 +350,17 @@ pub struct Content<'a> {
     pub palette: &'a str,
 }
 
+#[derive(Clone, Copy)]
+pub struct Scrubber {
+    pub progress: f32,
+    pub alpha: f32,
+}
+
 pub struct Visibility<'a> {
     pub top_bar: f32,
     pub info: f32,
     pub position: f32,
-    pub scrubber: Option<(f32, f32)>,
+    pub scrubber: Option<Scrubber>,
     pub chapter_markers: &'a [f32],
 }
 
@@ -793,7 +799,7 @@ impl Overlays {
                 white(position_alpha),
             );
         }
-        if let Some((progress, alpha)) = visibility.scrubber {
+        if let Some(Scrubber { progress, alpha }) = visibility.scrubber {
             let alpha = alpha.clamp(0.0, 1.0);
             if progress >= 0.0 && alpha > 0.001 {
                 let left = SCRUBBER_MARGIN;

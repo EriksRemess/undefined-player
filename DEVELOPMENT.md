@@ -72,8 +72,8 @@ cargo build --release --locked
 git diff --check
 ```
 
-`make check` runs native tests, Rust tests, strict Clippy checks, and Linux
-desktop-file validation. Playback tests generate fixtures with `ffmpeg`
+`make check` runs formatting checks, native tests, Rust tests, strict Clippy
+checks, and Linux desktop-file validation. Playback tests generate fixtures with `ffmpeg`
 (including libx264) and use dummy SDL drivers. Linux text tests require DejaVu
 fonts. No desktop or GPU is needed for these checks.
 
@@ -140,12 +140,27 @@ package manager cannot resolve.
 installer. It requires compatible shared libraries on the destination system.
 Do not redistribute builds using FFmpeg’s `--enable-nonfree` configuration.
 
+## Rust conventions
+
+- Keep application policy in Rust and native adapters focused on platform/library calls.
+- Make FFI wrappers safe when they can establish every precondition themselves.
+  Document caller obligations with `# Safety` on unsafe APIs and explain ownership,
+  lifetimes, and synchronization at raw-pointer boundaries.
+- Use named fields for cross-module data whose tuple positions are ambiguous.
+- Use typed errors when callers need different recovery paths (such as audio-track
+  selection). Display-only failures can use the application’s string-based `Result<T>` alias.
+- Prefer pattern matching for expected absence. Use `expect` with the invariant
+  when a failure indicates a programming error.
+- Reject poisoned state in normal operations. Cleanup may recover only when needed
+  to release resources safely, with the reason documented at the recovery site.
+
 ## Architecture
 
 | Area | Modules |
 | --- | --- |
 | Startup and Finder requests | `main.rs`, `macos_app.rs`, `native/app_macos.m` |
-| Playback, palette, timing | `playback.rs`, `clock.rs`, `presentation.rs` |
+| Playback and timing | `playback.rs`, `clock.rs`, `presentation.rs` |
+| Command search and argument steps | `palette.rs` |
 | Demux, decode, buffering | `media.rs`, `decoder.rs`, `worker.rs`, `read_ahead.rs` |
 | Audio and subtitles | `audio.rs`, `subtitles.rs` |
 | Window, controls, overlays | `window.rs`, `geometry.rs`, `overlay.rs`, `pixel_font.rs` |

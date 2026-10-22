@@ -30,6 +30,8 @@ impl MediaMetadata {
     pub(crate) fn artist(&self) -> Option<&str> {
         self.artist.as_deref()
     }
+    /// # Safety
+    /// `format` must be a live format context, with no concurrent mutation or close.
     pub(crate) unsafe fn inspect(format: *const ffi::UpAvFormat) -> Self {
         let read = |key: &CStr| {
             let pointer = unsafe { ffi::up_av_format_metadata(format, key.as_ptr()) };
@@ -118,6 +120,8 @@ pub(crate) struct TrackLabel {
 }
 
 impl TrackLabel {
+    /// # Safety
+    /// `format` must be a live format context, with no concurrent mutation or close.
     pub(crate) unsafe fn inspect(format: *const ffi::UpAvFormat, stream_index: u32) -> Self {
         let codec = unsafe { ffmpeg_name(ffi::up_av_stream_codec_name(format, stream_index)) }
             .unwrap_or_else(|| "UNKNOWN".to_owned());
@@ -135,6 +139,9 @@ pub(crate) struct VideoInfo {
 }
 
 impl VideoInfo {
+    /// # Safety
+    /// Preserve [`Media`]'s native resource invariants. A non-null `frame` must be
+    /// a live decoded video frame that is neither modified nor freed during the call.
     pub(crate) unsafe fn inspect(media: &Media, frame: *const ffi::UpAvFrame) -> Self {
         let mut info: ffi::UpVideoInfo = unsafe { std::mem::zeroed() };
         assert_ne!(

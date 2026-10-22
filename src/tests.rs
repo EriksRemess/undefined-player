@@ -475,9 +475,7 @@ fn external_network_media_decodes_and_seeks() {
         env::set_var("SDL_VIDEODRIVER", "dummy");
         env::set_var("SDL_AUDIODRIVER", "dummy");
     }
-    assert_ne!(unsafe { ffi::up_platform_init() }, 0, "{}", unsafe {
-        sdl_error()
-    });
+    assert_ne!(unsafe { ffi::up_platform_init() }, 0, "{}", sdl_error());
     let _sdl = Sdl;
     let mut media = unsafe { Media::open(&source, None, false) }.expect("network media opens");
     if let Ok(expected) = env::var("UP_TEST_EXPECTED_VIDEO_SIZE") {

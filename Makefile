@@ -39,6 +39,7 @@ dmg: app
 	echo "Built target/dist/$(DMG_NAME)"
 
 check: check-native
+	$(CARGO) fmt --check
 	$(CARGO) test
 	$(CARGO) clippy --all-targets -- -D warnings
 ifneq ($(HOST_OS),Darwin)

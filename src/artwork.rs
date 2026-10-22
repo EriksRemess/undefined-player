@@ -10,6 +10,8 @@ pub(crate) struct Artwork {
 }
 
 impl Artwork {
+    /// # Safety
+    /// `format` must be a live format context, with no concurrent mutation or close.
     pub(crate) unsafe fn extract(format: *const ffi::UpAvFormat) -> Option<Self> {
         for index in 0..unsafe { ffi::up_av_stream_count(format) } {
             let mut data = std::ptr::null();

@@ -8,6 +8,8 @@ pub(crate) struct Chapters {
 }
 
 impl Chapters {
+    /// # Safety
+    /// `format` must be a live format context, with no concurrent mutation or close.
     pub(crate) unsafe fn inspect(
         format: *const ffi::UpAvFormat,
         playback_start: f64,
