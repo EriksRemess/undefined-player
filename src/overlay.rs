@@ -1,5 +1,5 @@
 //! Player-owned overlay images and placement. Native code only shapes Unicode
-//! into natural-size masks and uploads the prepared images to Vulkan.
+//! into natural-size masks and uploads the prepared images to the GPU.
 use crate::geometry::{SCRUBBER_MARGIN, TOP_BAR_HEIGHT};
 use crate::{Result, ffi, pixel_font};
 use std::borrow::Cow;
@@ -661,7 +661,9 @@ impl Overlays {
                     -(inset as f32),
                     -(inset as f32),
                     width + inset as f32,
-                    TOP_BAR_HEIGHT,
+                    // The controls are inset from the top as well. Extend
+                    // both sides of their band equally before translating.
+                    TOP_BAR_HEIGHT + inset as f32,
                 ],
                 [0.02, 0.02, 0.02, 0.72 * top_alpha],
             );

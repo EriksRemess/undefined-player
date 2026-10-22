@@ -138,6 +138,11 @@ fn command_line_rejects_missing_files_and_unknown_options() {
 
 #[test]
 fn requested_keys_map_to_requested_actions() {
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        action_for_key(ffi::UpKey_UP_KEY_U),
+        Some(Action::ToggleUpscale)
+    );
     assert_eq!(
         action_for_key(ffi::UpKey_UP_KEY_COMMA),
         Some(Action::PreviousChapter)

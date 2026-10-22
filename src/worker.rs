@@ -52,15 +52,18 @@ impl DecodeWorker {
                 let started = Instant::now();
                 let result = match thread_media.lock() {
                     Ok(mut media) => {
-                        let mut result = unsafe { media.fill_queues() };
+                        let capacity = media.video_queue_capacity();
+                        let available = capacity
+                            .saturating_sub(thread_outstanding_frames.load(Ordering::Acquire));
+                        let mut result = unsafe { media.fill_queues_step(available) };
                         if let Err(error) = &result
-                            && media.video.uses_vulkan
+                            && media.video.uses_hardware
                             && media.first_video_pts.is_none()
                         {
                             // Audio can fill the startup buffer before video is
                             // decoded. Preserve initial hardware fallback here too.
                             eprintln!(
-                                "warning: Vulkan decoding failed ({error}); restarting with software decoding"
+                                "warning: hardware decoding failed ({error}); restarting with software decoding"
                             );
                             let target = unsafe { media.audio_clock() }.unwrap_or(0.0);
                             let selected_audio_track = media.selected_audio_track;
@@ -80,11 +83,11 @@ impl DecodeWorker {
                                 replacement.audio_seek_target = Some(target);
                                 replacement.subtitle_seek_target = Some(target);
                                 *media = replacement;
-                                unsafe { media.fill_queues() }
+                                unsafe { media.fill_queues_step(available) }
                             });
                         }
                         while result.is_ok()
-                            && thread_outstanding_frames.load(Ordering::Acquire) < VIDEO_QUEUE_MAX
+                            && thread_outstanding_frames.load(Ordering::Acquire) < capacity
                         {
                             let Some(frame) = media.video_queue.pop_front() else {
                                 break;

@@ -1,4 +1,5 @@
 use crate::{Result, ffi, geometry};
+#[cfg(target_os = "linux")]
 use std::env;
 use std::ffi::CStr;
 use std::time::{Duration, Instant};
@@ -66,6 +67,8 @@ pub(crate) enum Action {
     ToggleMute,
     TogglePause,
     ToggleSubtitles,
+    #[cfg(target_os = "macos")]
+    ToggleUpscale,
 }
 
 pub(crate) fn action_shortcut(action: &Action) -> &'static str {
@@ -86,6 +89,8 @@ pub(crate) fn action_shortcut(action: &Action) -> &'static str {
         Action::ToggleMute => "M",
         Action::TogglePause => "SPACE",
         Action::ToggleSubtitles => "S",
+        #[cfg(target_os = "macos")]
+        Action::ToggleUpscale => "U",
     }
 }
 
@@ -107,6 +112,8 @@ pub(crate) fn action_for_key(key: u32) -> Option<Action> {
         ffi::UpKey_UP_KEY_I => Some(Action::ToggleInfo),
         ffi::UpKey_UP_KEY_SPACE => Some(Action::TogglePause),
         ffi::UpKey_UP_KEY_S => Some(Action::ToggleSubtitles),
+        #[cfg(target_os = "macos")]
+        ffi::UpKey_UP_KEY_U => Some(Action::ToggleUpscale),
         _ => None,
     }
 }
@@ -155,7 +162,8 @@ pub(crate) struct Sdl;
 
 impl Sdl {
     pub(crate) unsafe fn init() -> Result<Self> {
-        // This player deliberately has no X11 or non-PipeWire runtime path.
+        // Keep Linux backend selection explicit; SDL selects native macOS drivers.
+        #[cfg(target_os = "linux")]
         unsafe {
             env::set_var("SDL_VIDEODRIVER", "wayland");
             env::set_var("SDL_AUDIODRIVER", "pipewire");
@@ -194,7 +202,7 @@ impl Window {
     pub(crate) unsafe fn create(title: &CStr) -> Result<Self> {
         let window = unsafe { ffi::up_window_create(title.as_ptr(), 1280, 720) };
         if window.is_null() {
-            return Err(format!("could not create the Wayland window: {}", unsafe {
+            return Err(format!("could not create the video window: {}", unsafe {
                 sdl_error()
             }));
         }
@@ -264,12 +272,14 @@ impl Drop for Window {
     }
 }
 
-pub(crate) struct WaylandInput<'window> {
+pub(crate) struct WindowShape<'window> {
+    #[cfg(target_os = "linux")]
     native: *mut ffi::UpWaylandInput,
     _window: &'window Window,
 }
 
-impl<'window> WaylandInput<'window> {
+impl<'window> WindowShape<'window> {
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_region(&self, rectangles: &[[i32; 4]], radius: f32) -> Result<()> {
         if !unsafe {
             ffi::up_wayland_input_set_region(
@@ -284,7 +294,8 @@ impl<'window> WaylandInput<'window> {
         Ok(())
     }
 
-    pub(crate) fn create(window: &'window Window) -> Result<Self> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create(window: &'window Window) -> Result<Option<Self>> {
         let input = unsafe { ffi::up_wayland_input_create(window.0.cast()) };
         if input.is_null() {
             return Err("out of memory while creating Wayland input".into());
@@ -296,14 +307,32 @@ impl<'window> WaylandInput<'window> {
             unsafe { ffi::up_wayland_input_destroy(input) };
             return Err(message);
         }
-        Ok(Self {
+        Ok(Some(Self {
             native: input,
             _window: window,
-        })
+        }))
     }
 }
 
-impl Drop for WaylandInput<'_> {
+#[cfg(target_os = "macos")]
+impl<'window> WindowShape<'window> {
+    pub(crate) fn create(window: &'window Window) -> Result<Option<Self>> {
+        Ok(Some(Self { _window: window }))
+    }
+
+    pub(crate) fn set_region(&self, _rectangles: &[[i32; 4]], radius: f32) -> Result<()> {
+        if unsafe { ffi::up_window_set_corner_radius(self._window.as_ptr(), radius) } == 0 {
+            return Err(format!(
+                "could not update the macOS window shape: {}",
+                unsafe { sdl_error() }
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WindowShape<'_> {
     fn drop(&mut self) {
         unsafe { ffi::up_wayland_input_destroy(self.native) };
     }

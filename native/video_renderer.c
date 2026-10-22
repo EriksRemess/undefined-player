@@ -554,6 +554,11 @@ fail:
     return renderer;
 }
 
+int up_video_renderer_ready(const UpVideoRenderer *renderer)
+{
+    return renderer && renderer->renderer && renderer->swapchain && !renderer->error[0];
+}
+
 void *up_video_renderer_device(UpVideoRenderer *renderer)
 {
     if (!renderer || !renderer->renderer)

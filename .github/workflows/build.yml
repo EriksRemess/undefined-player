@@ -15,6 +15,25 @@ permissions:
   contents: read
 
 jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install latest stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install macOS build dependencies
+        run: brew install pkgconf sdl3 ffmpeg pango
+
+      - name: Check
+        run: make check
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
   arch-linux:
     runs-on: ubuntu-latest
     container: archlinux:latest

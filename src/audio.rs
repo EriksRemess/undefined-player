@@ -10,7 +10,7 @@ pub(crate) const AUDIO_RATE: i32 = 48_000;
 pub(crate) const AUDIO_CHANNELS: i32 = 2;
 pub(crate) const AUDIO_BYTES_PER_FRAME: i64 = (size_of::<f32>() * AUDIO_CHANNELS as usize) as i64;
 pub(crate) const AUDIO_QUEUE_TARGET_BYTES: i32 =
-    AUDIO_RATE * AUDIO_BYTES_PER_FRAME as i32 * 150 / 1000;
+    AUDIO_RATE * AUDIO_BYTES_PER_FRAME as i32 * 250 / 1000;
 // Stop demuxing independently of video, including after the last video packet.
 pub(crate) const AUDIO_QUEUE_MAX_BYTES: i32 = AUDIO_RATE * AUDIO_BYTES_PER_FRAME as i32;
 pub(crate) const AUDIO_TIMESTAMP_TOLERANCE: f64 = 0.002;
@@ -98,6 +98,8 @@ pub(crate) struct AudioOutput {
     next_output_pts: f64,
     pub(crate) pending: VecDeque<AudioChunk>,
     pub(crate) resumed: bool,
+    pub(crate) underruns: u64,
+    starved: bool,
     control: AudioControl,
 }
 
@@ -105,7 +107,7 @@ impl AudioOutput {
     pub(crate) unsafe fn create(control: AudioControl) -> Result<Self> {
         let stream = unsafe { ffi::up_audio_stream_create(AUDIO_RATE, AUDIO_CHANNELS) };
         if stream.is_null() {
-            return Err(format!("could not open PipeWire audio: {}", unsafe {
+            return Err(format!("could not open audio output: {}", unsafe {
                 sdl_error()
             }));
         }
@@ -124,6 +126,8 @@ impl AudioOutput {
             next_output_pts: 0.0,
             pending: VecDeque::new(),
             resumed: false,
+            underruns: 0,
+            starved: false,
             control,
         })
     }
@@ -263,6 +267,8 @@ impl AudioOutput {
     }
 
     pub(crate) unsafe fn pump(&mut self) -> Result<()> {
+        self.starved |=
+            self.resumed && self.submitted_frames > 0 && unsafe { self.queued_bytes() } == 0;
         while let Some(chunk) = self.pending.front() {
             let pts =
                 chunk.pts + (chunk.offset / AUDIO_CHANNELS as usize) as f64 / AUDIO_RATE as f64;
@@ -285,6 +291,12 @@ impl AudioOutput {
             let count = (chunk.samples.len() - chunk.offset).min(available);
             if count == 0 {
                 break;
+            }
+            // Count starvation only when more samples arrive after the gap.
+            // A queue emptying normally at EOF is not an underrun.
+            if self.starved && self.resumed {
+                self.underruns += 1;
+                self.starved = false;
             }
             if unsafe {
                 ffi::up_audio_stream_put(
@@ -344,6 +356,9 @@ impl AudioOutput {
             }));
         }
         self.resumed = !paused;
+        if paused {
+            self.starved = false;
+        }
         Ok(())
     }
 
@@ -360,6 +375,7 @@ impl AudioOutput {
         self.next_input_pts = None;
         self.next_output_pts = 0.0;
         self.pending.clear();
+        self.starved = false;
         Ok(())
     }
 }

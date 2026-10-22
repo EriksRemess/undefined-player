@@ -49,7 +49,7 @@ pub(crate) struct Decoder {
     pub(crate) stream_index: i32,
     pub(crate) time_base: f64,
     pub(crate) frame_duration: f64,
-    pub(crate) uses_vulkan: bool,
+    pub(crate) uses_hardware: bool,
 }
 
 impl Drop for Decoder {
@@ -66,14 +66,14 @@ impl Decoder {
     pub(crate) unsafe fn open(
         format: *mut ffi::UpAvFormat,
         stream_index: i32,
-        vulkan_device: Option<*mut c_void>,
+        hardware_device: Option<*mut c_void>,
     ) -> Result<Self> {
         let context = unsafe {
             ffi::up_av_decoder_open(
                 format,
                 stream_index,
-                vulkan_device.unwrap_or(ptr::null_mut()),
-                i32::from(vulkan_device.is_some()),
+                hardware_device.unwrap_or(ptr::null_mut()),
+                i32::from(hardware_device.is_some()),
             )
         };
         if context.is_null() {
@@ -86,7 +86,7 @@ impl Decoder {
             stream_index: unsafe { ffi::up_av_decoder_stream_index(context) },
             time_base: unsafe { ffi::up_av_decoder_time_base(context) },
             frame_duration: unsafe { ffi::up_av_decoder_frame_duration(context) },
-            uses_vulkan: unsafe { ffi::up_av_decoder_uses_vulkan(context) } != 0,
+            uses_hardware: unsafe { ffi::up_av_decoder_uses_hardware(context) } != 0,
         })
     }
 }

@@ -216,8 +216,8 @@ unsafe extern "C" {
     pub fn up_av_decoder_open(
         format: *mut UpAvFormat,
         stream_index: ::std::os::raw::c_int,
-        vulkan_device: *mut ::std::os::raw::c_void,
-        prefer_vulkan: ::std::os::raw::c_int,
+        hardware_device: *mut ::std::os::raw::c_void,
+        prefer_hardware: ::std::os::raw::c_int,
     ) -> *mut UpAvDecoder;
 }
 unsafe extern "C" {
@@ -234,7 +234,7 @@ unsafe extern "C" {
     pub fn up_av_decoder_frame_duration(decoder: *const UpAvDecoder) -> f64;
 }
 unsafe extern "C" {
-    pub fn up_av_decoder_uses_vulkan(decoder: *const UpAvDecoder) -> ::std::os::raw::c_int;
+    pub fn up_av_decoder_uses_hardware(decoder: *const UpAvDecoder) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_av_decoder_width(decoder: *const UpAvDecoder) -> ::std::os::raw::c_int;
@@ -256,9 +256,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_av_decoder_flush(decoder: *mut UpAvDecoder);
+    pub fn up_av_decoder_skip_nonkey(decoder: *mut UpAvDecoder, skip: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
     pub fn up_av_packet_alloc() -> *mut UpAvPacket;
+    pub fn up_av_packet_clone(packet: *const UpAvPacket) -> *mut UpAvPacket;
+    pub fn up_av_packet_size(packet: *const UpAvPacket) -> ::std::os::raw::c_int;
+    pub fn up_av_packet_is_key(packet: *const UpAvPacket) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_av_packet_free(packet: *mut *mut UpAvPacket);
@@ -279,7 +283,7 @@ unsafe extern "C" {
     pub fn up_av_frame_free(frame: *mut *mut UpAvFrame);
 }
 unsafe extern "C" {
-    pub fn up_av_frame_is_vulkan(frame: *const UpAvFrame) -> ::std::os::raw::c_int;
+    pub fn up_av_frame_is_hardware(frame: *const UpAvFrame) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_av_frame_timestamp(frame: *const UpAvFrame) -> i64;
@@ -402,6 +406,7 @@ pub const UpKey_UP_KEY_ESCAPE: UpKey = 21;
 pub const UpKey_UP_KEY_BACKSPACE: UpKey = 22;
 pub const UpKey_UP_KEY_Y: UpKey = 23;
 pub const UpKey_UP_KEY_N: UpKey = 24;
+pub const UpKey_UP_KEY_U: UpKey = 25;
 pub type UpKey = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -424,6 +429,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_platform_error() -> *const ::std::os::raw::c_char;
+    pub fn up_platform_audio_driver() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     pub fn up_platform_delay(milliseconds: u32);
@@ -439,6 +445,9 @@ unsafe extern "C" {
     pub fn up_window_can_hide_cursor(window: *mut UpWindow) -> ::std::os::raw::c_int;
     pub fn up_window_corner_scale(window: *mut UpWindow) -> f32;
     pub fn up_window_corner_radius(window: *mut UpWindow) -> f32;
+    #[cfg(target_os = "macos")]
+    pub fn up_window_set_corner_radius(window: *mut UpWindow, radius: f32)
+    -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn up_platform_start_text_input(started: ::std::os::raw::c_int);
@@ -521,6 +530,9 @@ unsafe extern "C" {
     pub fn up_video_renderer_create(window: *mut ::std::os::raw::c_void) -> *mut UpVideoRenderer;
 }
 unsafe extern "C" {
+    pub fn up_video_renderer_ready(renderer: *const UpVideoRenderer) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn up_video_renderer_device(renderer: *mut UpVideoRenderer) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {
@@ -558,6 +570,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn up_video_renderer_destroy(renderer: *mut UpVideoRenderer);
+}
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    pub fn up_video_renderer_set_upscaling(renderer: *mut UpVideoRenderer, enabled: bool);
+    pub fn up_video_renderer_upscaling_status(
+        renderer: *const UpVideoRenderer,
+    ) -> *const ::std::os::raw::c_char;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

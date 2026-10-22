@@ -155,8 +155,12 @@ impl VideoInfo {
         );
         let pixel_format = unsafe { ffmpeg_name(info.pixel_format) }
             .unwrap_or_else(|| "UNKNOWN PIXEL FORMAT".to_owned());
-        let decode_path = if media.video.uses_vulkan {
-            "VULKAN HW"
+        let decode_path = if media.video.uses_hardware {
+            if cfg!(target_os = "macos") {
+                "VIDEOTOOLBOX HW"
+            } else {
+                "VULKAN HW"
+            }
         } else {
             "SOFTWARE"
         };

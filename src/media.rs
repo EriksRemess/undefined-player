@@ -16,6 +16,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) const VIDEO_QUEUE_TARGET: usize = 16;
 pub(crate) const VIDEO_QUEUE_MAX: usize = 24;
 pub(crate) const AV_NOPTS_VALUE: i64 = i64::MIN;
+const VIDEO_PACKET_MAX: usize = 256;
+const VIDEO_PACKET_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+struct VideoPacket(*mut ffi::UpAvPacket);
+
+impl Drop for VideoPacket {
+    fn drop(&mut self) {
+        unsafe { ffi::up_av_packet_free(&mut self.0) };
+    }
+}
+
+fn queue_capacity(width: i32, height: i32) -> usize {
+    // Bound decoded-surface memory while retaining a short presentation lead.
+    let bytes = (width.max(1) as u64) * (height.max(1) as u64) * 4;
+    ((256 * 1024 * 1024 / bytes) as usize).clamp(4, VIDEO_QUEUE_MAX)
+}
 
 unsafe extern "C" fn interrupt_when_stopped(opaque: *mut c_void) -> i32 {
     let running = unsafe { &*opaque.cast::<AtomicBool>() };
@@ -47,6 +63,10 @@ pub(crate) struct Media {
     pub(crate) audio: Option<AudioOutput>,
     pub(crate) subtitle_tracks: Vec<MediaTrack>,
     pub(crate) video_queue: VecDeque<VideoFrame>,
+    video_packets: VecDeque<VideoPacket>,
+    video_packet_bytes: usize,
+    input_eof: bool,
+    video_catching_up: bool,
     pub(crate) subtitle_queue: VecDeque<SubtitleCue>,
     pub(crate) subtitle_serial: u64,
     pub(crate) log_subtitles: bool,
@@ -62,13 +82,13 @@ pub(crate) struct Media {
 impl Media {
     pub(crate) unsafe fn open<S: MediaInput + ?Sized>(
         source: &S,
-        vulkan_device: Option<*mut c_void>,
+        hardware_device: Option<*mut c_void>,
         log_subtitles: bool,
     ) -> Result<Self> {
         unsafe {
             Self::open_with_controls(
                 source,
-                vulkan_device,
+                hardware_device,
                 log_subtitles,
                 Arc::new(AtomicBool::new(true)),
                 AudioControl::default(),
@@ -78,7 +98,7 @@ impl Media {
 
     pub(crate) unsafe fn open_with_controls<S: MediaInput + ?Sized>(
         source: &S,
-        vulkan_device: Option<*mut c_void>,
+        hardware_device: Option<*mut c_void>,
         log_subtitles: bool,
         interrupt: Arc<AtomicBool>,
         audio_control: AudioControl,
@@ -87,7 +107,7 @@ impl Media {
         let result = unsafe {
             Self::open_input(
                 source,
-                vulkan_device,
+                hardware_device,
                 log_subtitles,
                 Arc::clone(&interrupt),
                 audio_control.clone(),
@@ -100,7 +120,7 @@ impl Media {
             return unsafe {
                 Self::open_input(
                     source,
-                    vulkan_device,
+                    hardware_device,
                     log_subtitles,
                     interrupt,
                     audio_control,
@@ -114,7 +134,7 @@ impl Media {
 
     unsafe fn open_input<S: MediaInput + ?Sized>(
         source: &S,
-        vulkan_device: Option<*mut c_void>,
+        hardware_device: Option<*mut c_void>,
         log_subtitles: bool,
         interrupt: Arc<AtomicBool>,
         audio_control: AudioControl,
@@ -169,11 +189,11 @@ impl Media {
                 if video_index < 0 {
                     return Err("the input has no usable video stream".into());
                 }
-                let result = match unsafe { Decoder::open(format, video_index, vulkan_device) } {
+                let result = match unsafe { Decoder::open(format, video_index, hardware_device) } {
                     Ok(video) => Ok(video),
-                    Err(hardware_error) if vulkan_device.is_some() => {
+                    Err(hardware_error) if hardware_device.is_some() => {
                         eprintln!(
-                            "warning: Vulkan decoder initialization failed ({hardware_error}); trying software decoding"
+                            "warning: hardware decoder initialization failed ({hardware_error}); trying software decoding"
                         );
                         unsafe { Decoder::open(format, video_index, None) }
                     }
@@ -195,8 +215,14 @@ impl Media {
             let video_name =
                 unsafe { CStr::from_ptr(ffi::up_av_stream_codec_name(format, video_index as u32)) }
                     .to_string_lossy();
-            let decode_path = if video.uses_vulkan {
-                "Vulkan Video"
+            let decode_path = if video.uses_hardware {
+                if cfg!(target_os = "macos") {
+                    "VideoToolbox hardware decode, Metal presentation"
+                } else {
+                    "Vulkan Video"
+                }
+            } else if cfg!(target_os = "macos") {
+                "software decode, Metal presentation"
             } else {
                 "software decode, Vulkan presentation"
             };
@@ -326,6 +352,10 @@ impl Media {
                 audio,
                 subtitle_tracks,
                 video_queue: VecDeque::new(),
+                video_packets: VecDeque::new(),
+                video_packet_bytes: 0,
+                input_eof: false,
+                video_catching_up: false,
                 subtitle_queue: VecDeque::new(),
                 subtitle_serial: 0,
                 log_subtitles,
@@ -365,9 +395,11 @@ impl Media {
                     ffmpeg_error(ret)
                 }));
             }
-            if self.video.uses_vulkan && unsafe { ffi::up_av_frame_is_vulkan(frame) } == 0 {
+            if self.video.uses_hardware && unsafe { ffi::up_av_frame_is_hardware(frame) } == 0 {
                 unsafe { ffi::up_av_frame_free(&mut frame) };
-                return Err("the selected codec/profile is not supported by Vulkan Video".into());
+                return Err(
+                    "the selected codec/profile is not supported by hardware decoding".into(),
+                );
             }
             let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
             let pts = if timestamp == AV_NOPTS_VALUE {
@@ -637,6 +669,40 @@ impl Media {
         Ok(())
     }
 
+    unsafe fn decode_buffered_video(&mut self) -> Result<()> {
+        let packet = self.video_packets.pop_front().unwrap();
+        self.video_packet_bytes -= unsafe { ffi::up_av_packet_size(packet.0) }.max(0) as usize;
+        let timestamp = unsafe { ffi::up_av_packet_pts(packet.0) };
+        let pts = (timestamp != AV_NOPTS_VALUE).then_some(timestamp as f64 * self.video.time_base);
+        let audio_clock = self
+            .audio
+            .as_ref()
+            .and_then(|audio| unsafe { audio.active_clock() });
+        let late = pts
+            .zip(audio_clock)
+            .is_some_and(|(pts, clock)| pts < clock - 0.25);
+        if late && !self.video_catching_up {
+            self.video_catching_up = true;
+            eprintln!("video: decoder cannot keep up; skipping to a keyframe to preserve audio");
+        }
+        // Once references have been skipped, resume only at a current keyframe.
+        // Dropping arbitrary compressed packets would corrupt later pictures.
+        if self.video_catching_up && !late && unsafe { ffi::up_av_packet_is_key(packet.0) } != 0 {
+            self.video_catching_up = false;
+        }
+        unsafe {
+            ffi::up_av_decoder_skip_nonkey(self.video.as_ptr(), i32::from(self.video_catching_up))
+        };
+        let ret = unsafe { ffi::up_av_decoder_send_packet(self.video.as_ptr(), packet.0) };
+        if ret < 0 {
+            return Err(format!(
+                "video decoder rejected a buffered packet: {}",
+                unsafe { ffmpeg_error(ret) }
+            ));
+        }
+        unsafe { self.receive_video() }
+    }
+
     pub(crate) unsafe fn drain(&mut self) -> Result<()> {
         if self.drained {
             return Ok(());
@@ -666,6 +732,28 @@ impl Media {
     }
 
     pub(crate) unsafe fn fill_queues(&mut self) -> Result<()> {
+        unsafe { self.fill_queues_with_budget(None, self.video_queue_capacity()) }
+    }
+
+    pub(crate) fn video_queue_capacity(&self) -> usize {
+        queue_capacity(
+            unsafe { ffi::up_av_decoder_width(self.video.as_ptr()) },
+            unsafe { ffi::up_av_decoder_height(self.video.as_ptr()) },
+        )
+    }
+
+    // Publish frames promptly even when one high-resolution decode is slow.
+    // Startup and synchronous callers can still fill their complete buffers.
+    pub(crate) unsafe fn fill_queues_step(&mut self, capacity: usize) -> Result<()> {
+        unsafe { self.fill_queues_with_budget(Some(std::time::Duration::from_millis(8)), capacity) }
+    }
+
+    unsafe fn fill_queues_with_budget(
+        &mut self,
+        budget: Option<std::time::Duration>,
+        capacity: usize,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
         unsafe { self.sync_audio_selection() };
         if let Some(audio) = self.audio.as_mut() {
             unsafe { audio.pump()? };
@@ -679,30 +767,63 @@ impl Media {
                 .audio
                 .as_ref()
                 .is_some_and(|audio| unsafe { audio.queued_bytes() } < AUDIO_QUEUE_TARGET_BYTES);
-            if unsafe { self.audio_full() }
-                || self.video_queue.len() >= VIDEO_QUEUE_MAX
-                || (self.video_queue.len() >= VIDEO_QUEUE_TARGET && !audio_needs_data)
-            {
+            let video_full = self.video_queue.len() >= capacity;
+            let packets_full = self.video_packets.len() >= VIDEO_PACKET_MAX
+                || self.video_packet_bytes >= VIDEO_PACKET_MAX_BYTES;
+            // Read compressed video ahead while audio is low. Decoding an 8K
+            // picture must not prevent demuxing the audio behind that packet.
+            let read_audio = audio_needs_data && !self.input_eof && !packets_full;
+            if video_full && !read_audio {
                 break;
             }
-
-            let ret = unsafe { ffi::up_av_read_frame(self.format, self.packet) };
-            if ret < 0 {
-                if unsafe { ffmpeg_error_is_again(ret) } {
-                    break;
-                }
-                if !unsafe { ffmpeg_error_is_eof(ret) } {
-                    return Err(format!("could not read media packet: {}", unsafe {
-                        ffmpeg_error(ret)
-                    }));
-                }
+            if !read_audio && !self.video_packets.is_empty() {
+                unsafe { self.decode_buffered_video()? };
+            } else if self.input_eof {
                 self.eof = true;
                 unsafe { self.drain()? };
                 break;
+            } else {
+                if unsafe { self.audio_full() }
+                    || (!audio_needs_data
+                        && self.video_queue.len() >= VIDEO_QUEUE_TARGET.min(capacity))
+                {
+                    break;
+                }
+                let ret = unsafe { ffi::up_av_read_frame(self.format, self.packet) };
+                if ret < 0 {
+                    if unsafe { ffmpeg_error_is_again(ret) } {
+                        break;
+                    }
+                    if !unsafe { ffmpeg_error_is_eof(ret) } {
+                        return Err(format!("could not read media packet: {}", unsafe {
+                            ffmpeg_error(ret)
+                        }));
+                    }
+                    self.input_eof = true;
+                    continue;
+                }
+                let decode = if unsafe { ffi::up_av_packet_stream_index(self.packet) }
+                    == self.video.stream_index
+                    && self.audio.is_some()
+                {
+                    let packet = unsafe { ffi::up_av_packet_clone(self.packet) };
+                    if packet.is_null() {
+                        Err("out of memory while buffering video packets".into())
+                    } else {
+                        self.video_packet_bytes +=
+                            unsafe { ffi::up_av_packet_size(packet) }.max(0) as usize;
+                        self.video_packets.push_back(VideoPacket(packet));
+                        Ok(())
+                    }
+                } else {
+                    unsafe { self.decode_packet() }
+                };
+                unsafe { ffi::up_av_packet_unref(self.packet) };
+                decode?;
             }
-            let decode = unsafe { self.decode_packet() };
-            unsafe { ffi::up_av_packet_unref(self.packet) };
-            decode?;
+            if budget.is_some_and(|budget| started.elapsed() >= budget) {
+                break;
+            }
         }
         Ok(())
     }
@@ -761,6 +882,7 @@ impl Media {
         unsafe {
             ffi::up_av_packet_unref(self.packet);
             ffi::up_av_decoder_flush(self.video.as_ptr());
+            ffi::up_av_decoder_skip_nonkey(self.video.as_ptr(), 0);
         }
         for track in &self.audio_tracks {
             unsafe { ffi::up_av_decoder_flush(track.decoder.as_ptr()) };
@@ -775,6 +897,10 @@ impl Media {
             }
         }
         self.video_queue.clear();
+        self.video_packets.clear();
+        self.video_packet_bytes = 0;
+        self.input_eof = false;
+        self.video_catching_up = false;
         self.interlace_detector = crate::deinterlace::Detector::default();
         self.subtitle_queue.clear();
         self.eof = false;
@@ -837,14 +963,23 @@ impl Media {
             .and_then(|audio| unsafe { audio.clock() })
     }
 
-    pub(crate) unsafe fn finish_seek(&self, video_pts: Option<f64>, fallback: f64) -> Option<f64> {
+    pub(crate) unsafe fn finish_seek(
+        &self,
+        video_pts: Option<f64>,
+        outstanding_video: usize,
+        fallback: f64,
+    ) -> Option<f64> {
         let audio_clock = unsafe { self.audio_clock() };
         completed_seek_anchor(
             video_pts,
             audio_clock,
             self.audio.is_some(),
             self.eof,
-            self.video_queue.len() >= VIDEO_QUEUE_TARGET || unsafe { self.audio_full() },
+            // The worker shares its capacity with frames already handed to
+            // playback. Those frames also block further demux/decode work.
+            self.video_queue.len().saturating_add(outstanding_video)
+                >= VIDEO_QUEUE_TARGET.min(self.video_queue_capacity())
+                || unsafe { self.audio_full() },
             fallback,
         )
     }

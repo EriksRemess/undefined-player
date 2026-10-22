@@ -11,13 +11,11 @@ use crate::presentation::{
 use crate::renderer::{Renderer, RendererOverlays, VideoFrames};
 use crate::source::MediaSource;
 use crate::subtitles::SubtitleCue;
-use crate::window::{
-    Action, IdleCursor, Sdl, WaylandInput, Window, action_for_key, action_shortcut,
-};
+use crate::window::{Action, IdleCursor, Window, WindowShape, action_for_key, action_shortcut};
 use crate::worker::DecodeWorker;
 use crate::{Result, ffi};
 use std::collections::VecDeque;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ptr;
 use std::time::{Duration, Instant};
 
@@ -174,6 +172,8 @@ impl Palette {
             (Action::CycleDeinterlace, "Cycle deinterlacing"),
             (Action::ToggleLoop, "Toggle looping"),
             (Action::ToggleMute, "Toggle mute"),
+            #[cfg(target_os = "macos")]
+            (Action::ToggleUpscale, "Toggle Apple ML upscaling"),
         ]
         .into_iter()
         .map(|(action, label)| PaletteRow {
@@ -506,16 +506,17 @@ pub(crate) unsafe fn seek_to(
     Ok(position)
 }
 
-pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
+// SDL remains alive across Finder requests while each playback session drops
+// its decoder, audio stream, GPU resources and saved resume state normally.
+pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<MediaSource>> {
     let mut config = crate::config::Config::load();
-    let _sdl = unsafe { Sdl::init()? };
     let metadata_title = CString::new(source_title(&source))
         .map_err(|_| "media title contains a NUL byte".to_string())?;
     let title = CString::new(source_display_title(&source))
         .map_err(|_| "media title contains a NUL byte".to_string())?;
     let window = unsafe { Window::create(&title)? };
-    let wayland_input = match WaylandInput::create(&window) {
-        Ok(input) => Some(input),
+    let window_shape = match WindowShape::create(&window) {
+        Ok(input) => input,
         Err(error) => {
             eprintln!(
                 "warning: {error}; window dragging, the window menu, and rounded corners are unavailable"
@@ -525,15 +526,15 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     };
     let mut renderer = Renderer::create(&window)?;
     renderer.set_corner_radius(config.corner_radius);
-    let mut media = unsafe { Media::open(&source, Some(renderer.device()), perf_log)? };
+    let mut media = unsafe { Media::open(&source, renderer.device(), perf_log)? };
     unsafe { media.prefer_initial_audio_language(&config.preferred_audio_language) };
 
     if let Err(hardware_error) = unsafe { media.fill_initial_queues() } {
-        if !media.video.uses_vulkan {
+        if !media.video.uses_hardware {
             return Err(hardware_error);
         }
         eprintln!(
-            "warning: Vulkan decoding failed ({hardware_error}); restarting with software decoding"
+            "warning: hardware decoding failed ({hardware_error}); restarting with software decoding"
         );
         drop(media);
         media = unsafe { Media::open(&source, None, perf_log)? };
@@ -569,8 +570,9 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut selected_audio_track = media.selected_audio_track;
     if audio_track_count > 0 {
         eprintln!(
-            "audio: track {} selected via PipeWire",
-            selected_audio_track + 1
+            "audio: track {} selected via {}",
+            selected_audio_track + 1,
+            unsafe { CStr::from_ptr(ffi::up_platform_audio_driver()) }.to_string_lossy()
         );
     }
     let mut video_details = video_info.overlay_text(
@@ -689,6 +691,11 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
     let mut report_display_time = Duration::ZERO;
     let mut report_display_calls = 0_u64;
     while running {
+        #[cfg(target_os = "macos")]
+        if let Some(source) = crate::macos_app::take_source()? {
+            return Ok(Some(source));
+        }
+        let mut presented_this_iteration = false;
         let mut event: ffi::UpEvent = unsafe { std::mem::zeroed() };
         while unsafe { ffi::up_platform_poll_event(&mut event) } != 0 {
             match event.type_ {
@@ -913,6 +920,19 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                         (action_for_key(event.key), None)
                     };
                     match action {
+                        #[cfg(target_os = "macos")]
+                        Some(Action::ToggleUpscale) => {
+                            let enabled = renderer.toggle_upscaling();
+                            position_notice.show_text(
+                                if enabled {
+                                    c"UPSCALE: AUTO"
+                                } else {
+                                    c"UPSCALE: OFF"
+                                }
+                                .to_owned(),
+                            );
+                            redraw = true;
+                        }
                         Some(Action::ToggleZoom) => {
                             let enabled = renderer.toggle_zoom();
                             let status = if enabled { "ZOOM: FILL" } else { "ZOOM: FIT" };
@@ -1187,7 +1207,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
             }
         }
         cursor.update(&window);
-        redraw |= renderer.update_window_shape(wayland_input.as_ref())?;
+        redraw |= renderer.update_window_shape(window_shape.as_ref())?;
         redraw |= renderer.set_close_hovered(
             mouse_position.is_some_and(|(x, y)| window.close_button_contains(x, y)),
         );
@@ -1236,7 +1256,9 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
             && let Some(media) = decoder.try_lock()?
         {
             let video_pts = video_queue.front().map(|frame| frame.frame.pts);
-            if let Some(playback_target) = unsafe { media.finish_seek(video_pts, target) } {
+            if let Some(playback_target) =
+                unsafe { media.finish_seek(video_pts, decoder.pending_frames(), target) }
+            {
                 clock.seek(playback_target);
                 pending_seek_anchor = None;
             }
@@ -1457,6 +1479,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                 new_frame_pending = false;
             }
             redraw = false;
+            presented_this_iteration = true;
         }
 
         if perf_log && last_perf_report.elapsed() >= Duration::from_secs(2) {
@@ -1474,6 +1497,17 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
                 fill_ms,
                 display_ms,
             );
+            if let Some(media) = decoder.try_lock()?
+                && let Some(audio) = &media.audio
+            {
+                eprintln!(
+                    "perf: {:.0} ms audio queued, {} audio underruns",
+                    unsafe { audio.queued_bytes() } as f64 * 1000.0
+                        / (crate::audio::AUDIO_RATE as f64
+                            * crate::audio::AUDIO_BYTES_PER_FRAME as f64),
+                    audio.underruns
+                );
+            }
             last_perf_report = Instant::now();
             report_shown = total_shown;
             report_dropped = total_dropped;
@@ -1503,10 +1537,14 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<()> {
             mpris_stopped = false;
         }
 
-        unsafe { ffi::up_platform_delay(2) };
+        // Metal presentation already waits for vsync. Another fixed sleep
+        // consumes the next frame's scheduling margin at 60 Hz.
+        if !cfg!(target_os = "macos") || !presented_this_iteration {
+            unsafe { ffi::up_platform_delay(2) };
+        }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1542,7 +1580,7 @@ mod palette_tests {
         let background = resume_background(true, false).unwrap().unwrap();
         assert_eq!(background.dimensions(), (16, 16));
         assert_eq!(
-            unsafe { ffi::up_av_frame_is_vulkan(background.as_ptr()) },
+            unsafe { ffi::up_av_frame_is_hardware(background.as_ptr()) },
             0
         );
         assert!(resume_background(true, true).unwrap().is_none());

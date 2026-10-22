@@ -45,6 +45,18 @@ fn changing_audio_format_is_safe() {
     child("changing-audio");
 }
 #[test]
+fn bounded_decode_preserves_frames_under_backpressure() {
+    child("bounded-decode");
+}
+#[test]
+fn audio_is_buffered_while_video_is_backpressured() {
+    child("audio-priority");
+}
+#[test]
+fn seeking_restores_full_decoding_after_keyframe_catchup() {
+    child("catchup-seek");
+}
+#[test]
 fn embedded_chapters_use_the_normal_seek_path() {
     child("chapters");
 }
@@ -55,6 +67,10 @@ fn embedded_artwork_is_extracted_and_cleaned_up() {
 #[test]
 fn delayed_audio_switch_makes_progress() {
     child("delayed-audio");
+}
+#[test]
+fn worker_seek_completes_before_delayed_audio() {
+    child("worker-delayed-audio-seek");
 }
 #[test]
 fn decoded_frames_preserve_interlacing_and_field_order() {
@@ -171,6 +187,200 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "worker-delayed-audio-seek" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=30:d=14",
+                    "-itsoffset",
+                    "12",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=sample_rate=48000:duration=2",
+                    "-c:v",
+                    "ffv1",
+                    "-c:a",
+                    "pcm_s16le",
+                ],
+                "delayed-worker.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            unsafe { media.seek(0.5) }.unwrap();
+            let worker = DecodeWorker::start(media, crate::source::MediaSource::File(path), false);
+            let mut frames = VecDeque::new();
+            let mut anchor = None;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                worker.check_error().unwrap();
+                worker.receive_frames(&mut frames);
+                if let Some(media) = worker.try_lock().unwrap() {
+                    anchor = unsafe {
+                        media.finish_seek(
+                            frames.front().map(|f| f.frame.pts),
+                            worker.pending_frames(),
+                            0.5,
+                        )
+                    };
+                    if anchor.is_some() {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            frames.clear();
+            drop(worker);
+            let anchor = anchor.expect(
+                "seek waits forever when video is buffered outside Media and audio starts later",
+            );
+            assert!((0.46..0.55).contains(&anchor), "seek anchor: {anchor}");
+        }
+        "catchup-seek" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=30:d=2",
+                    "-c:v",
+                    "mpeg4",
+                    "-g",
+                    "30",
+                    "-bf",
+                    "0",
+                ],
+                "catchup.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            unsafe { ffi::up_av_decoder_skip_nonkey(media.video.as_ptr(), 1) };
+            while unsafe { ffi::up_av_read_frame(media.format, media.packet) } >= 0 {
+                unsafe { media.decode_packet() }.unwrap();
+                unsafe { ffi::up_av_packet_unref(media.packet) };
+            }
+            unsafe { media.drain() }.unwrap();
+            assert_eq!(
+                media.video_queue.len(),
+                2,
+                "catch-up should decode only the two keyframes"
+            );
+            unsafe { media.seek(0.5) }.unwrap();
+            let mut after_catchup = Vec::new();
+            while !media.eof {
+                unsafe { media.fill_queues() }.unwrap();
+                while let Some(frame) = media.video_queue.pop_front() {
+                    after_catchup.push(frame.pts);
+                }
+            }
+            let mut baseline = unsafe { Media::open(&path, None, false) }.unwrap();
+            unsafe { baseline.seek(0.5) }.unwrap();
+            let mut expected = Vec::new();
+            while !baseline.eof {
+                unsafe { baseline.fill_queues() }.unwrap();
+                expected.extend(baseline.video_queue.drain(..).map(|frame| frame.pts));
+            }
+            assert!(expected.len() >= 45);
+            assert_eq!(
+                after_catchup, expected,
+                "seek did not restore normal dependent-frame decoding"
+            );
+        }
+        "audio-priority" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=60:d=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=sample_rate=44100:duration=2",
+                    "-c:v",
+                    "ffv1",
+                    "-c:a",
+                    "aac",
+                ],
+                "audio-priority.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            for _ in 0..100 {
+                unsafe { media.fill_queues_step(0) }.unwrap();
+                assert!(
+                    media.video_queue.is_empty(),
+                    "video backpressure was ignored"
+                );
+                if unsafe { media.audio.as_ref().unwrap().queued_bytes() }
+                    >= AUDIO_QUEUE_TARGET_BYTES
+                {
+                    break;
+                }
+            }
+            assert!(
+                unsafe { media.audio.as_ref().unwrap().queued_bytes() } >= AUDIO_QUEUE_TARGET_BYTES,
+                "video backpressure prevented audio from being buffered"
+            );
+            assert!(!media.eof);
+            let mut timestamps = Vec::new();
+            for _ in 0..2000 {
+                unsafe { ffi::up_audio_stream_clear(media.audio.as_ref().unwrap().stream) };
+                unsafe { media.fill_queues_step(1) }.unwrap();
+                assert!(media.video_queue.len() <= 1);
+                if let Some(frame) = media.video_queue.pop_front() {
+                    timestamps.push(frame.pts);
+                }
+                if media.eof {
+                    break;
+                }
+            }
+            assert_eq!(
+                timestamps.len(),
+                120,
+                "compressed read-ahead lost video at EOF"
+            );
+            assert!(timestamps.windows(2).all(|times| times[1] > times[0]));
+            unsafe { media.seek(1.0) }.unwrap();
+            unsafe { media.fill_queues() }.unwrap();
+            assert!(
+                media.video_queue.front().unwrap().pts >= 0.99,
+                "seeking retained a stale compressed packet"
+            );
+        }
+        "bounded-decode" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=12",
+                    "-t",
+                    "1",
+                    "-c:v",
+                    "ffv1",
+                ],
+                "bounded.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            unsafe { media.fill_queues_step(0) }.unwrap();
+            assert!(media.video_queue.is_empty() && !media.eof);
+            let mut timestamps = Vec::new();
+            for _ in 0..100 {
+                unsafe { media.fill_queues_step(1) }.unwrap();
+                assert!(
+                    media.video_queue.len() <= 1,
+                    "backpressure exceeded the available slot"
+                );
+                if let Some(frame) = media.video_queue.pop_front() {
+                    timestamps.push(frame.pts);
+                }
+                if media.eof && media.video_queue.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(timestamps.len(), 12, "bounded handoff lost decoded frames");
+            assert!(timestamps.windows(2).all(|times| times[1] > times[0]));
+        }
         "mute" => {
             let control = AudioControl::default();
             let mut audio = unsafe { AudioOutput::create(control.clone()) }.unwrap();
@@ -542,7 +752,7 @@ fn playback_child() {
                     );
                     chapters.seeked(target);
                     let landed =
-                        unsafe { media.finish_seek(Some(frame.pts), origin + target) }.unwrap();
+                        unsafe { media.finish_seek(Some(frame.pts), 0, origin + target) }.unwrap();
                     clock.seek(landed);
                     assert_eq!(
                         chapters.current(chapters.playback_position(clock.now() - origin)),
@@ -934,7 +1144,7 @@ fn playback_child() {
                 // Force the same initial rejection as a hardware decoder that
                 // cannot produce Vulkan frames, without requiring a GPU.
                 unsafe { media.select_audio_track(1, 0.5) }.unwrap();
-                media.video.uses_vulkan = true;
+                media.video.uses_hardware = true;
                 let worker =
                     DecodeWorker::start(media, crate::source::MediaSource::File(path), false);
                 let mut frames = VecDeque::new();
@@ -947,7 +1157,7 @@ fn playback_child() {
                     {
                         let media = worker.lock().unwrap();
                         unsafe { ffi::up_audio_stream_clear(media.audio.as_ref().unwrap().stream) };
-                        if !media.video.uses_vulkan && media.first_video_pts.is_some() {
+                        if !media.video.uses_hardware && media.first_video_pts.is_some() {
                             assert_eq!(
                                 media.selected_audio_track, 1,
                                 "fallback changed the audio track"
@@ -1028,7 +1238,7 @@ fn playback_child() {
             for _ in 0..128 {
                 unsafe { media.fill_queues() }.unwrap();
                 anchor =
-                    unsafe { media.finish_seek(media.video_queue.front().map(|f| f.pts), 0.5) };
+                    unsafe { media.finish_seek(media.video_queue.front().map(|f| f.pts), 0, 0.5) };
                 if anchor.is_some() {
                     break;
                 }
@@ -1036,7 +1246,9 @@ fn playback_child() {
             let anchor =
                 anchor.expect("full video buffer must allow seek completion without audio");
             assert!((0.46..0.55).contains(&anchor), "seek anchor: {anchor}");
-            assert!(unsafe { media.audio_clock() }.is_none());
+            // Compressed read-ahead may already have found the delayed track.
+            // Its timestamp must still keep it silent until 3 seconds.
+            assert!(unsafe { media.audio_clock() }.is_none_or(|pts| (pts - 3.0).abs() < 0.001));
             unsafe { media.sync_audio(anchor, false) }.unwrap();
             assert!(!media.audio.as_ref().unwrap().resumed);
             // Advance video until the delayed audio is demuxed.

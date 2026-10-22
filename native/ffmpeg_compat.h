@@ -115,21 +115,25 @@ const char *up_av_chapter_title(const UpAvFormat *format, unsigned int index);
 int up_av_read_frame(UpAvFormat *format, UpAvPacket *packet);
 int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds);
 UpAvDecoder *up_av_decoder_open(UpAvFormat *format, int stream_index,
-                                void *vulkan_device, int prefer_vulkan);
+                                void *hardware_device, int prefer_hardware);
 const char *up_av_decoder_error(void);
 void up_av_decoder_free(UpAvDecoder **decoder);
 int up_av_decoder_stream_index(const UpAvDecoder *decoder);
 double up_av_decoder_time_base(const UpAvDecoder *decoder);
 double up_av_decoder_frame_duration(const UpAvDecoder *decoder);
-int up_av_decoder_uses_vulkan(const UpAvDecoder *decoder);
+int up_av_decoder_uses_hardware(const UpAvDecoder *decoder);
 int up_av_decoder_width(const UpAvDecoder *decoder);
 int up_av_decoder_height(const UpAvDecoder *decoder);
 int up_av_decoder_send_packet(UpAvDecoder *decoder,
                               const UpAvPacket *packet);
 int up_av_decoder_receive_frame(UpAvDecoder *decoder, UpAvFrame **frame);
 void up_av_decoder_flush(UpAvDecoder *decoder);
+void up_av_decoder_skip_nonkey(UpAvDecoder *decoder, int skip);
 
 UpAvPacket *up_av_packet_alloc(void);
+UpAvPacket *up_av_packet_clone(const UpAvPacket *packet);
+int up_av_packet_size(const UpAvPacket *packet);
+int up_av_packet_is_key(const UpAvPacket *packet);
 void up_av_packet_free(UpAvPacket **packet);
 void up_av_packet_unref(UpAvPacket *packet);
 int up_av_packet_stream_index(const UpAvPacket *packet);
@@ -149,7 +153,7 @@ typedef struct UpLumaView {
 } UpLumaView;
 int up_av_frame_luma(const UpAvFrame *frame, UpLumaView *view);
 void up_av_frame_luma_free(UpLumaView *view);
-int up_av_frame_is_vulkan(const UpAvFrame *frame);
+int up_av_frame_is_hardware(const UpAvFrame *frame);
 int64_t up_av_frame_timestamp(const UpAvFrame *frame);
 int64_t up_av_frame_duration(const UpAvFrame *frame);
 int up_av_video_info(const UpAvFormat *format, const UpAvDecoder *decoder,

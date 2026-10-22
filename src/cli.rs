@@ -53,7 +53,7 @@ pub(crate) fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result
 
 pub(crate) fn usage(program: &Path) -> String {
     format!(
-        "Usage: {} [OPTIONS] VIDEO_FILE_OR_URL\n\nOptions:\n  --perf         print playback performance statistics\n  --debug        show FFmpeg diagnostic messages\n  -h, --help     show this help\n  -V, --version  show the version",
+        "Usage: {} [OPTIONS] VIDEO_FILE_OR_URL\n\nOptions:\n  --perf         print playback performance statistics\n  --debug        show decoder and platform diagnostic messages\n  -h, --help     show this help\n  -V, --version  show the version",
         program.display()
     )
 }
