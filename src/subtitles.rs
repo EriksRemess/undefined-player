@@ -32,9 +32,10 @@ pub(crate) fn subtitle_dialogue_text(raw: &str, ass: bool) -> String {
     let mut characters = dialogue.chars().peekable();
     while let Some(character) = characters.next() {
         match character {
-            '{' => in_override = true,
+            '{' if ass => in_override = true,
             '}' if in_override => in_override = false,
-            '\\' if !in_override => match characters.next() {
+            _ if in_override => {}
+            '\\' if ass => match characters.next() {
                 Some('N' | 'n') => text.push('\n'),
                 Some('h') => text.push(' '),
                 Some(other) => {
@@ -44,11 +45,18 @@ pub(crate) fn subtitle_dialogue_text(raw: &str, ass: bool) -> String {
                 None => text.push('\\'),
             },
             '\0' => {}
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                text.push('\n');
+            }
+            '\n' => text.push('\n'),
             '’' | '‘' => text.push('\''),
             '“' | '”' => text.push('"'),
             '–' | '—' => text.push('-'),
-            _ if !in_override && character.is_whitespace() => text.push(' '),
-            _ if !in_override && !character.is_control() => text.push(character),
+            _ if character.is_whitespace() => text.push(' '),
+            _ if !character.is_control() => text.push(character),
             _ => {}
         }
     }

@@ -628,7 +628,7 @@ impl Media {
                 })
                 .and_then(|pixels| pixels.checked_mul(4))
                 .filter(|bytes| *bytes <= 512 * 1024 * 1024);
-            let mut bitmap = pixel_count.map(|bytes| vec![0_u8; bytes]);
+            let mut bitmap = None;
             let mut has_bitmap = false;
             let mut text = Vec::new();
 
@@ -639,7 +639,7 @@ impl Media {
                 }
                 match rect.type_ {
                     ffi::UpSubtitleRectType_UP_SUBTITLE_RECT_BITMAP => {
-                        let Some(pixels) = bitmap.as_mut() else {
+                        let Some(bytes) = pixel_count else {
                             continue;
                         };
                         if rect.width <= 0
@@ -650,6 +650,7 @@ impl Media {
                         {
                             continue;
                         }
+                        let pixels = bitmap.get_or_insert_with(|| vec![0_u8; bytes]);
                         let x0 = rect.x.clamp(0, canvas_width);
                         let y0 = rect.y.clamp(0, canvas_height);
                         let x1 = rect.x.saturating_add(rect.width).clamp(0, canvas_width);

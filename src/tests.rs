@@ -343,6 +343,32 @@ fn network_title_decodes_the_url_filename() {
 }
 
 #[test]
+fn network_schemes_are_normalized_without_changing_signed_paths() {
+    assert_eq!(
+        cli(&["HtTpS://Media.example/Case%2FSensitive.mp4?Token=AbC"]),
+        cli(&["https://Media.example/Case%2FSensitive.mp4?Token=AbC"])
+    );
+    assert_eq!(
+        cli(&["HTTP://example.test/video"]),
+        cli(&["http://example.test/video"])
+    );
+}
+
+#[test]
+fn network_titles_are_safe_and_do_not_treat_queries_as_paths() {
+    for (url, expected) in [
+        ("https://example.test/One%00Two%1B.mp4", "OneTwo"),
+        ("https://example.test/%00.mp4", "undefined-player"),
+        ("https://example.test?next=/wrong.mp4", "undefined-player"),
+        ("https://example.test#next=/wrong.mp4", "undefined-player"),
+    ] {
+        let source = crate::source::MediaSource::Http(url.into());
+        assert_eq!(source_title(&source), expected, "{url}");
+        assert!(std::ffi::CString::new(source_display_title(&source)).is_ok());
+    }
+}
+
+#[test]
 fn mpris_positions_use_microseconds() {
     assert_eq!(seconds_to_microseconds(1.25), 1_250_000);
     assert_eq!(seconds_to_microseconds(-1.0), 0);
@@ -473,6 +499,18 @@ fn ass_dialogue_is_reduced_to_overlay_text() {
 }
 
 #[test]
+fn subtitle_text_preserves_literal_content_and_hides_ass_overrides() {
+    assert_eq!(
+        subtitle_dialogue_text("Use {braces} and \\N literally\r\nSecond line", false),
+        "Use {braces} and \\N literally\nSecond line"
+    );
+    assert_eq!(
+        subtitle_dialogue_text("0,0,Default,,0,0,0,,{\\fn‘Quoted—Font’}Hello\\Nworld", true),
+        "Hello\nworld"
+    );
+}
+
+#[test]
 #[ignore = "requires UP_TEST_MEDIA pointing to a local video file"]
 fn external_media_reports_complete_video_info() {
     let _serial = EXTERNAL_MEDIA_TEST_LOCK
@@ -512,7 +550,7 @@ fn external_network_media_decodes_and_seeks() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let url = env::var("UP_TEST_URL").expect("UP_TEST_URL is set");
-    let source = crate::source::MediaSource::Http(url);
+    let source = crate::source::MediaSource::from_argument(url.into()).expect("valid media URL");
     unsafe {
         env::set_var("SDL_VIDEODRIVER", "dummy");
         env::set_var("SDL_AUDIODRIVER", "dummy");

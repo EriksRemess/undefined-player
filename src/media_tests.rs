@@ -588,6 +588,12 @@ fn playback_child() {
             .unwrap();
             // Read through the entire ring several times before seeking. Check
             // every decoded picture, not just demux timestamps or byte counts.
+            for target in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300, -1e300] {
+                assert!(
+                    unsafe { ffi::up_av_seek(media.format, media.video.stream_index, target) } < 0,
+                    "unrepresentable seek target was accepted: {target}"
+                );
+            }
             let mut decoded = 0;
             while !media.eof || !media.video_queue.is_empty() {
                 unsafe { media.fill_initial_queues() }.unwrap();

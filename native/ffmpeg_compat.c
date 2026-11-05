@@ -93,9 +93,20 @@ void up_av_frame_luma_free(UpLumaView *view)
 
 static const AVCodec *preferred_decoder(enum AVCodecID id)
 {
-    // FFmpeg's default can be a software implementation such as libdav1d.
-    // The decoder named "av1" can be hardware-only, so it is not a fallback.
-    return avcodec_find_decoder(id);
+    // Registry order can put a hardware wrapper (such as CUVID) first even
+    // when no usable GPU is present. This path must work without a device;
+    // the requested Vulkan/VideoToolbox decoder is selected separately.
+    const AVCodec *codec = avcodec_find_decoder(id);
+    if (codec && !(codec->capabilities & (AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_HYBRID)))
+        return codec;
+    void *iterator = NULL;
+    while ((codec = av_codec_iterate(&iterator))) {
+        if (av_codec_is_decoder(codec) && codec->id == id &&
+            !(codec->capabilities & (AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_HYBRID |
+                                    AV_CODEC_CAP_EXPERIMENTAL)))
+            return codec;
+    }
+    return NULL;
 }
 
 static AVStream *stream_at(const UpAvFormat *format, unsigned int index)
@@ -654,8 +665,12 @@ int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
     AVStream *stream = stream_at(format, (unsigned int) stream_index);
     if (!stream || stream->time_base.num <= 0 || stream->time_base.den <= 0)
         return AVERROR(EINVAL);
-    int64_t timestamp = llround(target_seconds * stream->time_base.den /
-                                stream->time_base.num);
+    double ticks = target_seconds * stream->time_base.den / stream->time_base.num;
+    // llround cannot represent non-finite or out-of-range results. In
+    // particular, INT64_MIN is FFmpeg's sentinel for a missing timestamp.
+    if (!isfinite(ticks) || ticks <= (double) INT64_MIN || ticks >= (double) INT64_MAX)
+        return AVERROR(EINVAL);
+    int64_t timestamp = llround(ticks);
     AVFormatContext *native = FORMAT(format);
     int result = av_seek_frame(native, stream_index, timestamp,
                                AVSEEK_FLAG_BACKWARD);

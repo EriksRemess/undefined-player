@@ -46,9 +46,12 @@ impl MediaSource {
                     .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
         });
         if is_http {
-            return Ok(Self::Http(
-                argument.into_string().expect("HTTP URL is UTF-8"),
-            ));
+            let mut url = argument.into_string().expect("HTTP URL is UTF-8");
+            let scheme_end = url.find(':').expect("HTTP URL has a scheme");
+            // FFmpeg's protocol lookup is case-sensitive. Preserve every byte
+            // after the scheme, including signed paths and query parameters.
+            url[..scheme_end].make_ascii_lowercase();
+            return Ok(Self::Http(url));
         }
         Ok(Self::File(PathBuf::from(argument)))
     }

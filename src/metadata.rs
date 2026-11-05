@@ -251,7 +251,7 @@ pub(crate) fn media_title(path: &Path) -> String {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         })
         .map_or(stem, |(title, _)| title);
-    let title = stem.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = single_line_metadata(stem);
     if title.is_empty() {
         "undefined-player".into()
     } else {
@@ -289,11 +289,11 @@ pub(crate) fn source_title(source: &MediaSource) -> String {
             let path = url
                 .split_once("//")
                 .map_or(url.as_str(), |(_, remainder)| remainder)
-                .split_once('/')
-                .map_or("", |(_, path)| path)
                 .split(['?', '#'])
                 .next()
-                .unwrap_or("");
+                .unwrap_or("")
+                .split_once('/')
+                .map_or("", |(_, path)| path);
             let name = path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
             media_title(Path::new(&decode_url_component(name)))
         }
