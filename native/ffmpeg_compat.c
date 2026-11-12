@@ -323,6 +323,11 @@ int up_av_error_is_eof(int code)
     return code == AVERROR_EOF;
 }
 
+int up_av_error_is_invalid_data(int code)
+{
+    return code == AVERROR_INVALIDDATA;
+}
+
 static int buffered_read(void *reader, uint8_t *buffer, int size)
 {
     int result = up_read_ahead_read(reader, buffer, size);

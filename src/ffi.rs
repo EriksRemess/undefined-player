@@ -107,6 +107,9 @@ unsafe extern "C" {
     pub fn up_av_error_is_eof(code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn up_av_error_is_invalid_data(code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn up_av_video_decoder_available(
         name: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;

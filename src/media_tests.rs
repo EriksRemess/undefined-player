@@ -49,6 +49,24 @@ fn bounded_decode_preserves_frames_under_backpressure() {
     child("bounded-decode");
 }
 #[test]
+fn damaged_video_packet_recovers_at_a_keyframe() {
+    child("damaged-video");
+}
+#[test]
+fn damaged_video_without_audio_recovers_at_a_keyframe() {
+    child("damaged-video-silent");
+}
+#[test]
+fn damaged_video_startup_and_unrecoverable_errors_remain_fatal() {
+    for case in [
+        "damaged-video-startup",
+        "damaged-video-tail",
+        "damaged-video-limit",
+    ] {
+        child(case);
+    }
+}
+#[test]
 fn audio_is_buffered_while_video_is_backpressured() {
     child("audio-priority");
 }
@@ -134,6 +152,12 @@ fn native_geometry_does_not_leave_zoom_waiting_for_pixels() {
     child("native-geometry");
 }
 
+#[test]
+#[ignore = "requires UP_TEST_URL; pauses for UP_TEST_PAUSE_SECONDS (default 600)"]
+fn external_network_media_survives_long_pause() {
+    child("network-pause");
+}
+
 fn decode_one_audio_packet(media: &mut Media) {
     let stream = media.audio_tracks[media.selected_audio_track]
         .decoder
@@ -190,6 +214,168 @@ fn playback_child() {
     let _sdl = Sdl;
     let fixture = Fixture::new();
     match case.as_str() {
+        "damaged-video"
+        | "damaged-video-silent"
+        | "damaged-video-startup"
+        | "damaged-video-tail"
+        | "damaged-video-limit" => {
+            let clean = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=30:d=6",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=sample_rate=48000:duration=6",
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-deadline",
+                    "realtime",
+                    "-cpu-used",
+                    "8",
+                    "-g",
+                    "30",
+                    "-c:a",
+                    "aac",
+                ],
+                "clean.mkv",
+            );
+            let noise = match case.as_str() {
+                "damaged-video-startup" => "noise=amount='if(eq(n,0),1,0)'",
+                "damaged-video-tail" => "noise=amount='if(gte(n,150),1,0)'",
+                "damaged-video-limit" => "noise=amount='if(gte(n,45),1,0)'",
+                _ => "noise=amount='if(eq(n,45),1,0)'",
+            };
+            let mut args = vec![
+                "-stream_loop",
+                if case == "damaged-video-limit" {
+                    "23"
+                } else {
+                    "0"
+                },
+                "-i",
+                clean.to_str().unwrap(),
+                "-c",
+                "copy",
+                "-bsf:v",
+                noise,
+            ];
+            if case == "damaged-video-silent" {
+                args.push("-an");
+            }
+            let path = fixture.generate(&args, "damaged.nut");
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            let mut timestamps = Vec::new();
+            let mut failure = None;
+            for _ in 0..2000 {
+                if let Some(audio) = &media.audio {
+                    unsafe { ffi::up_audio_stream_clear(audio.stream) };
+                }
+                let result = unsafe { media.fill_queues_step(1) };
+                timestamps.extend(media.video_queue.drain(..).map(|frame| frame.pts));
+                if let Err(error) = result {
+                    failure = Some(error);
+                    break;
+                }
+                if media.eof {
+                    break;
+                }
+            }
+            assert!(timestamps.windows(2).all(|times| times[1] > times[0]));
+            match case.as_str() {
+                "damaged-video-startup" => {
+                    assert!(timestamps.is_empty());
+                    assert!(failure.unwrap().contains("video decoder rejected"));
+                }
+                "damaged-video-tail" => {
+                    assert!(media.eof);
+                    assert!(
+                        failure
+                            .unwrap()
+                            .contains("could not recover before end of stream")
+                    );
+                }
+                "damaged-video-limit" => {
+                    assert!(!media.eof, "recovery must be bounded before EOF");
+                    assert!(failure.unwrap().contains("video decoder could not recover"));
+                }
+                _ => {
+                    assert!(failure.is_none(), "{failure:?}");
+                    assert!(media.eof, "damaged video did not reach EOF");
+                    assert!(
+                        timestamps.len() >= 150,
+                        "too many pictures lost: {}",
+                        timestamps.len()
+                    );
+                    assert!(timestamps.last().unwrap() > &5.9, "video did not recover");
+                }
+            }
+        }
+        "network-pause" => {
+            fn play_for(
+                worker: &DecodeWorker,
+                clock: &mut WallClock,
+                frames: &mut VecDeque<crate::worker::QueuedVideoFrame>,
+                seconds: u64,
+            ) -> Option<f64> {
+                let deadline = Instant::now() + Duration::from_secs(seconds);
+                let mut last_pts = None;
+                while Instant::now() < deadline {
+                    worker.check_error().unwrap();
+                    worker.receive_frames(frames);
+                    if let Some(mut media) = worker.try_lock().unwrap() {
+                        unsafe { media.sync_audio(clock.now(), false) }.unwrap();
+                        if let Some(audio_pts) = unsafe { media.active_clock() } {
+                            clock.synchronize(audio_pts);
+                        }
+                    }
+                    while frames
+                        .front()
+                        .is_some_and(|frame| frame.frame.pts <= clock.now())
+                    {
+                        last_pts = frames.pop_front().map(|frame| frame.frame.pts);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                worker.check_error().unwrap();
+                last_pts
+            }
+
+            let url = env::var("UP_TEST_URL").expect("UP_TEST_URL is set");
+            let source = crate::source::MediaSource::from_argument(url.into()).unwrap();
+            let source = crate::youtube::resolve(source).unwrap();
+            let mut media = unsafe { Media::open(&source, None, false) }.unwrap();
+            unsafe { media.fill_initial_queues() }.unwrap();
+            let origin = media.first_video_pts.unwrap();
+            let worker = DecodeWorker::start(media, source, false);
+            let mut clock = WallClock::new(origin);
+            let mut frames = VecDeque::new();
+            assert!(play_for(&worker, &mut clock, &mut frames, 5).is_some());
+            let mut paused = false;
+            unsafe { crate::playback::set_playback_paused(&worker, &mut clock, &mut paused, true) }
+                .unwrap();
+            let paused_position = clock.now();
+            let seconds = env::var("UP_TEST_PAUSE_SECONDS")
+                .map(|value| value.parse::<u64>().unwrap())
+                .unwrap_or(600);
+            eprintln!(
+                "pausing network media at {:.3} for {seconds} seconds",
+                clock.now()
+            );
+            thread::sleep(Duration::from_secs(seconds));
+            worker.check_error().unwrap();
+            assert_eq!(clock.now(), paused_position);
+            unsafe {
+                crate::playback::set_playback_paused(&worker, &mut clock, &mut paused, false)
+            }
+            .unwrap();
+            eprintln!("resuming network media at {:.3}", clock.now());
+            let resumed_position = play_for(&worker, &mut clock, &mut frames, 20).unwrap();
+            assert!(resumed_position > paused_position + 1.0);
+            frames.clear();
+        }
         "native-geometry" => {
             let path = fixture.generate(
                 &[

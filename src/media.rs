@@ -19,6 +19,13 @@ pub(crate) const VIDEO_QUEUE_MAX: usize = 24;
 pub(crate) const AV_NOPTS_VALUE: i64 = i64::MIN;
 const VIDEO_PACKET_MAX: usize = 256;
 const VIDEO_PACKET_MAX_BYTES: usize = 32 * 1024 * 1024;
+const VIDEO_RECOVERY_MAX_PACKETS: usize = 4096;
+
+struct VideoRecovery {
+    error: String,
+    waiting_for_keyframe: bool,
+    packets_left: usize,
+}
 
 struct VideoPacket(*mut ffi::UpAvPacket);
 
@@ -90,6 +97,7 @@ pub(crate) struct Media {
     video_packet_bytes: usize,
     input_eof: bool,
     video_catching_up: bool,
+    video_recovery: Option<VideoRecovery>,
     pub(crate) subtitle_queue: VecDeque<SubtitleCue>,
     pub(crate) subtitle_serial: u64,
     pub(crate) log_subtitles: bool,
@@ -461,6 +469,7 @@ impl Media {
                 video_packet_bytes: 0,
                 input_eof: false,
                 video_catching_up: false,
+                video_recovery: None,
                 subtitle_queue: VecDeque::new(),
                 subtitle_serial: 0,
                 log_subtitles,
@@ -498,7 +507,7 @@ impl Media {
                 if ffmpeg_error_is_again(ret) || ffmpeg_error_is_eof(ret) {
                     break;
                 }
-                return Err(format!("video decoding failed: {}", ffmpeg_error(ret)));
+                return unsafe { self.recover_video(ret, "video decoding failed") };
             }
             let frame = DropGuard::new(frame, |mut frame| unsafe {
                 ffi::up_av_frame_free(&mut frame)
@@ -507,6 +516,9 @@ impl Media {
                 return Err(
                     "the selected codec/profile is not supported by hardware decoding".into(),
                 );
+            }
+            if self.video_recovery.take().is_some() {
+                eprintln!("video: decoding recovered after damaged packets");
             }
             let timestamp = unsafe { ffi::up_av_frame_timestamp(*frame) };
             let pts = if timestamp == AV_NOPTS_VALUE {
@@ -752,12 +764,12 @@ impl Media {
     pub(crate) unsafe fn decode_packet(&mut self) -> Result<()> {
         let stream_index = unsafe { ffi::up_av_packet_stream_index(self.packet) };
         if stream_index == self.video.stream_index {
+            if !unsafe { self.video_packet_ready(self.packet)? } {
+                return Ok(());
+            }
             let ret = unsafe { ffi::up_av_decoder_send_packet(self.video.as_ptr(), self.packet) };
             if ret < 0 {
-                return Err(format!(
-                    "video decoder rejected a packet: {}",
-                    ffmpeg_error(ret)
-                ));
+                return unsafe { self.recover_video(ret, "video decoder rejected a packet") };
             }
             unsafe { self.receive_video()? };
         } else if self
@@ -786,12 +798,60 @@ impl Media {
         Ok(())
     }
 
+    unsafe fn recover_video(&mut self, code: i32, context: &str) -> Result<()> {
+        let error = format!("{context}: {}", ffmpeg_error(code));
+        // Startup errors must still trigger hardware/rendition fallback.
+        if self.first_video_pts.is_none() || unsafe { ffi::up_av_error_is_invalid_data(code) } == 0
+        {
+            return Err(error);
+        }
+        let recovery = self.video_recovery.get_or_insert_with(|| {
+            eprintln!("warning: {error}; recovering at the next keyframe");
+            VideoRecovery {
+                error,
+                waiting_for_keyframe: true,
+                packets_left: VIDEO_RECOVERY_MAX_PACKETS,
+            }
+        });
+        recovery.waiting_for_keyframe = true;
+        unsafe {
+            ffi::up_av_decoder_flush(self.video.as_ptr());
+            ffi::up_av_decoder_skip_nonkey(self.video.as_ptr(), 0);
+        }
+        self.video_catching_up = false;
+        self.interlace_detector = crate::deinterlace::Detector::default();
+        Ok(())
+    }
+
+    unsafe fn video_packet_ready(&mut self, packet: *const ffi::UpAvPacket) -> Result<bool> {
+        let Some(recovery) = self.video_recovery.as_mut() else {
+            return Ok(true);
+        };
+        if recovery.packets_left == 0 {
+            return Err(format!(
+                "video decoder could not recover: {}",
+                recovery.error
+            ));
+        }
+        recovery.packets_left -= 1;
+        if recovery.waiting_for_keyframe {
+            if unsafe { ffi::up_av_packet_is_key(packet) } == 0 {
+                return Ok(false);
+            }
+            recovery.waiting_for_keyframe = false;
+        }
+        Ok(true)
+    }
+
     unsafe fn decode_buffered_video(&mut self) -> Result<()> {
         let packet = self
             .video_packets
             .pop_front()
             .expect("buffered decode requires a queued packet");
         self.video_packet_bytes -= unsafe { ffi::up_av_packet_size(packet.0) }.max(0) as usize;
+        if !unsafe { self.video_packet_ready(packet.0)? } {
+            return Ok(());
+        }
         let timestamp = unsafe { ffi::up_av_packet_pts(packet.0) };
         let pts = (timestamp != AV_NOPTS_VALUE).then_some(timestamp as f64 * self.video.time_base);
         let audio_clock = self
@@ -815,10 +875,7 @@ impl Media {
         };
         let ret = unsafe { ffi::up_av_decoder_send_packet(self.video.as_ptr(), packet.0) };
         if ret < 0 {
-            return Err(format!(
-                "video decoder rejected a buffered packet: {}",
-                ffmpeg_error(ret)
-            ));
+            return unsafe { self.recover_video(ret, "video decoder rejected a buffered packet") };
         }
         unsafe { self.receive_video() }
     }
@@ -838,6 +895,12 @@ impl Media {
             ));
         }
         unsafe { self.receive_video()? };
+        if let Some(recovery) = &self.video_recovery {
+            return Err(format!(
+                "video decoder could not recover before end of stream: {}",
+                recovery.error
+            ));
+        }
         if let Some(track) = self.audio_tracks.get(self.selected_audio_track) {
             let audio_ret =
                 unsafe { ffi::up_av_decoder_send_packet(track.decoder.as_ptr(), ptr::null()) };
@@ -1078,6 +1141,7 @@ impl Media {
         self.video_packet_bytes = 0;
         self.input_eof = false;
         self.video_catching_up = false;
+        self.video_recovery = None;
         self.interlace_detector = crate::deinterlace::Detector::default();
         self.subtitle_queue.clear();
         self.eof = false;

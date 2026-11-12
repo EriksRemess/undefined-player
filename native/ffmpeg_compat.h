@@ -77,6 +77,7 @@ void up_av_set_debug(int enabled);
 int up_av_error_string(int code, char *buffer, size_t buffer_size);
 int up_av_error_is_again(int code);
 int up_av_error_is_eof(int code);
+int up_av_error_is_invalid_data(int code);
 
 int up_av_video_decoder_available(const char *name);
 

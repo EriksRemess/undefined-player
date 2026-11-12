@@ -73,9 +73,12 @@ git diff --check
 ```
 
 `make check` runs formatting checks, native tests, Rust tests, strict Clippy
-checks, and Linux desktop-file validation. Playback tests generate fixtures with `ffmpeg`
-(including libx264) and use dummy SDL drivers. Linux text tests require DejaVu
-fonts. No desktop or GPU is needed for these checks.
+checks, and Linux desktop-file validation. Playback tests generate fixtures with
+`ffmpeg` (including libx264 and libvpx-vp9) and use dummy SDL drivers. Linux text
+tests require DejaVu fonts. No desktop or GPU is needed for these checks.
+
+The ignored `external_network_media_survives_long_pause` test uses `UP_TEST_URL`
+and pauses for `UP_TEST_PAUSE_SECONDS` (600 by default).
 
 On a Mac with a desktop and supported GPU:
 
@@ -222,6 +225,11 @@ Demuxing targets a 250 ms audio lead. Compressed video read-ahead is bounded to
 256 packets or 32 MiB, plus one packet. When video is over 250 ms late, catch-up
 skips non-keyframes until a current keyframe; long GOPs can therefore freeze
 the picture when decoding cannot keep pace.
+
+Invalid video packets after playback starts flush the video decoder and skip
+dependent packets until the next keyframe. Recovery must produce a valid frame
+within 4096 video packets and before EOF; startup and other decoder errors remain
+fatal so hardware fallback still works.
 
 Local-file buffering retains 4 MiB behind and reads 4 MiB ahead. Seeks invalidate
 in-flight reads; shutdown joins workers before freeing their state. Network
