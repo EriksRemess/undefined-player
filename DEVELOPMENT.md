@@ -132,9 +132,18 @@ make deb
 sudo apt install ../undefined-player_*_amd64.deb
 ```
 
-CI uses Ubuntu 26.04; other distributions must meet `debian/control` requirements.
-Use direct Cargo builds for custom source-installed dependencies that Debian’s
-package manager cannot resolve.
+CI uses Ubuntu 26.04 native libraries and Rustup's stable toolchain. With Rust
+1.100+ installed through Rustup, select the same build profile:
+
+```sh
+sudo apt-get build-dep -P pkg.undefined-player.rustup .
+DEB_BUILD_PROFILES=pkg.undefined-player.rustup make deb
+```
+
+This profile omits only the distribution's Cargo and rustc packages. Cargo still
+enforces the minimum Rust version. Other dependencies must meet `debian/control`
+requirements; use direct Cargo builds for custom source-installed native
+libraries that Debian's package manager cannot resolve.
 
 `make tarball` creates a Linux archive under `target/dist` with a user-local
 installer. It requires compatible shared libraries on the destination system.

@@ -72,6 +72,8 @@ jobs:
   debian-package:
     runs-on: ubuntu-latest
     container: ubuntu:26.04
+    env:
+      DEB_BUILD_PROFILES: pkg.undefined-player.rustup
     steps:
       - name: Install Debian packaging tools
         run: |
@@ -98,7 +100,9 @@ jobs:
             cargo-${{ runner.arch }}-${{ github.job }}-
 
       - name: Install declared build dependencies
-        run: DEBIAN_FRONTEND=noninteractive apt-get build-dep -y .
+        run: >-
+          DEBIAN_FRONTEND=noninteractive apt-get build-dep -y
+          --build-profiles="$DEB_BUILD_PROFILES" .
 
       - name: Prepare package version
         id: package

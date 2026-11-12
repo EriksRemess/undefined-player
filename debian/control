@@ -4,8 +4,8 @@ Priority: optional
 Maintainer: Ēriks Remess <eriks@remess.lv>
 Build-Depends:
  debhelper-compat (= 13),
- cargo,
- rustc (>= 1.100.0),
+ cargo <!pkg.undefined-player.rustup>,
+ rustc (>= 1.100.0) <!pkg.undefined-player.rustup>,
  binutils,
  pkgconf,
  wayland-protocols,
