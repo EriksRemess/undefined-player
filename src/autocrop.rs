@@ -220,7 +220,7 @@ impl AutoCrop {
                 }
             }
         }
-        self.enabled = !self.enabled;
+        self.enabled.toggle();
         self.reset();
         eprintln!("autocrop: {}", if self.enabled { "on" } else { "off" });
         self.enabled

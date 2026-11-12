@@ -1,6 +1,7 @@
 use crate::ffi;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::mem::DropGuard;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,9 +27,8 @@ impl Artwork {
             if png.is_null() {
                 continue;
             }
-            let stored = Self::store(unsafe { std::slice::from_raw_parts(png, png_size) });
-            unsafe { ffi::up_av_artwork_free(png) };
-            match stored {
+            let png = DropGuard::new(png, |png| unsafe { ffi::up_av_artwork_free(png) });
+            match Self::store(unsafe { std::slice::from_raw_parts(*png, png_size) }) {
                 Ok(artwork) => return Some(artwork),
                 Err(error) => {
                     eprintln!("warning: could not prepare embedded artwork: {error}");

@@ -4,6 +4,7 @@ use crate::geometry::{SCRUBBER_MARGIN, TOP_BAR_HEIGHT};
 use crate::{Result, ffi, pixel_font};
 use std::borrow::Cow;
 use std::ffi::CStr;
+use std::mem::DropGuard;
 
 const WIDTH: usize = 1024;
 const PALETTE_Y: usize = 704;
@@ -117,10 +118,10 @@ fn normalized(text: &str) -> Result<Cow<'_, str>> {
     if pointer.is_null() {
         return Err("could not normalize overlay text".into());
     }
-    let result = unsafe { CStr::from_ptr(pointer) }
+    let pointer = DropGuard::new(pointer, |pointer| unsafe { ffi::up_text_free(pointer) });
+    let result = unsafe { CStr::from_ptr(*pointer) }
         .to_string_lossy()
         .into_owned();
-    unsafe { ffi::up_text_free(pointer) };
     Ok(Cow::Owned(result))
 }
 

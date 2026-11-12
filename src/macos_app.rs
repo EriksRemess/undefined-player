@@ -1,6 +1,7 @@
 //! Finder open-file events and the native app's Open dialog.
 use crate::{Result, source::MediaSource};
 use std::ffi::{CStr, CString, OsStr, c_char};
+use std::mem::DropGuard;
 use std::os::unix::ffi::OsStrExt;
 
 unsafe extern "C" {
@@ -19,8 +20,8 @@ fn source_from_path(path: *mut c_char) -> Result<Option<MediaSource>> {
     if path.is_null() {
         return Ok(None);
     }
-    let argument = unsafe { OsStr::from_bytes(CStr::from_ptr(path).to_bytes()).to_owned() };
-    unsafe { up_mac_app_free_path(path) };
+    let path = DropGuard::new(path, |path| unsafe { up_mac_app_free_path(path) });
+    let argument = unsafe { OsStr::from_bytes(CStr::from_ptr(*path).to_bytes()).to_owned() };
     MediaSource::from_argument(argument).map(Some)
 }
 

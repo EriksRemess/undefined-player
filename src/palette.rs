@@ -209,7 +209,7 @@ impl Palette {
 
     fn direction_step(&self) -> Option<bool> {
         let query = self.query_words();
-        match query.strip_prefix("seek ").unwrap_or(&query) {
+        match query.trim_prefix("seek ") {
             "forward" | "forwards" | "ahead" => Some(true),
             "back" | "backward" | "backwards" => Some(false),
             _ => None,
@@ -234,7 +234,7 @@ impl Palette {
             ];
         }
         if let Some(value) = query.strip_prefix("language ") {
-            let value = value.strip_prefix("custom ").unwrap_or(value);
+            let value = value.trim_prefix("custom ");
             return crate::language::parse_preference(value)
                 .ok()
                 .into_iter()
@@ -252,7 +252,7 @@ impl Palette {
                 let value = query
                     .strip_prefix("corners ")
                     .expect("corner argument branch has a prefix");
-                let value = value.strip_prefix("custom ").unwrap_or(value);
+                let value = value.trim_prefix("custom ");
                 crate::config::parse_radius(value)
                     .ok()
                     .into_iter()

@@ -1,8 +1,8 @@
 use crate::{Result, ffi, geometry};
-#[cfg(target_os = "linux")]
-use std::env;
 use std::ffi::CStr;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{env, mem::DropGuard};
 
 pub(crate) struct IdleCursor {
     last_activity: Instant,
@@ -318,15 +318,17 @@ impl<'window> WindowShape<'window> {
         if input.is_null() {
             return Err("out of memory while creating Wayland input".into());
         }
-        if !unsafe { ffi::up_wayland_input_ready(input) } {
-            let message = unsafe { CStr::from_ptr(ffi::up_wayland_input_error(input)) }
+        let input = DropGuard::new(input, |input| unsafe {
+            ffi::up_wayland_input_destroy(input)
+        });
+        if !unsafe { ffi::up_wayland_input_ready(*input) } {
+            let message = unsafe { CStr::from_ptr(ffi::up_wayland_input_error(*input)) }
                 .to_string_lossy()
                 .into_owned();
-            unsafe { ffi::up_wayland_input_destroy(input) };
             return Err(message);
         }
         Ok(Some(Self {
-            native: input,
+            native: DropGuard::dismiss(input),
             _window: window,
         }))
     }

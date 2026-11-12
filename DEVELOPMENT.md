@@ -4,7 +4,7 @@
 
 ## Build requirements
 
-Rust 1.93.1+ and Cargo are required. Native libraries are discovered through
+Rust 1.100+ and Cargo are required. Native libraries are discovered through
 `pkg-config`.
 
 ### macOS

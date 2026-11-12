@@ -5,7 +5,7 @@ Maintainer: Ēriks Remess <eriks@remess.lv>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,
- rustc (>= 1.93.1),
+ rustc (>= 1.100.0),
  binutils,
  pkgconf,
  wayland-protocols,

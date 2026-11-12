@@ -5,6 +5,7 @@ use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+use std::mem::DropGuard;
 use std::os::unix::{
     ffi::OsStrExt,
     fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -197,6 +198,9 @@ impl Store {
                 .create_new(true)
                 .mode(0o600)
                 .open(&temporary)?;
+            let temporary = DropGuard::new(temporary, |temporary| {
+                let _ = fs::remove_file(temporary);
+            });
             writeln!(file, "{HEADER}")?;
             for (key, entry) in entries {
                 writeln!(
@@ -206,12 +210,10 @@ impl Store {
                 )?;
             }
             file.sync_all()?;
-            fs::rename(&temporary, &self.path)?;
+            fs::rename(&*temporary, &self.path)?;
+            DropGuard::dismiss(temporary);
             File::open(directory)?.sync_all()
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
         result.map_err(|e| e.to_string())
     }
 }

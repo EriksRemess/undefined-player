@@ -641,7 +641,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                             redraw = true;
                         }
                         Some(Action::ToggleInfo) => {
-                            info_visible = !info_visible;
+                            info_visible.toggle();
                             redraw = true;
                         }
                         Some(Action::ToggleMute) => {
@@ -663,7 +663,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                             redraw = true;
                         }
                         Some(Action::ToggleLoop) => {
-                            looping = !looping;
+                            looping.toggle();
                             if let Some(mpris) = &mpris {
                                 mpris.options(muted, looping);
                             }
@@ -740,7 +740,7 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                             new_frame_pending = true;
                         }
                         Some(Action::ToggleSubtitles) if subtitles_available => {
-                            subtitles_visible = !subtitles_visible;
+                            subtitles_visible.toggle();
                             position_notice.show_text(subtitle_status_text(
                                 subtitles_visible,
                                 selected_subtitle_track,

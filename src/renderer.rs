@@ -186,7 +186,7 @@ impl<'window> Renderer<'window> {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn toggle_upscaling(&mut self) -> bool {
-        self.upscaling = !self.upscaling;
+        self.upscaling.toggle();
         unsafe { ffi::up_video_renderer_set_upscaling(self.context, self.upscaling) };
         self.upscaling
     }

@@ -1,5 +1,6 @@
 //! Human-editable key=value preferences. No config is written until a setting changes.
 use crate::Result;
+use std::mem::DropGuard;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -211,14 +212,16 @@ impl Config {
                 .mode(0o600)
                 .open(&temporary)
                 .map_err(|e| e.to_string())?;
+            let temporary = DropGuard::new(temporary, |temporary| {
+                let _ = fs::remove_file(temporary);
+            });
             let write_result = (|| -> io::Result<()> {
                 file.write_all(text.as_bytes())?;
                 file.sync_all()?;
-                fs::rename(&temporary, path)
+                fs::rename(&*temporary, path)?;
+                DropGuard::dismiss(temporary);
+                Ok(())
             })();
-            if write_result.is_err() {
-                let _ = fs::remove_file(&temporary);
-            }
             write_result.map_err(|e| e.to_string())
         })();
         result.map_err(|e| format!("could not save {}: {e}", path.display()))?;

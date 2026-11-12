@@ -9,6 +9,7 @@ use crate::subtitles::{SubtitleContent, SubtitleCue, subtitle_dialogue_text};
 use crate::{Result, ffi};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
+use std::mem::DropGuard;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -499,19 +500,21 @@ impl Media {
                 }
                 return Err(format!("video decoding failed: {}", ffmpeg_error(ret)));
             }
-            if self.video.uses_hardware && unsafe { ffi::up_av_frame_is_hardware(frame) } == 0 {
-                unsafe { ffi::up_av_frame_free(&mut frame) };
+            let frame = DropGuard::new(frame, |mut frame| unsafe {
+                ffi::up_av_frame_free(&mut frame)
+            });
+            if self.video.uses_hardware && unsafe { ffi::up_av_frame_is_hardware(*frame) } == 0 {
                 return Err(
                     "the selected codec/profile is not supported by hardware decoding".into(),
                 );
             }
-            let timestamp = unsafe { ffi::up_av_frame_timestamp(frame) };
+            let timestamp = unsafe { ffi::up_av_frame_timestamp(*frame) };
             let pts = if timestamp == AV_NOPTS_VALUE {
                 self.next_video_pts
             } else {
                 timestamp as f64 * self.video.time_base
             };
-            let raw_duration = unsafe { ffi::up_av_frame_duration(frame) };
+            let raw_duration = unsafe { ffi::up_av_frame_duration(*frame) };
             let duration = if raw_duration > 0 {
                 raw_duration as f64 * self.video.time_base
             } else {
@@ -523,12 +526,12 @@ impl Media {
                 .video_seek_target
                 .is_some_and(|target| pts + duration.max(1.0 / 120.0) < target)
             {
-                unsafe { ffi::up_av_frame_free(&mut frame) };
                 continue;
             }
             self.video_seek_target = None;
             self.first_video_pts.get_or_insert(pts);
-            let mut frame = unsafe { VideoFrame::from_raw(frame, pts, duration) };
+            let mut frame =
+                unsafe { VideoFrame::from_raw(DropGuard::dismiss(frame), pts, duration) };
             frame.detected_field = self.interlace_detector.analyze(&frame);
             self.video_queue.push_back(frame);
         }
@@ -553,14 +556,13 @@ impl Media {
                 }
                 return Err(format!("audio decoding failed: {}", ffmpeg_error(ret)));
             }
-            if let Some(audio) = self.audio.as_mut() {
-                let result = unsafe { audio.push(frame, time_base, self.audio_seek_target) };
-                unsafe { ffi::up_av_frame_free(&mut frame) };
-                if result? {
-                    self.audio_seek_target = None;
-                }
-            } else {
-                unsafe { ffi::up_av_frame_free(&mut frame) };
+            let frame = DropGuard::new(frame, |mut frame| unsafe {
+                ffi::up_av_frame_free(&mut frame)
+            });
+            if let Some(audio) = self.audio.as_mut()
+                && unsafe { audio.push(*frame, time_base, self.audio_seek_target) }?
+            {
+                self.audio_seek_target = None;
             }
         }
         Ok(())
@@ -573,7 +575,7 @@ impl Media {
         let context = decoder.as_ptr();
         let time_base = decoder.time_base;
         let mut ret = 0;
-        let mut subtitle = unsafe { ffi::up_av_decode_subtitle(context, self.packet, &mut ret) };
+        let subtitle = unsafe { ffi::up_av_decode_subtitle(context, self.packet, &mut ret) };
         if ret < 0 {
             return Err(format!(
                 "subtitle decoder rejected a packet: {}",
@@ -583,10 +585,13 @@ impl Media {
         if subtitle.is_null() {
             return Ok(());
         }
+        let subtitle = DropGuard::new(subtitle, |mut subtitle| unsafe {
+            ffi::up_av_subtitle_free(&mut subtitle)
+        });
         let packet_pts = unsafe { ffi::up_av_packet_pts(self.packet) };
         let packet_duration = unsafe { ffi::up_av_packet_duration(self.packet) };
         let mut subtitle_info: ffi::UpSubtitleInfo = unsafe { std::mem::zeroed() };
-        unsafe { ffi::up_av_subtitle_info(subtitle, &mut subtitle_info) };
+        unsafe { ffi::up_av_subtitle_info(*subtitle, &mut subtitle_info) };
 
         let cue = {
             let base_pts = if subtitle_info.pts != AV_NOPTS_VALUE {
@@ -634,7 +639,7 @@ impl Media {
 
             for index in 0..subtitle_info.rect_count {
                 let mut rect: ffi::UpSubtitleRectView = unsafe { std::mem::zeroed() };
-                if unsafe { ffi::up_av_subtitle_rect(subtitle, index, &mut rect) } == 0 {
+                if unsafe { ffi::up_av_subtitle_rect(*subtitle, index, &mut rect) } == 0 {
                     continue;
                 }
                 match rect.type_ {
@@ -715,7 +720,7 @@ impl Media {
                 content,
             }
         };
-        unsafe { ffi::up_av_subtitle_free(&mut subtitle) };
+        drop(subtitle);
         if self
             .subtitle_seek_target
             .is_some_and(|target| cue.end <= target)
