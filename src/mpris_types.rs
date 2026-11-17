@@ -24,7 +24,7 @@ pub(crate) fn seconds_to_microseconds(seconds: f64) -> i64 {
     if !seconds.is_finite() || seconds <= 0.0 {
         0
     } else {
-        (seconds * 1_000_000.0).min(i64::MAX as f64) as i64
+        (seconds * 1_000_000.0).round() as i64
     }
 }
 

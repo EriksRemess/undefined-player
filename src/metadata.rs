@@ -6,12 +6,20 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 
 pub(crate) fn single_line_metadata(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
+    let mut result = String::with_capacity(text.len());
+    let mut space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            space = !result.is_empty();
+        } else if !ch.is_control() {
+            if space {
+                result.push(' ');
+                space = false;
+            }
+            result.push(ch);
+        }
+    }
+    result
 }
 
 pub(crate) struct MediaMetadata {
@@ -241,6 +249,10 @@ pub(crate) fn media_title(path: &Path) -> String {
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("undefined-player");
+    title_from_stem(stem)
+}
+
+fn title_from_stem(stem: &str) -> String {
     let stem = stem
         .strip_suffix(']')
         .and_then(|value| value.rsplit_once(" ["))
@@ -295,7 +307,16 @@ pub(crate) fn source_title(source: &MediaSource) -> String {
                 .split_once('/')
                 .map_or("", |(_, path)| path);
             let name = path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
-            media_title(Path::new(&decode_url_component(name)))
+            let name = decode_url_component(name);
+            // A decoded slash belongs to this URL segment's display name.
+            let stem = match name.as_str() {
+                "." | ".." => "",
+                name => name
+                    .rsplit_once('.')
+                    .filter(|(stem, _)| !stem.is_empty())
+                    .map_or(name, |(stem, _)| stem),
+            };
+            title_from_stem(stem)
         }
     }
 }

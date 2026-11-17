@@ -23,7 +23,7 @@ mdf mdr men mga mic min mis mk/mkd/mac mkh mg/mlg mt/mlt mnc mni mno moh mn/mon 
 mi/mri/mao ms/msa/may mul mun mus mwl mwr my/mya/bur myn myv nah nai nap na/nau nv/nav \
 nr/nbl nd/nde ng/ndo nds ne/nep new nia nic niu nl/nld/dut nn/nno nb/nob nog non no/nor nqo \
 nso nub nwc ny/nya nym nyn nyo nzi oc/oci oj/oji or/ori om/orm osa os/oss ota oto paa pag \
-pal pam pa/pan pap pau peo phi phn pi/pli pl/pol pon pt/por pra pro ps/pus qaa-qtz qu/que \
+pal pam pa/pan pap pau peo phi phn pi/pli pl/pol pon pt/por pra pro ps/pus qu/que \
 raj rap rar roa rm/roh rom ro/ron/rum rn/run rup ru/rus sad sg/sag sah sai sal sam sa/san \
 sas sat scn sco sel sem sga sgn shn sid si/sin sio sit sla sk/slk/slo sl/slv sma se/sme smi \
 smj smn sm/smo sms sn/sna sd/snd snk sog so/som son st/sot es/spa sq/sqi/alb sc/srd srn \
@@ -55,10 +55,17 @@ fn normalize(value: &str) -> Option<String> {
         "ji" => "yi",
         base => base,
     };
-    let group = LANGUAGE_CODES
-        .split_whitespace()
-        .find(|group| group.split('/').any(|code| code == base))?;
-    let mut result = group.split('/').next()?.to_owned();
+    let local_use = matches!(base.as_bytes(), [b'q', b'a'..=b't', b'a'..=b'z']);
+    let mut result = if local_use {
+        base
+    } else {
+        LANGUAGE_CODES
+            .split_whitespace()
+            .find(|group| group.split('/').any(|code| code == base))?
+            .split('/')
+            .next()?
+    }
+    .to_owned();
     let mut next = parts.next();
     if let Some(script) =
         next.filter(|s| s.len() == 4 && s.bytes().all(|b| b.is_ascii_alphabetic()))
@@ -106,4 +113,23 @@ pub(crate) fn preferred_track<'a>(
         })
         .min()
         .map(|(_, index)| index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_use_languages_match_only_the_requested_code() {
+        for code in ["qaa", "qme", "qtz"] {
+            let preference = parse_preference(&format!("{code}_US")).unwrap();
+            assert_eq!(preference, format!("{code}-US"));
+            assert_eq!(
+                preferred_track([Some("eng"), Some(code)].into_iter(), &preference),
+                Some(1)
+            );
+        }
+        assert!(parse_preference("qua").is_err());
+        assert_eq!(preferred_track([Some("qab")].into_iter(), "qaa"), None);
+    }
 }

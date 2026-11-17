@@ -72,7 +72,11 @@ impl State {
             (false, b"Next") => MprisCommand::NextChapter,
             (false, b"Previous") => MprisCommand::PreviousChapter,
             (false, b"Seek") => MprisCommand::Seek(value),
-            (false, b"SetPosition") if track_id == Some(TRACK_ID) => {
+            (false, b"SetPosition")
+                if track_id == Some(TRACK_ID)
+                    && self.duration_us > 0
+                    && (0..=self.duration_us).contains(&value) =>
+            {
                 MprisCommand::SetPosition(value)
             }
             _ => return,
@@ -320,6 +324,31 @@ impl Drop for Mpris {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn set_position_ignores_requests_outside_the_track() {
+        let source = MediaSource::File(Path::new("/tmp/video.mkv").into());
+        let mut state = State::new(c"Video", None, &source, 100);
+        for value in [-1, 0, 100, 101] {
+            state.command(false, b"SetPosition", Some(TRACK_ID), value);
+        }
+        assert_eq!(
+            state.commands.into_iter().collect::<Vec<_>>(),
+            [MprisCommand::SetPosition(0), MprisCommand::SetPosition(100)]
+        );
+    }
+
+    #[test]
+    fn ignored_absolute_seeks_cannot_displace_commands_on_an_unknown_timeline() {
+        let source = MediaSource::Http("https://media.example/live".into());
+        let mut state = State::new(c"Live", None, &source, 0);
+        state.command(true, b"Quit", None, 0);
+        for _ in 0..COMMAND_CAPACITY {
+            state.command(false, b"SetPosition", Some(TRACK_ID), 0);
+        }
+        assert_eq!(state.commands.pop_front(), Some(MprisCommand::Quit));
+        assert!(state.commands.is_empty());
+    }
+
     #[test]
     fn commands_are_bounded_ordered_and_track_scoped() {
         let source = MediaSource::File(Path::new("/tmp/video.mkv").into());

@@ -59,15 +59,17 @@ pub(crate) fn completed_seek_anchor(
     has_audio: bool,
     eof: bool,
     buffer_full: bool,
-    fallback: f64,
+    target: f64,
 ) -> Option<f64> {
     if (video_pts.is_none() || (has_audio && audio_clock.is_none())) && !eof && !buffer_full {
         return None;
     }
     // A full buffer must be consumed before demuxing can reach the other
     // stream. Start at the earlier timestamp and schedule late audio separately.
-    Some(match (video_pts, audio_clock) {
+    let first_pts = match (video_pts, audio_clock) {
         (Some(video), Some(audio)) => video.min(audio),
-        (video, audio) => audio.or(video).unwrap_or(fallback),
-    })
+        (video, audio) => audio.or(video).unwrap_or(target),
+    };
+    // A picture covering the requested time can start before it.
+    Some(target.max(first_pts))
 }

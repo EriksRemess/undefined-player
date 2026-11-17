@@ -72,14 +72,19 @@ pub(crate) unsafe fn set_playback_paused(
     Ok(())
 }
 
+fn seek_position(position: f64, duration: Option<f64>) -> f64 {
+    // FFmpeg reports duration in microseconds. Stay inside the final frame at EOF.
+    let maximum = duration.map_or(f64::MAX, |end| (end - 0.000_001).max(0.0));
+    position.clamp(0.0, maximum)
+}
+
 pub(crate) fn queue_relative_seek(
     pending: &mut Option<f64>,
     current: f64,
     offset: f64,
     duration: Option<f64>,
 ) {
-    let maximum = duration.map_or(f64::MAX, |duration| (duration - 0.05).max(0.0));
-    *pending = Some((pending.unwrap_or(current) + offset).clamp(0.0, maximum));
+    *pending = Some(seek_position(pending.unwrap_or(current) + offset, duration));
 }
 
 pub(crate) fn handle_playback_end(looping: bool, pending_position: &mut Option<f64>) -> bool {
@@ -102,8 +107,7 @@ pub(crate) unsafe fn seek_to(
     playback_start: f64,
     duration: Option<f64>,
 ) -> Result<f64> {
-    let maximum = duration.map_or(f64::MAX, |duration| (duration - 0.05).max(0.0));
-    let position = position.clamp(0.0, maximum);
+    let position = seek_position(position, duration);
     let target = playback_start + position;
     // Timeline seeks can require decoding a long GOP. Leave that work to the
     // decode worker so the window continues dispatching compositor events.
@@ -619,9 +623,8 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
                                     media_duration,
                                 ),
                                 Some(PaletteSeek::Absolute(position)) => {
-                                    let maximum = media_duration
-                                        .map_or(f64::MAX, |duration| (duration - 0.05).max(0.0));
-                                    pending_position = Some(position.clamp(0.0, maximum));
+                                    pending_position =
+                                        Some(seek_position(position, media_duration));
                                 }
                                 None => queue_relative_seek(
                                     &mut pending_position,
@@ -892,15 +895,11 @@ pub(crate) unsafe fn run(source: MediaSource, perf_log: bool) -> Result<Option<M
         }
 
         if let Some(target) = pending_seek_anchor
-            && let Some(media) = decoder.try_lock()?
+            && let Some(playback_target) =
+                decoder.seek_anchor(current_video.as_ref(), &video_queue, target)?
         {
-            let video_pts = video_queue.front().map(|frame| frame.frame.pts);
-            if let Some(playback_target) =
-                unsafe { media.finish_seek(video_pts, decoder.pending_frames(), target) }
-            {
-                clock.seek(playback_target);
-                pending_seek_anchor = None;
-            }
+            clock.seek(playback_target);
+            pending_seek_anchor = None;
         }
 
         // SDL/PipeWire consumes audio in period-sized chunks (1024 samples on

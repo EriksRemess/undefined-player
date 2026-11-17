@@ -75,6 +75,31 @@ fn seeking_restores_full_decoding_after_keyframe_catchup() {
     child("catchup-seek");
 }
 #[test]
+fn seeking_to_a_frame_boundary_skips_the_expired_picture() {
+    child("seek-frame-boundary");
+    child("seek-fast-frame-boundary");
+}
+#[test]
+fn seeking_between_keyframes_keeps_the_picture_covering_the_target() {
+    child("seek-between-keyframes");
+}
+#[test]
+fn timeline_seek_can_reach_the_last_frame_of_a_short_clip() {
+    child("seek-short-clip");
+}
+#[test]
+fn seeks_preserve_the_displayed_picture_on_a_millisecond_time_base() {
+    child("seek-millisecond-time-base");
+}
+#[test]
+fn variable_rate_seeks_match_sequential_playback_across_reordered_gops() {
+    child("seek-variable-rate");
+}
+#[test]
+fn a_paused_seek_can_show_a_long_frame_before_audio_fills() {
+    child("seek-long-frame");
+}
+#[test]
 fn embedded_chapters_use_the_normal_seek_path() {
     child("chapters");
 }
@@ -433,17 +458,9 @@ fn playback_child() {
             while Instant::now() < deadline {
                 worker.check_error().unwrap();
                 worker.receive_frames(&mut frames);
-                if let Some(media) = worker.try_lock().unwrap() {
-                    anchor = unsafe {
-                        media.finish_seek(
-                            frames.front().map(|f| f.frame.pts),
-                            worker.pending_frames(),
-                            0.5,
-                        )
-                    };
-                    if anchor.is_some() {
-                        break;
-                    }
+                anchor = worker.seek_anchor(None, &frames, 0.5).unwrap();
+                if anchor.is_some() {
+                    break;
                 }
                 thread::sleep(Duration::from_millis(1));
             }
@@ -453,6 +470,188 @@ fn playback_child() {
                 "seek waits forever when video is buffered outside Media and audio starts later",
             );
             assert!((0.46..0.55).contains(&anchor), "seek anchor: {anchor}");
+        }
+        "seek-variable-rate" => {
+            for name in ["flat.mp4", "fragmented.mp4", "variable.mkv"] {
+                let mut args = vec![
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=30000/1001:d=6",
+                    "-vf",
+                    "select='not(eq(mod(n,5),3))'",
+                    "-fps_mode",
+                    "vfr",
+                    "-c:v",
+                    "libx264",
+                    "-g",
+                    "25",
+                    "-bf",
+                    "3",
+                ];
+                if name == "fragmented.mp4" {
+                    args.extend(["-movflags", "+frag_keyframe+empty_moov"]);
+                }
+                let path = fixture.generate(&args, name);
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                let mut timeline = Vec::new();
+                while !media.eof {
+                    unsafe { media.fill_queues() }.unwrap();
+                    timeline.extend(media.video_queue.drain(..).map(|f| f.pts));
+                }
+                assert!(timeline.len() > 100);
+                drop(media);
+                let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+                for pair in timeline.windows(2).step_by(3).rev() {
+                    for target in [pair[0], (pair[0] + pair[1]) / 2.0] {
+                        unsafe { media.seek(target) }.unwrap();
+                        unsafe { media.fill_initial_queues() }.unwrap();
+                        let pts = media.video_queue.front().unwrap().pts;
+                        assert_eq!(pts, pair[0], "{name} seek to {target}");
+                    }
+                }
+            }
+        }
+        "seek-long-frame" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=1/5:d=15",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=sample_rate=48000:duration=15",
+                    "-c:v",
+                    "ffv1",
+                    "-c:a",
+                    "pcm_s16le",
+                ],
+                "slow.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            unsafe { media.seek(1.25) }.unwrap();
+            unsafe { media.fill_initial_queues() }.unwrap();
+            assert_eq!(media.video_queue.front().map(|frame| frame.pts), Some(0.0));
+        }
+        "seek-millisecond-time-base" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=24:d=1",
+                    "-c:v",
+                    "ffv1",
+                ],
+                "rounded.mkv",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            for (target, expected) in [(0.0415, 0.0), (0.042, 0.042), (0.9999, 0.958)] {
+                unsafe { media.seek(target) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                let pts = media.video_queue.front().map(|frame| frame.pts);
+                assert!(
+                    pts.is_some_and(|pts| (pts - expected).abs() < 1e-9),
+                    "seek to {target} returned {pts:?}"
+                );
+            }
+        }
+        "seek-short-clip" => {
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=64x64:r=100:d=0.04",
+                    "-c:v",
+                    "mpeg4",
+                ],
+                "short.avi",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            let duration = media.duration().unwrap();
+            let mut clock = WallClock::new(0.0);
+            clock.set_paused(true);
+            let mut notice = crate::presentation::PositionNotice::new();
+            for target in [0.035, duration] {
+                let position = unsafe {
+                    crate::playback::seek_to(
+                        &mut media,
+                        &mut clock,
+                        &mut notice,
+                        target,
+                        0.0,
+                        Some(duration),
+                    )
+                }
+                .unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                assert_eq!(media.video_queue.front().unwrap().pts, 0.03);
+                assert!((position - target).abs() <= 0.0000011);
+            }
+        }
+        "seek-frame-boundary" | "seek-fast-frame-boundary" | "seek-between-keyframes" => {
+            let (rate, gop, seeks): (_, _, &[(f64, f64)]) = match case.as_str() {
+                "seek-between-keyframes" => (4, "1", &[(0.70, 0.5)]),
+                "seek-fast-frame-boundary" => (200, "12", &[(0.025, 0.025)]),
+                _ => (25, "12", &[(0.24, 0.24), (1.4, 1.4), (1.399, 1.36)]),
+            };
+            let path = fixture.generate(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc2=s=64x64:r={rate}:d=2"),
+                    "-c:v",
+                    "mpeg4",
+                    "-g",
+                    gop,
+                    "-bf",
+                    "0",
+                ],
+                "seek.avi",
+            );
+            let mut media = unsafe { Media::open(&path, None, false) }.unwrap();
+            for &(target, expected) in seeks {
+                unsafe { media.seek(target) }.unwrap();
+                unsafe { media.fill_initial_queues() }.unwrap();
+                let pts = media.video_queue.front().unwrap().pts;
+                assert!(
+                    (pts - expected).abs() < 1e-9,
+                    "seek to {target} returned {pts}"
+                );
+                let anchor = unsafe { media.finish_seek(Some(pts), 0, target) }.unwrap();
+                assert!(
+                    (anchor - target).abs() < 1e-9,
+                    "seek to {target} landed at {anchor}"
+                );
+            }
+            if case == "seek-between-keyframes" {
+                // The render loop can present the first picture while the
+                // decoder mutex is busy and complete the seek one iteration later.
+                let worker =
+                    DecodeWorker::start(media, crate::source::MediaSource::File(path), false);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut frames = VecDeque::new();
+                while frames.len() < 2 {
+                    assert!(Instant::now() < deadline);
+                    worker.check_error().unwrap();
+                    worker.receive_frames(&mut frames);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let current = frames.pop_front().unwrap();
+                let anchor = loop {
+                    if let Some(anchor) = worker.seek_anchor(Some(&current), &frames, 0.70).unwrap()
+                    {
+                        break anchor;
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                };
+                assert_eq!(anchor, 0.70);
+            }
         }
         "catchup-seek" => {
             let path = fixture.generate(

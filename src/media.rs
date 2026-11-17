@@ -106,6 +106,7 @@ pub(crate) struct Media {
     pub(crate) first_video_pts: Option<f64>,
     pub(crate) next_video_pts: f64,
     pub(crate) video_seek_target: Option<f64>,
+    seek_preroll: Option<VideoFrame>,
     pub(crate) audio_seek_target: Option<f64>,
     pub(crate) subtitle_seek_target: Option<f64>,
 }
@@ -478,6 +479,7 @@ impl Media {
                 first_video_pts: None,
                 next_video_pts: 0.0,
                 video_seek_target: None,
+                seek_preroll: None,
                 audio_seek_target: None,
                 subtitle_seek_target: None,
             })
@@ -534,20 +536,30 @@ impl Media {
             };
             // Decoder timing must survive queue transfers to the render thread.
             self.next_video_pts = pts + duration;
-            if self
-                .video_seek_target
-                .is_some_and(|target| pts + duration.max(1.0 / 120.0) < target)
-            {
-                continue;
+            let frame = unsafe { VideoFrame::from_raw(DropGuard::dismiss(frame), pts, duration) };
+            if let Some(target) = self.video_seek_target {
+                // The next picture's PTS determines when the current one is
+                // replaced. Packet duration can be rounded to whole stream ticks.
+                if pts < target.next_down() {
+                    self.seek_preroll = Some(frame);
+                    continue;
+                }
+                if let Some(previous) = self.seek_preroll.take()
+                    && pts > target.next_up()
+                {
+                    self.queue_video_frame(previous);
+                }
+                self.video_seek_target = None;
             }
-            self.video_seek_target = None;
-            self.first_video_pts.get_or_insert(pts);
-            let mut frame =
-                unsafe { VideoFrame::from_raw(DropGuard::dismiss(frame), pts, duration) };
-            frame.detected_field = self.interlace_detector.analyze(&frame);
-            self.video_queue.push_back(frame);
+            self.queue_video_frame(frame);
         }
         Ok(())
+    }
+
+    fn queue_video_frame(&mut self, mut frame: VideoFrame) {
+        self.first_video_pts.get_or_insert(frame.pts);
+        frame.detected_field = self.interlace_detector.analyze(&frame);
+        self.video_queue.push_back(frame);
     }
 
     /// # Safety
@@ -901,6 +913,10 @@ impl Media {
                 recovery.error
             ));
         }
+        if let Some(last) = self.seek_preroll.take() {
+            self.queue_video_frame(last);
+            self.video_seek_target = None;
+        }
         if let Some(track) = self.audio_tracks.get(self.selected_audio_track) {
             let audio_ret =
                 unsafe { ffi::up_av_decoder_send_packet(track.decoder.as_ptr(), ptr::null()) };
@@ -1029,6 +1045,15 @@ impl Media {
                 break;
             }
         }
+        // Paused audio can prevent reading the next picture of a low-rate
+        // stream. Present the last decoded candidate until demuxing can resume.
+        if self.seek_preroll.is_some()
+            && self.video_packets.is_empty()
+            && unsafe { self.audio_full() }
+            && let Some(frame) = self.seek_preroll.take()
+        {
+            self.queue_video_frame(frame);
+        }
         Ok(())
     }
 
@@ -1107,9 +1132,6 @@ impl Media {
         if self.video.time_base <= 0.0 {
             return Err("video stream has an invalid time base".into());
         }
-        // av_seek_frame with AVSEEK_FLAG_BACKWARD resolves the usable keyframe
-        // for the requested timestamp. Do not preselect a container index
-        // entry here: sparse Matroska cues can be many seconds behind it.
         let ret =
             unsafe { ffi::up_av_seek(self.format, self.video.stream_index, requested_target) };
         if ret < 0 {
@@ -1148,6 +1170,7 @@ impl Media {
         self.drained = false;
         let playback_target = requested_target;
         self.next_video_pts = playback_target;
+        self.seek_preroll = None;
         self.video_seek_target = Some(playback_target);
         self.audio_seek_target = self.audio.as_ref().map(|_| playback_target);
         self.subtitle_seek_target = (!self.subtitle_tracks.is_empty()).then_some(playback_target);
@@ -1220,7 +1243,7 @@ impl Media {
         &self,
         video_pts: Option<f64>,
         outstanding_video: usize,
-        fallback: f64,
+        target: f64,
     ) -> Option<f64> {
         #[cfg(target_os = "macos")]
         if let Some(native) = self.native {
@@ -1238,7 +1261,7 @@ impl Media {
             self.video_queue.len().saturating_add(outstanding_video)
                 >= VIDEO_QUEUE_TARGET.min(self.video_queue_capacity())
                 || unsafe { self.audio_full() },
-            fallback,
+            target,
         )
     }
 

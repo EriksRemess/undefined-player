@@ -26,10 +26,23 @@ fn relative_seeks_follow_pending_positions_and_clamp_each_command() {
     pending = Some(28.0);
     queue_relative_seek(&mut pending, 0.0, 10.0, Some(30.0));
     queue_relative_seek(&mut pending, 0.0, -10.0, Some(30.0));
-    assert_eq!(pending, Some(19.95));
+    assert!((pending.unwrap() - 19.999_999).abs() < 1e-12);
     pending = None;
     queue_relative_seek(&mut pending, 40.0, 10.0, None);
     assert_eq!(pending, Some(50.0));
+}
+
+#[test]
+fn relative_seek_preserves_positions_in_the_final_frame() {
+    let mut pending = None;
+    crate::playback::queue_relative_seek(&mut pending, 0.030, 0.005, Some(0.040));
+    assert!((pending.unwrap() - 0.035).abs() < 1e-12);
+}
+
+#[test]
+fn media_control_timestamps_round_trip_whole_microseconds() {
+    let micros = 1_000_001;
+    assert_eq!(seconds_to_microseconds(micros as f64 / 1_000_000.0), micros);
 }
 
 #[test]
@@ -330,6 +343,30 @@ fn display_title_collapses_filename_whitespace() {
         )),
         "KYOTO HIDDEN VALLEYS DRIVE 🌿 ARASHIYAMA TO KIBUNE ⧸ 8K 60FPS HDR ⧸ RELAXING PIANO"
     );
+}
+
+#[test]
+fn url_titles_preserve_encoded_slashes_in_the_filename() {
+    for (name, title) in [
+        ("AC%2FDC%20Live.mp4", "AC/DC Live"),
+        ("AC%2FDC%2Emp4", "AC/DC"),
+        (".hidden", ".hidden"),
+    ] {
+        let source =
+            crate::source::MediaSource::Http(format!("https://example.test/files/{name}?v=1"));
+        assert_eq!(source_title(&source), title);
+    }
+}
+
+#[test]
+fn invisible_filename_controls_do_not_leave_blank_titles_or_extra_spaces() {
+    for (name, title) in [
+        ("%00%20%07.mp4", "undefined-player"),
+        ("%07%20A%20%00%20B%20%07.mp4", "A B"),
+    ] {
+        let source = crate::source::MediaSource::Http(format!("https://example.test/{name}"));
+        assert_eq!(source_title(&source), title);
+    }
 }
 
 #[test]

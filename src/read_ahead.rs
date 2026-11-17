@@ -174,6 +174,8 @@ impl ReadAhead {
             state.start = target;
             state.error = None;
             state.generation = state.generation.wrapping_add(1);
+        } else if state.error.is_some_and(|code| code < 0) {
+            state.error = None;
         }
         state.position = target;
         state.trim();
@@ -339,5 +341,25 @@ mod tests {
         assert_eq!(reader.read(&mut [0; 1]), Err(-5));
         assert_eq!(reader.seek(4 * CHUNK as i64, 0), Ok(4 * CHUNK as i64));
         check(&reader, 4 * CHUNK as i64, CHUNK);
+    }
+
+    #[test]
+    fn seek_within_buffer_retries_a_transient_read_error() {
+        let size = 2 * CHUNK as i64;
+        let mut failed = false;
+        let reader = ReadAhead::new(size, move |buffer, offset| {
+            if !failed && offset == CHUNK as u64 {
+                failed = true;
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fill(buffer, offset, size as u64)
+        })
+        .unwrap();
+        check(&reader, 0, CHUNK);
+        assert_eq!(reader.read(&mut [0; 1]), Err(-5));
+        let target = CHUNK as i64 - 10;
+        assert_eq!(reader.seek(target, 0), Ok(target));
+        check(&reader, target, CHUNK + 10);
+        assert_eq!(reader.read(&mut [0; 1]), Ok(0));
     }
 }

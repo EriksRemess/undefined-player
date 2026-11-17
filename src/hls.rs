@@ -115,7 +115,8 @@ fn select(master: &str) -> Option<String> {
             continue;
         };
         let uri = (index + 1..lines.len())
-            .find(|&i| !lines[i].trim().is_empty() && !lines[i].starts_with('#'))?;
+            .take_while(|&i| !lines[i].trim_start().starts_with("#EXT"))
+            .find(|&i| !lines[i].trim().is_empty() && !lines[i].trim_start().starts_with('#'))?;
         // Without resolution metadata, retain FFmpeg's full discovery path.
         let (width, height) = attribute(attributes, "RESOLUTION")?.split_once('x')?;
         let pixels = width.parse::<u32>().ok()? as u64 * height.parse::<u32>().ok()? as u64;
@@ -197,6 +198,18 @@ mod tests {
 
     unsafe extern "C" fn collect_segment(opaque: *mut c_void, uri: *const c_char) {
         unsafe { collect_playlist(opaque, uri, 1) };
+    }
+
+    #[test]
+    fn missing_variant_uri_leaves_the_master_for_full_discovery() {
+        let master = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=1280x720\n",
+            "# comment\n\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=100000,RESOLUTION=640x360\n",
+            "low.m3u8\n",
+        );
+        assert_eq!(select(master), None);
     }
 
     #[test]

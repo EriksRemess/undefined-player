@@ -159,6 +159,21 @@ impl DecodeWorker {
         }
     }
 
+    pub(crate) fn seek_anchor(
+        &self,
+        current: Option<&QueuedVideoFrame>,
+        queue: &VecDeque<QueuedVideoFrame>,
+        target: f64,
+    ) -> Result<Option<f64>> {
+        let Some(media) = self.try_lock()? else {
+            return Ok(None);
+        };
+        let video_pts = current
+            .or_else(|| queue.front())
+            .map(|frame| frame.frame.pts);
+        Ok(unsafe { media.finish_seek(video_pts, self.pending_frames(), target) })
+    }
+
     pub(crate) fn receive_subtitles(&self, queue: &mut VecDeque<SubtitleCue>) -> Result<()> {
         if let Some(mut media) = self.try_lock()? {
             queue.append(&mut media.subtitle_queue);

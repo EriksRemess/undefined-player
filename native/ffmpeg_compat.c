@@ -671,14 +671,27 @@ int up_av_seek(UpAvFormat *format, int stream_index, double target_seconds)
     if (!stream || stream->time_base.num <= 0 || stream->time_base.den <= 0)
         return AVERROR(EINVAL);
     double ticks = target_seconds * stream->time_base.den / stream->time_base.num;
-    // llround cannot represent non-finite or out-of-range results. In
-    // particular, INT64_MIN is FFmpeg's sentinel for a missing timestamp.
+    // INT64_MIN is FFmpeg's sentinel for a missing timestamp.
     if (!isfinite(ticks) || ticks <= (double) INT64_MIN || ticks >= (double) INT64_MAX)
         return AVERROR(EINVAL);
-    int64_t timestamp = llround(ticks);
+    // A backward seek must not round up to a keyframe after the target.
+    int64_t timestamp = (int64_t) floor(ticks);
     AVFormatContext *native = FORMAT(format);
-    int result = av_seek_frame(native, stream_index, timestamp,
-                               AVSEEK_FLAG_BACKWARD);
+    int result = av_seek_frame(native, stream_index, timestamp, AVSEEK_FLAG_BACKWARD);
+    // Seeking loads the relevant fragment's sample index. MOV indexes by DTS,
+    // so a nearby keyframe can be presented after the requested picture.
+    if (result >= 0 && stream->codecpar->video_delay > 0 &&
+        av_match_name("mov", native->iformat->name)) {
+        int sample = av_index_search_timestamp(stream, timestamp,
+                                               AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+        int key = av_index_search_timestamp(stream, timestamp, AVSEEK_FLAG_BACKWARD);
+        if (key > 0 && sample >= key && sample - key < stream->codecpar->video_delay) {
+            const AVIndexEntry *entry = avformat_index_get_entry(stream, key);
+            if (entry && entry->timestamp > INT64_MIN + 1)
+                result = av_seek_frame(native, stream_index, entry->timestamp - 1,
+                                       AVSEEK_FLAG_BACKWARD);
+        }
+    }
     if (result >= 0 && native->pb &&
         native->pb->read_packet == hls_manifest_read) {
         struct HlsInput *input = native->opaque;
